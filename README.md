@@ -61,6 +61,15 @@ cd agent-delegation-mcp
 ./install.sh
 ```
 
+To install only one server, pass `--servers`. For example, OpenCode alone (no
+agy wrapper):
+
+```bash
+./install.sh --servers opencode
+```
+
+Use `--servers agy` for the other one; the default installs both.
+
 Then restart Claude Code, or run `/mcp reconnect` in an open session. The tools
 appear as `mcp__agy-wrapper__ask_agy` and `mcp__opencode-wrapper__ask_opencode`.
 
