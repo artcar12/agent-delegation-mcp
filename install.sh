@@ -220,7 +220,10 @@ command -v claude >/dev/null 2>&1 \
 register() {
   local name="$1" script="$2"; shift 2
   claude mcp remove "$name" -s "$SCOPE" >/dev/null 2>&1 || true
-  claude mcp add "$name" -s "$SCOPE" "$@" -- "$VENV/bin/python" "$script" >/dev/null
+  if ! claude mcp add "$name" -s "$SCOPE" "$@" -- "$VENV/bin/python" "$script" >/dev/null; then
+    die "\`claude mcp add $name\` failed. The files are installed and smoke-tested at
+         $INSTALL_DIR, but $name is currently deregistered. Re-run this script to retry."
+  fi
   ok "registered $name ($SCOPE scope)"
 }
 
@@ -236,6 +239,18 @@ if [ "$WANT_OPENCODE" = 1 ]; then
   [ -n "$OPENCODE_BIN" ] && args+=(-e "OPENCODE_BIN=$OPENCODE_BIN")
   [ -n "$DEFAULT_CWD" ]  && args+=(-e "AGENT_MCP_DEFAULT_CWD=$DEFAULT_CWD")
   register opencode-wrapper "$INSTALL_DIR/opencode_mcp_server.py" ${args+"${args[@]}"}
+fi
+
+# A narrowed --servers run installs only the named servers but leaves any
+# previously-installed one in place and still registered. Surface that rather
+# than silently orphaning it; don't delete it, since the user may want to keep it.
+if [ "$WANT_AGY" = 0 ] && [ -f "$INSTALL_DIR/agy_mcp_server.py" ]; then
+  warn "agy was not selected, but it is still installed and may still be registered.
+         To remove it:  claude mcp remove agy-wrapper -s $SCOPE && rm $INSTALL_DIR/agy_mcp_server.py"
+fi
+if [ "$WANT_OPENCODE" = 0 ] && [ -f "$INSTALL_DIR/opencode_mcp_server.py" ]; then
+  warn "opencode was not selected, but it is still installed and may still be registered.
+         To remove it:  claude mcp remove opencode-wrapper -s $SCOPE && rm $INSTALL_DIR/opencode_mcp_server.py"
 fi
 
 # Resolved with an if, not ${VAR:-default}: an apostrophe in the default word
