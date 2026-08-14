@@ -174,8 +174,10 @@ ok "server files copied"
 # venv's site-packages no longer match and every MCP server here fails to start
 # with no error anywhere. The tools just vanish from Claude's tool list.
 step "Building the venv (python $PY_VERSION)"
+# --clear on both paths: uv refuses an existing venv outright, and a reused venv
+# would keep whatever interpreter it was built with, defeating the pin above.
 if command -v uv >/dev/null 2>&1; then
-  uv venv --python "$PY_VERSION" "$VENV" >/dev/null
+  uv venv --clear --python "$PY_VERSION" "$VENV" >/dev/null
   uv pip install --python "$VENV/bin/python" -r "$INSTALL_DIR/requirements.txt" >/dev/null
   ok "uv-managed CPython $PY_VERSION, mcp installed"
 else
@@ -183,7 +185,7 @@ else
          moves that interpreter the tools will silently disappear. Installing uv
          (https://docs.astral.sh/uv/) and re-running avoids that."
   command -v python3 >/dev/null 2>&1 || die "neither uv nor python3 is available"
-  python3 -m venv "$VENV"
+  python3 -m venv --clear "$VENV"
   "$VENV/bin/python" -m pip install --quiet --upgrade pip
   "$VENV/bin/python" -m pip install --quiet -r "$INSTALL_DIR/requirements.txt"
   ok "venv built with $("$VENV/bin/python" -V)"
@@ -236,13 +238,21 @@ if [ "$WANT_OPENCODE" = 1 ]; then
   register opencode-wrapper "$INSTALL_DIR/opencode_mcp_server.py" ${args+"${args[@]}"}
 fi
 
+# Resolved with an if, not ${VAR:-default}: an apostrophe in the default word
+# opens a quote inside the expansion and bash never finds the closing brace.
+if [ -n "$DEFAULT_CWD" ]; then
+  SCOPE_DESC="$DEFAULT_CWD"
+else
+  SCOPE_DESC="the working directory of each Claude session"
+fi
+
 cat <<EOF
 
 ${B}Done.${N} Restart Claude Code, or run /mcp reconnect in an open session.
 
   Tools:   mcp__agy-wrapper__ask_agy, mcp__opencode-wrapper__ask_opencode
   Check:   claude mcp list
-  Scope:   ${DEFAULT_CWD:-each session's own working directory}
+  Scope:   ${SCOPE_DESC}
 
 The delegates these tools launch approve their own shell commands, file edits
 and git operations under that directory, with no checkpoint mid-run. Read the
