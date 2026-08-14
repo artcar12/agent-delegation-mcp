@@ -446,8 +446,7 @@ re-run the gate yourself afterward. The rest is refinement on top of that loop.
 
 macOS, `agy` 1.1.12, `opencode` 1.18.10, `mcp` 2.0.0 on uv-managed CPython
 3.14.5, Claude Code with Opus. Version-sensitive claims are called out inline.
-The failure modes came from production use on a React Native / Expo project and
-a Symfony / OroCommerce project.
+The failure modes came from real production use.
 
 ## License
 
