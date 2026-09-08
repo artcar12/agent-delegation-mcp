@@ -121,12 +121,22 @@ write_version() {
   else
     describe="unknown (not a git checkout)"; dirty=0
   fi
+  # remote/branch let an install with no checkout still check itself against
+  # GitHub - which is nearly every install. Falls back to the slug baked into
+  # the server sources when this is not a clone.
+  local remote branch
+  remote="$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null \
+            | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')"
+  branch="$(git -C "$SRC_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null \
+            | sed 's#^origin/##')"
   cat > "$INSTALL_DIR/VERSION" <<EOF
 commit=$commit
 describe=$describe
 dirty=$dirty
 installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 source=$SRC_DIR
+remote=${remote:-}
+branch=${branch:-main}
 EOF
 }
 
@@ -181,7 +191,7 @@ if [ "$UNINSTALL" = 1 ]; then
     elif [ -e "$VENV" ]; then
       warn "$VENV does not look like a venv (no pyvenv.cfg); left alone"
     fi
-    for f in agy_mcp_server.py opencode_mcp_server.py requirements.txt README.md VERSION; do
+    for f in agy_mcp_server.py opencode_mcp_server.py requirements.txt README.md VERSION .update-check.json; do
       [ -f "$INSTALL_DIR/$f" ] && rm -f "$INSTALL_DIR/$f"
     done
     [ -d "$INSTALL_DIR/__pycache__" ] && find "$INSTALL_DIR/__pycache__" -depth -delete

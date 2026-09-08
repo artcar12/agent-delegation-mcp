@@ -8,6 +8,7 @@ file can be dropped into an existing venv on its own. Every knob is an
 environment variable; the full list is in the README.
 """
 
+import json
 import os
 import shutil
 import signal
@@ -15,14 +16,27 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 
-# mcp 2.x renamed FastMCP -> MCPServer and dropped the `mcp.server.fastmcp`
-# module. Same API: _Server("name"), @mcp.tool(), mcp.run() (stdio default).
-try:
-    from mcp.server import MCPServer as _Server          # mcp >= 2.0
-except ImportError:
-    from mcp.server.fastmcp import FastMCP as _Server    # mcp 1.x
+# `--check` also runs from a SessionStart hook, where latency is paid on every
+# session start. Importing the MCP SDK costs about a second - eight times the
+# rest of the check - and the check never serves a request, so stand in a no-op
+# registrar rather than making every session wait for an import it will not use.
+_CHECK_ONLY = "--check" in sys.argv[1:]
+
+if _CHECK_ONLY:
+    class _Server:                                       # never serves anything
+        def __init__(self, *args, **kwargs): pass
+        def tool(self, *args, **kwargs): return lambda fn: fn
+else:
+    # mcp 2.x renamed FastMCP -> MCPServer and dropped the `mcp.server.fastmcp`
+    # module. Same API: _Server("name"), @mcp.tool(), mcp.run() (stdio default).
+    try:
+        from mcp.server import MCPServer as _Server      # mcp >= 2.0
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as _Server  # mcp 1.x
 
 
 def _env(name: str, default: str) -> str:
@@ -287,17 +301,6 @@ def _await(proc: subprocess.Popen, cwd: str, since: float) -> str:
     return (out or "(opencode produced no output)") + artifacts
 
 
-def _git(repo: str, *args: str) -> str:
-    """One-line git query with a hard timeout. Never network, never mutating -
-    a diagnostic must not be able to hang the dispatch it is annotating."""
-    try:
-        p = subprocess.run(["git", "-C", repo, *args], capture_output=True,
-                           text=True, timeout=5, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return p.stdout.strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else ""
-
-
 def _installed_version() -> dict:
     """install.sh stamps a VERSION next to this file. Its absence is a real
     answer, not an error: dropping a single .py into a venv by hand is a
@@ -315,47 +318,130 @@ def _installed_version() -> dict:
     return data
 
 
-# Memo, not a cache with a lifetime: a running server holds its code in memory,
-# so this answer cannot change without a /mcp reconnect, which re-imports.
-_STALENESS: list = []
+# Most installs are not git checkouts - the repo is public, so ask GitHub
+# instead of assuming a local clone. Overridable for a fork.
+REPO_SLUG = _env("AGENT_MCP_REPO", "artcar12/agent-delegation-mcp")
+
+# One unauthenticated GET per day, per server, to api.github.com. It sends
+# nothing but the request itself. Set AGENT_MCP_UPDATE_CHECK=0 to disable it
+# outright; the local-checkout comparison keeps working either way.
+UPDATE_CHECK = _env("AGENT_MCP_UPDATE_CHECK", "1") not in ("0", "false", "no")
+UPDATE_TTL = _int_env("AGENT_MCP_UPDATE_TTL", 86_400)
+
+# Filled from the cache file at import, then refreshed in the background. Read
+# through this rather than memoising, so a refresh that lands mid-session is
+# picked up by the next dispatch instead of waiting for a reconnect.
+_UPDATE: dict = {}
 
 
-def _staleness() -> str:
-    """Appended to every dispatch, because a stale install is silent by
-    construction. The servers are file copies, so the only other evidence is an
-    mtime compared against `git log` by hand - which is how a committed
-    process-group fix sat uninstalled through a real incident.
+def _cache_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".update-check.json")
 
-    Strictly local: comparing against the remote would mean a network call on
-    every dispatch. The upstream half reads the origin ref as of the checkout's
-    last fetch, so it under-reports rather than crying wolf. `delegation_status`
-    does the live check.
+
+def _fetch_update(slug: str, commit: str, _branch: str = "") -> dict:
+    """Ask GitHub whether the latest published RELEASE is newer than this copy.
+
+    Deliberately the release, not the default branch: unreleased commits on main
+    are work in progress, and telling every user to reinstall because a branch
+    moved is noise. No releases published means nothing to compare, not an error.
+
+    `compare/BASE...HEAD` reports HEAD relative to BASE, so status "ahead" means
+    the release tag is ahead of what is installed. That distinction is what
+    keeps a local build quiet: a dev commit sitting ahead of the last release
+    comes back "behind" or "diverged", and a commit GitHub has never seen comes
+    back 404 - neither is an update.
     """
-    if _STALENESS:
-        return _STALENESS[0]
-    note = ""
+    tag = _api(f"https://api.github.com/repos/{slug}/releases/latest", commit)
+    if isinstance(tag, dict) and tag.get("_error"):
+        return {"status": "no-release"} if tag["_error"] == 404 else {
+            "status": "error", "detail": f"HTTP {tag['_error']}"}
+    if not isinstance(tag, dict) or not tag.get("tag_name"):
+        return {"status": "error", "detail": "unreadable release"}
+    name = tag["tag_name"]
+
+    body = _api(f"https://api.github.com/repos/{slug}/compare/{commit}...{name}", commit)
+    if isinstance(body, dict) and body.get("_error"):
+        return {"status": "unknown-commit", "tag": name} if body["_error"] == 404 else {
+            "status": "error", "detail": f"HTTP {body['_error']}", "tag": name}
+    return {"status": body.get("status", "error"),
+            "ahead_by": body.get("ahead_by", 0), "tag": name}
+
+
+def _api(url: str, commit: str):
+    """Unauthenticated GET. Returns the decoded body, or {"_error": code}."""
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"agent-delegation-mcp/{commit}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return {"_error": exc.code}
+    except Exception:                           # offline, DNS, TLS, malformed
+        return {"_error": 0}
+
+
+def _refresh_update(commit: str, branch: str, slug: str) -> None:
+    result = _fetch_update(slug, commit, branch)
+    result.update({"checked": int(time.time()), "commit": commit, "slug": slug})
+    _UPDATE.update(result)
+    try:
+        with open(_cache_path(), "w") as fh:
+            json.dump(result, fh)
+    except OSError:
+        pass                                    # a read-only install dir is not fatal
+
+
+def _load_cached(commit: str) -> bool:
+    """Populate _UPDATE from the cache file. Returns True when that result is
+    still within its TTL, i.e. when no fetch is needed. A cache written for a
+    different commit is ignored: after an update, the old answer is not about
+    this install any more."""
+    try:
+        with open(_cache_path()) as fh:
+            cached = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cached, dict) or cached.get("commit") != commit:
+        return False
+    _UPDATE.update(cached)                      # stale-while-revalidate
+    return int(time.time()) - int(cached.get("checked", 0)) < UPDATE_TTL
+
+
+def _start_update_check() -> None:
+    """Load the cache now, refresh it later. Never block: this runs at import,
+    and a client that gives a server a startup deadline must not be held up by
+    a network call - which is the same class of bug as the hang this whole
+    wrapper exists to cut short."""
     version = _installed_version()
-    commit, src = version.get("commit", ""), version.get("source", "")
-    if commit and commit != "unknown" and src and os.path.isdir(src):
-        head = _git(src, "rev-parse", "--short", "HEAD")
-        if head and head != commit:
-            note = (f"STALE WRAPPER: this server is running {commit}; {src} is at {head}. "
-                    f"Fixes committed there are NOT in effect - including any fix you were "
-                    f"just told to expect. Run {src}/install.sh, then /mcp reconnect.")
-        elif head:
-            behind = _git(src, "rev-list", "--count", "HEAD..@{upstream}")
-            if behind.isdigit() and int(behind) > 0:
-                note = (f"POSSIBLY BEHIND REMOTE: {src} is {behind} commit(s) behind its "
-                        f"upstream as of its last fetch. `git -C {src} pull && ./install.sh`, "
-                        f"then /mcp reconnect. Run delegation_status for a live check.")
-    _STALENESS.append(note)
-    return note
+    commit = version.get("commit", "")
+    if not UPDATE_CHECK or not commit or commit == "unknown":
+        return
+    slug = version.get("remote") or REPO_SLUG
+    branch = version.get("branch") or "main"
+    if _load_cached(commit):                    # still fresh, nothing to do
+        return
+    threading.Thread(target=_refresh_update, args=(commit, branch, slug),
+                     daemon=True).start()
+
+
+def _remote_note() -> str:
+    """What GitHub said, as of the cache. Silent unless it is actionable."""
+    if _UPDATE.get("status") == "ahead" and _UPDATE.get("ahead_by"):
+        slug = _UPDATE.get("slug", REPO_SLUG)
+        return (f"UPDATE AVAILABLE: release {_UPDATE.get('tag', '?')} is "
+                f"{_UPDATE['ahead_by']} commit(s) ahead of this install. See "
+                f"https://github.com/{slug}/releases/latest, re-run install.sh, "
+                f"then /mcp reconnect.")
+    return ""
+
 
 
 def _staleness_suffix() -> str:
     """Same finding, appended to a tool result. Belt to the instructions' braces:
     a client that drops server instructions still sees this one."""
-    note = _staleness()
+    note = _remote_note()
     return f"\n\n[{note}]" if note else ""
 
 
@@ -384,7 +470,7 @@ def _instructions() -> str:
     version = _installed_version()
     head = [f"opencode-wrapper {version.get('describe') or '(unstamped)'} - delegates coding and "
             f"research tasks to the opencode CLI, unattended and self-approving."]
-    note = _staleness()
+    note = _remote_note()
     if note:
         head.insert(0, f"!! {note}")
     head.append(
@@ -402,6 +488,8 @@ def _instructions() -> str:
 
 # Constructed here, not at the top: the instructions below are computed, and the
 # helpers that compute them have to exist first.
+_start_update_check()
+
 # `version` is where MCP expects a server to advertise itself (it rides in
 # serverInfo), so a client can show it without parsing prose. `instructions`
 # carries the part a client cannot infer: whether that version is the one the
@@ -500,15 +588,15 @@ def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
 def delegation_status() -> str:
     """
     Reports what this wrapper actually is: which commit is installed, whether
-    that is behind the checkout it came from or behind the remote, where the
-    opencode CLI resolved to, and the timeouts a dispatch will run under.
+    GitHub has a newer one, where the opencode CLI resolved to, and the timeouts a
+    dispatch will actually run under.
 
     Call this when a dispatch behaves in a way the docstring does not explain,
     before concluding the tool is broken. A wrapper is installed as a file copy
-    and a running server holds its code in memory, so "the fix is committed" and
-    "the fix is running" are independent facts, and nothing else surfaces the
-    difference. Unlike the check baked into every dispatch, this one queries the
-    remote, so it costs a network round trip.
+    and a running server holds its code in memory, so "a fix exists" and "a fix
+    is running" are independent facts, and nothing else surfaces the difference.
+    This queries GitHub live rather than reading the daily cache, so it costs a
+    network round trip.
     """
     version = _installed_version()
     src = version.get("source", "")
@@ -522,30 +610,29 @@ def delegation_status() -> str:
     ]
 
     commit = version.get("commit", "")
-    if src and os.path.isdir(src) and commit and commit != "unknown":
-        head = _git(src, "rev-parse", "--short", "HEAD")
-        if not head:
-            lines.append(f"  vs source:  cannot read git in {src}")
-        elif head != commit:
-            lines.append(f"  vs source:  STALE - installed {commit}, checkout is at {head}. "
-                         f"Run {src}/install.sh, then /mcp reconnect.")
-        else:
-            lines.append(f"  vs source:  current ({head})")
-            remote = _git(src, "ls-remote", "--quiet", "origin", "HEAD")
-            remote_sha = remote.split()[0][:len(head)] if remote else ""
-            if not remote_sha:
-                lines.append("  vs remote:  could not reach origin")
-            elif remote_sha != head:
-                # Deliberately not called "behind": without fetching the remote
-                # objects we cannot tell ahead from behind, and telling someone
-                # to pull their own unpushed branch is worse than saying less.
-                lines.append(f"  vs remote:  DIFFERS - origin/HEAD is {remote_sha}, this checkout "
-                             f"is {head}. Either you are ahead (unpushed work) or behind "
-                             f"(`git -C {src} pull && ./install.sh`, then /mcp reconnect).")
-            else:
-                lines.append("  vs remote:  current")
+    slug = version.get("remote") or REPO_SLUG
+    branch = version.get("branch") or "main"
+    if not commit or commit == "unknown":
+        lines.append("  vs GitHub:  no version stamp; re-run install.sh")
+    elif not UPDATE_CHECK:
+        lines.append("  vs GitHub:  update check disabled (AGENT_MCP_UPDATE_CHECK=0)")
     else:
-        lines.append("  vs source:  not comparable (no stamp, or the source is gone)")
+        _refresh_update(commit, branch, slug)
+        status, ahead = _UPDATE.get("status"), _UPDATE.get("ahead_by", 0)
+        tag = _UPDATE.get("tag", "?")
+        if status == "ahead" and ahead:
+            lines.append(f"  vs release: UPDATE AVAILABLE - {tag} is {ahead} commit(s) "
+                         f"ahead. Re-run install.sh, then /mcp reconnect.")
+        elif status == "identical":
+            lines.append(f"  vs release: up to date with {tag}")
+        elif status == "no-release":
+            lines.append(f"  vs release: {slug} has published no releases; nothing to compare")
+        elif status == "unknown-commit":
+            lines.append(f"  vs release: {commit} is not on {slug} (a local build?)")
+        elif status in ("behind", "diverged"):
+            lines.append(f"  vs release: ahead of {tag} ({status}); no update needed")
+        else:
+            lines.append(f"  vs release: unreachable ({_UPDATE.get('detail', 'unknown')})")
 
     lines += [
         f"  CLI:        {OPENCODE_BIN} -> {_probe([OPENCODE_BIN, '--version'])}",
@@ -559,5 +646,53 @@ def delegation_status() -> str:
     return "\n".join(lines)
 
 
+def _check_cli() -> int:
+    """`python opencode_mcp_server.py --check` - a staleness check that needs no git
+    checkout, which is the normal case: almost nobody installs this by cloning.
+    Forces a fetch rather than trusting the cache, and leaves the result in the
+    cache for the running servers. Exit 1 means an update is available.
+    """
+    version = _installed_version()
+    commit = version.get("commit", "")
+    print(f"opencode-wrapper {version.get('describe') or '(unstamped)'}")
+    print(f"  {os.path.abspath(__file__)}")
+
+    if not commit or commit == "unknown":
+        print("  no version stamp, so nothing to compare. Re-run install.sh.")
+        return 0
+    if not UPDATE_CHECK:
+        print("  update check disabled (AGENT_MCP_UPDATE_CHECK=0)")
+        return 0
+
+    slug = version.get("remote") or REPO_SLUG
+    branch = version.get("branch") or "main"
+    # Honour the daily cache unless --force. The SessionStart hook runs this on
+    # every session start, and the unauthenticated GitHub budget is 60 requests
+    # an hour: a forced fetch each time would spend it on an answer that cannot
+    # have changed. --force is there for CI and for checking right after a
+    # release lands.
+    if "--force" in sys.argv[1:] or not _load_cached(commit):
+        _refresh_update(commit, branch, slug)
+    status, ahead = _UPDATE.get("status"), _UPDATE.get("ahead_by", 0)
+    tag = _UPDATE.get("tag", "?")
+    if status == "ahead" and ahead:
+        print(f"  UPDATE AVAILABLE: release {tag} is {ahead} commit(s) ahead of this install.")
+        print(f"  https://github.com/{slug}/releases/latest - re-run install.sh, then /mcp reconnect.")
+        return 1
+    if status == "identical":
+        print(f"  up to date with release {tag}")
+    elif status == "no-release":
+        print(f"  {slug} has published no releases; nothing to compare")
+    elif status == "unknown-commit":
+        print(f"  {commit} is not a commit on {slug} (a local build?); nothing to compare")
+    elif status in ("behind", "diverged"):
+        print(f"  ahead of release {tag} ({status}); no update needed")
+    else:
+        print(f"  could not reach GitHub ({_UPDATE.get('detail', 'unknown')}); try again later")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv[1:]:
+        sys.exit(_check_cli())
     mcp.run()

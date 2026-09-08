@@ -160,29 +160,53 @@ git pull && ./install.sh          # update
 Python process is already running with the old code in memory. Use
 `/mcp reconnect`.
 
-**A stale install is silent.** The servers are installed as file copies, so
-committing a fix and *running* it are independent facts, and nothing in the tool
-output used to distinguish them - a hardening commit once sat uninstalled
-through a whole incident while the repo looked correct. `install.sh` now stamps
-a `VERSION` beside the copies, and four things read it:
+**A stale install is silent.** The servers are installed as file copies, so a
+newer version existing and a newer version *running* are independent facts, and
+nothing in the tool output used to distinguish them - a hardening commit once sat
+uninstalled through a whole incident while the repo looked correct. `install.sh`
+stamps a `VERSION` beside the copies, and the wrappers compare it against the
+latest **published release** on GitHub.
 
-- **The MCP handshake.** The stamp rides in `serverInfo.version`, and a stale
-  install leads the server's `instructions` with a `!! STALE WRAPPER` banner.
+The release, deliberately, not the default branch: unreleased commits on `main`
+are work in progress, and telling everyone to reinstall because a branch moved is
+noise. The comparison is `compare/<installed>...<tag>`, so a local build sitting
+*ahead* of the last release reports `behind` and stays quiet, and a commit GitHub
+has never seen 404s and stays quiet too.
+
+Four things surface the result:
+
+- **The MCP handshake.** The stamp rides in `serverInfo.version`, and a newer
+  release leads the server's `instructions` with a `!! UPDATE AVAILABLE` banner.
   Those reach the client at connect time, so the warning is in the session
-  *before* the first dispatch rather than after an hour of delegate time spent
-  on code that does not contain the fix.
-- **Every dispatch**, which appends a `[STALE WRAPPER: ...]` line to the result.
-  Belt to the handshake's braces, for a client that ignores instructions.
-- **`./install.sh --check`**, which exits 1 when stale, so it works as a CI guard.
-- **`delegation_status`**, the one that queries the remote.
+  *before* the first dispatch rather than after an hour of delegate time spent on
+  code that does not contain the fix.
+- **Every dispatch**, which appends the same line to the result. Belt to the
+  handshake's braces, for a client that ignores instructions.
+- **`python <server>.py --check`**, which prints the comparison and exits 1 when
+  an update is available - usable as a CI guard, and as a `SessionStart` hook:
 
-Everything except `delegation_status` is strictly local and memoised: no network
-call, and one `git` invocation per server lifetime.
+  ```json
+  { "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "timeout": 15,
+    "command": "D=\"${AGENT_MCP_HOME:-$HOME/.local/share/agent-delegation-mcp}\"; P=\"$D/.venv/bin/python\"; S=\"$D/opencode_mcp_server.py\"; [ -f \"$S\" ] || S=\"$D/agy_mcp_server.py\"; if [ -x \"$P\" ] && [ -f \"$S\" ]; then OUT=\"$(\"$P\" \"$S\" --check 2>/dev/null)\"; if [ $? -ne 0 ]; then printf \"%s\" \"$OUT\" | python3 -c 'import json,sys; t=sys.stdin.read().strip(); print(json.dumps({\"systemMessage\": t, \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": t}}))'; fi; fi; exit 0"
+  } ] } ] } }
+  ```
+
+  Silent unless there is something to say. It runs in about 0.2s: `--check` skips
+  the MCP SDK import, which is eight times the cost of the check itself.
+- **`delegation_status`**, which forces a fresh query instead of reading the
+  cache.
+
+The check is **one unauthenticated GitHub request per day**, refreshed on a
+background thread at server start so it never delays startup, cached in
+`.update-check.json` beside the servers. It sends nothing but the request. Set
+`AGENT_MCP_UPDATE_CHECK=0` to switch it off entirely.
 
 One limit is structural and worth stating plainly: **a stale install cannot warn
 you about itself unless it already contains this code.** An install predating it
-is silent, exactly as before. The guarantee runs forward from the first install
-that has it, not backward.
+is silent, exactly as before, and so is one whose commit was never pushed. The
+guarantee runs forward from the first install that has it, not backward - the
+`SessionStart` hook above is the way to close that gap, since it does not depend
+on what the installed servers can do.
 
 ---
 
@@ -206,6 +230,9 @@ Everything is an environment variable, set on the MCP registration (`-e` on
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
+| `AGENT_MCP_UPDATE_CHECK` | both | `1` | Set to `0` to disable the daily GitHub release check entirely. |
+| `AGENT_MCP_UPDATE_TTL` | both | `86400` | Seconds between release checks. `--check --force` bypasses it. |
+| `AGENT_MCP_REPO` | both | `artcar12/agent-delegation-mcp` | The repo to check against. Set it if you run a fork. `install.sh` records the checkout's own origin, which wins over this. |
 
 ---
 
