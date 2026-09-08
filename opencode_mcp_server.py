@@ -117,8 +117,6 @@ FATAL_PATTERNS = tuple(
 ARTIFACT_DIR = ".agent-runs"
 ARTIFACT_LIMIT = 20
 
-mcp = _Server("opencode-wrapper")
-
 
 def _truncate(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
@@ -341,17 +339,24 @@ def _staleness() -> str:
     if commit and commit != "unknown" and src and os.path.isdir(src):
         head = _git(src, "rev-parse", "--short", "HEAD")
         if head and head != commit:
-            note = (f"\n\n[STALE WRAPPER: this server is running {commit}; {src} is at "
-                    f"{head}. Fixes committed there are NOT in effect. Run "
-                    f"{src}/install.sh, then /mcp reconnect.]")
+            note = (f"STALE WRAPPER: this server is running {commit}; {src} is at {head}. "
+                    f"Fixes committed there are NOT in effect - including any fix you were "
+                    f"just told to expect. Run {src}/install.sh, then /mcp reconnect.")
         elif head:
             behind = _git(src, "rev-list", "--count", "HEAD..@{upstream}")
             if behind.isdigit() and int(behind) > 0:
-                note = (f"\n\n[POSSIBLY BEHIND REMOTE: {src} is {behind} commit(s) behind its "
+                note = (f"POSSIBLY BEHIND REMOTE: {src} is {behind} commit(s) behind its "
                         f"upstream as of its last fetch. `git -C {src} pull && ./install.sh`, "
-                        f"then /mcp reconnect. Run delegation_status for a live check.]")
+                        f"then /mcp reconnect. Run delegation_status for a live check.")
     _STALENESS.append(note)
     return note
+
+
+def _staleness_suffix() -> str:
+    """Same finding, appended to a tool result. Belt to the instructions' braces:
+    a client that drops server instructions still sees this one."""
+    note = _staleness()
+    return f"\n\n[{note}]" if note else ""
 
 
 def _probe(argv: list) -> str:
@@ -367,6 +372,49 @@ def _probe(argv: list) -> str:
         return f"(failed: {exc})"
     text = (p.stdout or p.stderr or "").strip().splitlines()
     return text[0] if text else "(no output)"
+
+
+def _instructions() -> str:
+    """Handed to the client at connect time, so it lands in the session before
+    the first dispatch rather than after it. Two things belong here and nowhere
+    else: a stale install, which the caller needs to know BEFORE spending an
+    hour of delegate time on code that does not contain the fix; and the rules
+    whose whole point is that a tool result arrives too late to convey them.
+    """
+    version = _installed_version()
+    head = [f"opencode-wrapper {version.get('describe') or '(unstamped)'} - delegates coding and "
+            f"research tasks to the opencode CLI, unattended and self-approving."]
+    note = _staleness()
+    if note:
+        head.insert(0, f"!! {note}")
+    head.append(
+        "Rules a tool result cannot deliver in time:\n"
+        "- Brief every delegate to write its deliverable to .agent-runs/<topic>.md, never to "
+        "stdout alone. stdout is lost outright if this connection drops mid-run.\n"
+        "- One dispatch at a time. Models sharing a provider share a quota pool, so a second "
+        "call can be why the first one dies.\n"
+        "- `Connection closed` is NOT evidence the delegate died; it keeps running as an "
+        "orphan. pgrep, check .agent-runs/, wait. Never re-dispatch.\n"
+        "- Call delegation_status for versions, the resolved CLI path and effective timeouts."
+    )
+    return "\n\n".join(head)
+
+
+# Constructed here, not at the top: the instructions below are computed, and the
+# helpers that compute them have to exist first.
+# `version` is where MCP expects a server to advertise itself (it rides in
+# serverInfo), so a client can show it without parsing prose. `instructions`
+# carries the part a client cannot infer: whether that version is the one the
+# source tree actually holds.
+try:
+    mcp = _Server("opencode-wrapper",
+                  version=_installed_version().get("describe", ""),
+                  instructions=_instructions())
+except TypeError:                   # older SDK without one or both parameters
+    try:
+        mcp = _Server("opencode-wrapper", instructions=_instructions())
+    except TypeError:
+        mcp = _Server("opencode-wrapper")
 
 
 @mcp.tool()
@@ -443,9 +491,9 @@ def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     except FileNotFoundError:
         return (f"Error: `opencode` CLI not found at {OPENCODE_BIN}. Install it, or "
                 "set OPENCODE_BIN to its absolute path and reconnect the MCP server."
-                + _staleness())
+                + _staleness_suffix())
 
-    return _await(proc, cwd, since) + _staleness()
+    return _await(proc, cwd, since) + _staleness_suffix()
 
 
 @mcp.tool()

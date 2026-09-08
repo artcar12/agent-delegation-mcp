@@ -164,11 +164,25 @@ Python process is already running with the old code in memory. Use
 committing a fix and *running* it are independent facts, and nothing in the tool
 output used to distinguish them - a hardening commit once sat uninstalled
 through a whole incident while the repo looked correct. `install.sh` now stamps
-a `VERSION` beside the copies, and three things read it: `--check` (exits 1 when
-stale, so it works as a CI guard), the `delegation_status` tool, and every
-dispatch, which appends a `[STALE WRAPPER: ...]` line when the installed commit
-is behind the checkout it came from. The dispatch check is strictly local and
-memoised; `delegation_status` is the one that queries the remote.
+a `VERSION` beside the copies, and four things read it:
+
+- **The MCP handshake.** The stamp rides in `serverInfo.version`, and a stale
+  install leads the server's `instructions` with a `!! STALE WRAPPER` banner.
+  Those reach the client at connect time, so the warning is in the session
+  *before* the first dispatch rather than after an hour of delegate time spent
+  on code that does not contain the fix.
+- **Every dispatch**, which appends a `[STALE WRAPPER: ...]` line to the result.
+  Belt to the handshake's braces, for a client that ignores instructions.
+- **`./install.sh --check`**, which exits 1 when stale, so it works as a CI guard.
+- **`delegation_status`**, the one that queries the remote.
+
+Everything except `delegation_status` is strictly local and memoised: no network
+call, and one `git` invocation per server lifetime.
+
+One limit is structural and worth stating plainly: **a stale install cannot warn
+you about itself unless it already contains this code.** An install predating it
+is silent, exactly as before. The guarantee runs forward from the first install
+that has it, not backward.
 
 ---
 
