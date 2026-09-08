@@ -1,8 +1,13 @@
 # agent-delegation-mcp
 
-Two local MCP stdio servers that let **Claude Code** hand implementation work to
-the **Antigravity CLI** (`agy`, Gemini) and to **OpenCode**, run it fully
-autonomously, and then gate the result.
+A Claude Code plugin providing two local MCP stdio servers, which let **Claude
+Code** hand implementation work to the **Antigravity CLI** (`agy`, Gemini) and to
+**OpenCode**, run it fully autonomously, and then gate the result.
+
+```bash
+claude plugin marketplace add artcar12/agent-delegation-mcp
+claude plugin install agent-delegation@agent-delegation-mcp
+```
 
 Claude plans and reviews. Cheaper or higher-quota models do the bulk
 implementation. Claude decides whether the work is correct.
@@ -50,176 +55,143 @@ review, the gate) while the mechanical work goes elsewhere.
 2. **OpenCode CLI** on PATH as `opencode`, likewise authenticated.
    `opencode models` lists the `provider/model` ids. Skip if you only want
    Antigravity.
-3. **Claude Code**, and either [`uv`](https://docs.astral.sh/uv/) (strongly
-   preferred, see [Pin the interpreter](#pin-the-interpreter)) or a `python3`.
+3. **Claude Code**, and [`uv`](https://docs.astral.sh/uv/). uv is not optional:
+   it is what resolves each server's single dependency, and there is no venv to
+   build or maintain because of it.
 
 ### Quick start
 
-```bash
-git clone https://github.com/artcar12/agent-delegation-mcp.git
-cd agent-delegation-mcp
-./install.sh
-```
-
-To install only one server, pass `--servers`. For example, OpenCode alone (no
-agy wrapper):
+This repo is a Claude Code plugin marketplace. Installing is two commands and no
+shell script:
 
 ```bash
-./install.sh --servers opencode
+claude plugin marketplace add artcar12/agent-delegation-mcp
+claude plugin install agent-delegation@agent-delegation-mcp
 ```
 
-Use `--servers agy` for the other one; the default installs both.
+Then `/reload-plugins`, or restart Claude Code. The tools appear as
+`mcp__agy-wrapper__ask_agy` and `mcp__opencode-wrapper__ask_opencode`.
 
-Then restart Claude Code, or run `/mcp reconnect` in an open session. The tools
-appear as `mcp__agy-wrapper__ask_agy` and `mcp__opencode-wrapper__ask_opencode`.
+> [!NOTE]
+> Read the two server files before installing. You are installing something that
+> will let a model run shell commands unattended, and being a plugin does not
+> change that — it just makes it a smaller thing to read than an installer.
 
-There is deliberately no `curl ... | bash` one-liner. You are installing
-something that will let a model run shell commands unattended. Read `install.sh`
-and the two server files first.
+### What installing actually does
 
-### Installer options
-
-```
---dir PATH           install location (default ~/.local/share/agent-delegation-mcp)
---servers LIST       comma-separated: agy, opencode (default both)
---python VERSION     interpreter version for the venv (default 3.13)
---default-cwd PATH   pin AGENT_MCP_DEFAULT_CWD; omit to use each session's cwd
---scope SCOPE        claude mcp scope: user, project or local (default user)
---no-register        install files only, skip `claude mcp add`
---uninstall          deregister the servers and delete the installed files
--y, --yes            do not prompt on uninstall
-```
-
-It is idempotent: re-running replaces whatever it installed last time. Re-run it
-after upgrading node (see [`OPENCODE_BIN`](#3-configuration)) or after pulling a
-new version of this repo.
-
-### What the installer does
-
-1. Resolves `agy` and `opencode` to **absolute paths** and records them in the
-   MCP registration. An MCP server is spawned by Claude Code and does not
-   reliably inherit a login shell's PATH.
-2. Builds a venv with a pinned interpreter and installs `mcp`.
-3. Smoke-tests each server by importing it, so a broken install fails loudly
-   here instead of silently at the point where Claude wants the tool.
-4. Registers both servers with `claude mcp add -s user`.
-
-### Manual install
-
-```bash
-uv venv --python 3.13 ~/.local/share/agent-delegation-mcp/.venv
-uv pip install --python ~/.local/share/agent-delegation-mcp/.venv/bin/python mcp
-cp *_mcp_server.py ~/.local/share/agent-delegation-mcp/
-
-claude mcp add agy-wrapper -s user \
-  -e AGY_BIN="$(command -v agy)" \
-  -- ~/.local/share/agent-delegation-mcp/.venv/bin/python \
-     ~/.local/share/agent-delegation-mcp/agy_mcp_server.py
-
-claude mcp add opencode-wrapper -s user \
-  -e OPENCODE_BIN="$(command -v opencode)" \
-  -- ~/.local/share/agent-delegation-mcp/.venv/bin/python \
-     ~/.local/share/agent-delegation-mcp/opencode_mcp_server.py
-```
-
-The equivalent raw config in `~/.claude.json`:
+`.claude-plugin/plugin.json` declares the plugin. `.mcp.json` beside it declares
+the two stdio servers, and is picked up automatically:
 
 ```json
-"mcpServers": {
-  "agy-wrapper": {
-    "type": "stdio",
-    "command": "/home/you/.local/share/agent-delegation-mcp/.venv/bin/python",
-    "args": ["/home/you/.local/share/agent-delegation-mcp/agy_mcp_server.py"],
-    "env": { "AGY_BIN": "/usr/local/bin/agy" }
+{
+  "mcpServers": {
+    "opencode-wrapper": {
+      "command": "uv",
+      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT}/opencode_mcp_server.py"]
+    }
   }
 }
 ```
 
-Each server file is standalone. Neither imports the other, so you can drop just
-one of them into an existing venv.
+`uv run --script` reads the [PEP 723](https://peps.python.org/pep-0723/) block at
+the top of the server file:
 
-#### Pin the interpreter
-
-A stock `python3 -m venv` leaves `bin/python` as a symlink to whatever `python3`
-resolves to later. When a brew or distro upgrade moves it (3.13 to 3.14, say),
-`site-packages/python3.13/` no longer matches and **every MCP server here fails
-to start with no error anywhere**. The tools simply vanish from Claude's tool
-list. Use `uv venv --python 3.13`, or point the config at an explicitly
-versioned binary. The installer prefers uv for exactly this reason and warns
-when it has to fall back.
-
-### Updating and uninstalling
-
-```bash
-git pull && ./install.sh          # update
-./install.sh --check              # is the installed copy current?
-./install.sh --uninstall          # remove
+```python
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["mcp>=1.29,<3"]
+# ///
 ```
 
+and resolves the interpreter and the `mcp` package itself, caching them after the
+first run (about 2s to start once warm).
+
+That block replaces a venv this project used to build and pin by hand, and the
+reason it was pinned is worth keeping in mind if you register these servers some
+other way. A stock `python3 -m venv` leaves `bin/python` as a symlink to whatever
+`python3` resolves to later. When a brew or distro upgrade moves it — 3.13 to
+3.14, say — `site-packages/python3.13/` no longer matches and **every MCP server
+here fails to start with no error anywhere**. The tools simply vanish from
+Claude's tool list. uv resolves an interpreter satisfying `requires-python` at
+each launch, so no symlink is left to go stale.
+
+### Running only one of the two
+
+Both servers install together, and neither imports the other. To run just one,
+disable the other in `/plugin`, or register the one you want by hand (below).
+
+### Without the plugin system
+
+They are ordinary MCP stdio servers and work registered directly:
+
+```bash
+git clone https://github.com/artcar12/agent-delegation-mcp.git ~/src/agent-delegation-mcp
+
+claude mcp add opencode-wrapper -s user \
+  -e OPENCODE_BIN="$(command -v opencode)" \
+  -- uv run --script ~/src/agent-delegation-mcp/opencode_mcp_server.py
+```
+
+What you give up is what the plugin system provides for free: version tracking,
+update notification, and `/plugin` visibility. `delegation_status` will report
+`(dev checkout: no plugin manifest)`, which is precisely what it is.
+
+### Updating
+
+Claude Code polls the marketplace on its own and offers the update, so normally
+you are told rather than having to ask. To force it:
+
+```bash
+claude plugin marketplace update agent-delegation-mcp
+claude plugin update agent-delegation
+```
+
+then `/reload-plugins`.
+
 **Editing a server file does nothing until the server is reconnected.** The
-Python process is already running with the old code in memory. Use
-`/mcp reconnect`.
+Python process is already running with the old code in memory. `/reload-plugins`
+after a plugin update; `/mcp reconnect` after editing a checkout in place.
 
-**A stale install is silent.** The servers are installed as file copies, so a
-newer version existing and a newer version *running* are independent facts, and
-nothing in the tool output used to distinguish them - a hardening commit once sat
-uninstalled through a whole incident while the repo looked correct. `install.sh`
-stamps a `VERSION` beside the copies, and the wrappers compare it against the
-latest **published release** on GitHub.
+**Which version is actually running** is the question a stale install makes hard,
+and it is not academic: a hardening commit once sat uninstalled through an entire
+incident while the repo looked correct. Two things answer it, neither of them
+bespoke to this project. The installed version rides in `serverInfo.version` at
+the MCP handshake and heads the server's `instructions`, so it is in the session
+before the first dispatch. And `delegation_status` prints it next to the absolute
+path of the file actually executing.
 
-The release, deliberately, not the default branch: unreleased commits on `main`
-are work in progress, and telling everyone to reinstall because a branch moved is
-noise. The comparison is `compare/<installed>...<tag>`, so a local build sitting
-*ahead* of the last release reports `behind` and stays quiet, and a commit GitHub
-has never seen 404s and stays quiet too.
+### Uninstalling
 
-Four things surface the result:
+```bash
+claude plugin uninstall agent-delegation
+claude plugin marketplace remove agent-delegation-mcp
+```
 
-- **The MCP handshake.** The stamp rides in `serverInfo.version`, and a newer
-  release leads the server's `instructions` with a `!! UPDATE AVAILABLE` banner.
-  Those reach the client at connect time, so the warning is in the session
-  *before* the first dispatch rather than after an hour of delegate time spent on
-  code that does not contain the fix.
-- **Every dispatch**, which appends the same line to the result. Belt to the
-  handshake's braces, for a client that ignores instructions.
-- **`python <server>.py --check`**, which prints the comparison and exits 1 when
-  an update is available - usable as a CI guard, and as a `SessionStart` hook:
+### Releasing (maintainers)
 
-  ```json
-  { "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "timeout": 15,
-    "command": "D=\"${AGENT_MCP_HOME:-$HOME/.local/share/agent-delegation-mcp}\"; P=\"$D/.venv/bin/python\"; S=\"$D/opencode_mcp_server.py\"; [ -f \"$S\" ] || S=\"$D/agy_mcp_server.py\"; if [ -x \"$P\" ] && [ -f \"$S\" ]; then OUT=\"$(\"$P\" \"$S\" --check 2>/dev/null)\"; if [ $? -ne 0 ]; then printf \"%s\" \"$OUT\" | python3 -c 'import json,sys; t=sys.stdin.read().strip(); print(json.dumps({\"systemMessage\": t, \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": t}}))'; fi; fi; exit 0"
-  } ] } ] } }
-  ```
+`version` in `.claude-plugin/plugin.json` and the matching entry in
+`.claude-plugin/marketplace.json` must agree; `claude plugin validate .` checks
+that, and `claude plugin tag` refuses to tag if they disagree or the tree is
+dirty:
 
-  Silent unless there is something to say. It runs in about 0.2s: `--check` skips
-  the MCP SDK import, which is eight times the cost of the check itself.
-- **`delegation_status`**, which forces a fresh query instead of reading the
-  cache.
-
-The check is **one unauthenticated GitHub request per day**, refreshed on a
-background thread at server start so it never delays startup, cached in
-`.update-check.json` beside the servers. It sends nothing but the request. Set
-`AGENT_MCP_UPDATE_CHECK=0` to switch it off entirely.
-
-One limit is structural and worth stating plainly: **a stale install cannot warn
-you about itself unless it already contains this code.** An install predating it
-is silent, exactly as before, and so is one whose commit was never pushed. The
-guarantee runs forward from the first install that has it, not backward - the
-`SessionStart` hook above is the way to close that gap, since it does not depend
-on what the installed servers can do.
+```bash
+claude plugin validate .
+claude plugin tag . --push        # creates agent-delegation--v<version>
+```
 
 ---
 
 ## 3. Configuration
 
-Everything is an environment variable, set on the MCP registration (`-e` on
-`claude mcp add`, or the `env` block in `~/.claude.json`). All are optional.
+Everything is an environment variable. Set it in the `env` block of an
+`.mcp.json` entry, with `-e` on `claude mcp add`, or in the environment Claude
+Code itself inherits. All are optional.
 
 | Variable | Applies to | Default | Why you would change it |
 |---|---|---|---|
 | `AGENT_MCP_DEFAULT_CWD` | both | the session's working directory | Pin every dispatch to one project regardless of where Claude was started. The `cwd` tool argument always wins. |
 | `AGY_BIN` | agy | `agy` on PATH | PATH is not reliably inherited by an MCP subprocess. |
-| `OPENCODE_BIN` | opencode | `opencode` on PATH | Same, and more urgent: `opencode` usually lives under an nvm node dir whose path carries the node version, so it moves on every node upgrade. Re-run the installer, or point this at a stable symlink such as `/usr/local/bin/opencode`. |
+| `OPENCODE_BIN` | opencode | `opencode` on PATH | Same, and more urgent: `opencode` usually lives under an nvm node dir whose path carries the node version, so it moves on every node upgrade. Point this at a stable symlink such as `/usr/local/bin/opencode`. |
 | `AGY_MCP_MODEL` | agy | `gemini-3.6-flash-high` | Model ids go stale. Check `agy models`. |
 | `OPENCODE_MCP_MODEL` | opencode | `opencode-go/glm-5.2` | Check `opencode models`. |
 | `OPENCODE_MCP_AGENT` | opencode | `build` | Only if you have renamed your write-capable agent. See [§4](#4-what-the-tools-actually-run). |
@@ -230,9 +202,6 @@ Everything is an environment variable, set on the MCP registration (`-e` on
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
-| `AGENT_MCP_UPDATE_CHECK` | both | `1` | Set to `0` to disable the daily GitHub release check entirely. |
-| `AGENT_MCP_UPDATE_TTL` | both | `86400` | Seconds between release checks. `--check --force` bypasses it. |
-| `AGENT_MCP_REPO` | both | `artcar12/agent-delegation-mcp` | The repo to check against. Set it if you run a fork. `install.sh` records the checkout's own origin, which wins over this. |
 
 ---
 
@@ -506,9 +475,9 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Reports success, files written to the caller's dir (opencode) | opencode ignores the subprocess cwd | `--dir <cwd>` |
 | Returns a plan, edits nothing | `"default_agent": "plan"` is read-only | `--agent build` |
 | `timeout waiting for response` after ~5 minutes | agy's print-mode default wait, not the subprocess timeout | `--print-timeout 60m`; check `git log` before believing the error |
-| Tools missing from Claude entirely | venv `python` symlink followed a system Python upgrade | pin the interpreter, or re-run `install.sh` |
-| Tool reports "CLI not found" after a node upgrade | nvm path carries the node version | re-run `install.sh`, or set `OPENCODE_BIN` to a stable symlink |
-| Edits to a `.py` have no effect | the server process holds the old code | `/mcp reconnect` |
+| Tools missing from Claude entirely | a hand-built venv's `python` symlink followed a system Python upgrade | let `uv run --script` resolve the interpreter, as the plugin does |
+| Tool reports "CLI not found" after a node upgrade | nvm path carries the node version | set `OPENCODE_BIN` to a stable symlink |
+| Edits to a `.py` have no effect | the server process holds the old code | `/reload-plugins`, or `/mcp reconnect` |
 | Model id rejected | defaults go stale, or the model is region-gated | `agy models` / `opencode models` |
 | Gate passes, feature does not work | tests cover the helper, not the caller | the §5.5 checklist |
 | No visibility during a long run | blocking subprocess, no interim output | the mandatory progress file |
@@ -516,27 +485,29 @@ reopening settled questions or rediscovering the same platform gotcha.
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | `pgrep`, check `.agent-runs/`, wait. Never re-dispatch. See §5.1 |
 | Killed as hung, but the task was fine | idle timeout is below what that task quietly needs | raise `OPENCODE_MCP_IDLE_TIMEOUT`, or set it to `0` |
-| A fix is committed but nothing changes | the installed copy is a stale file copy | `./install.sh --check`, or the `delegation_status` tool; then `install.sh` and `/mcp reconnect` |
+| A fix is committed but nothing changes | the running server is an older installed version | `delegation_status` for what is actually running; then `claude plugin update` and `/reload-plugins` |
 
 ---
 
 ## 8. Minimum viable version
 
-If you want the smallest useful slice: install just `opencode_mcp_server.py`,
-and adopt three rules. Write the plan to a file, demand a progress log, and
-re-run the gate yourself afterward. The rest is refinement on top of that loop.
+If you want the smallest useful slice: run `opencode_mcp_server.py` alone, and
+adopt three rules. Write the plan to a file, demand a progress log, and re-run
+the gate yourself afterward. The rest is refinement on top of that loop.
 
 ```bash
-./install.sh --servers opencode
+claude mcp add opencode-wrapper -s user \
+  -e OPENCODE_BIN="$(command -v opencode)" \
+  -- uv run --script "$PWD/opencode_mcp_server.py"
 ```
 
 ---
 
 ## Verified against
 
-macOS, `agy` 1.1.12, `opencode` 1.18.10, `mcp` 2.0.0 on uv-managed CPython
-3.14.5, Claude Code with Opus. Version-sensitive claims are called out inline.
-The failure modes came from real production use.
+macOS, `agy` 1.1.27, `opencode` 1.18.29, `mcp` 2.2.0 on uv-managed CPython
+3.14.5, `uv` 0.11.19, Claude Code with Opus. Version-sensitive claims are called
+out inline. The failure modes came from real production use.
 
 ## License
 

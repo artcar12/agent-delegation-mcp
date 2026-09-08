@@ -1,3 +1,0 @@
-# mcp 2.x exposes mcp.server.MCPServer; 1.x exposes mcp.server.fastmcp.FastMCP.
-# Both servers import whichever is present, so either major version works.
-mcp>=1.29,<3

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "opencode-wrapper": {
+      "command": "uv",
+      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT}/opencode_mcp_server.py"]
+    },
+    "agy-wrapper": {
+      "command": "uv",
+      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT}/agy_mcp_server.py"]
+    }
+  }
+}
