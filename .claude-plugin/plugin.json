@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "agent-delegation",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Delegates long-running coding and research tasks to the OpenCode and Antigravity (agy) CLIs as unattended MCP subagents. Fails fast on provider quota walls instead of blocking for the full hour, kills hung delegates on an idle timer, and reports whatever the delegate wrote to .agent-runs/ on every exit path.",
   "author": {
     "name": "Arthur Carroll"
