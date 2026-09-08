@@ -55,9 +55,17 @@ review, the gate) while the mechanical work goes elsewhere.
 2. **OpenCode CLI** on PATH as `opencode`, likewise authenticated.
    `opencode models` lists the `provider/model` ids. Skip if you only want
    Antigravity.
-3. **Claude Code**, and [`uv`](https://docs.astral.sh/uv/). uv is not optional:
-   it is what resolves each server's single dependency, and there is no venv to
-   build or maintain because of it.
+3. **Claude Code**, and [`uv`](https://docs.astral.sh/uv/) **on the PATH Claude
+   Code itself runs with**. uv is not optional: it is what resolves each server's
+   single dependency, and there is no venv to build or maintain because of it.
+
+   Check with `command -v uv`, and check it again after upgrading uv, because
+   this failure is silent in the worst way. `.mcp.json` invokes `uv` by name; if
+   the name does not resolve, the server never starts and **the tools simply do
+   not appear in Claude** - no error in the session, nothing to notice. A
+   `brew upgrade uv` that leaves the keg unlinked produces exactly this (fix:
+   `brew link --overwrite uv`), and so does any install that puts uv somewhere a
+   GUI-launched Claude Code does not inherit.
 
 ### Quick start
 
