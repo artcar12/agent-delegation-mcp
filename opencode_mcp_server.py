@@ -395,6 +395,21 @@ def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     `opencode models` - ids go stale. Note that models sharing a provider share
     one quota pool: when one reports a usage limit, its siblings are also out.
 
+    FREE TIER (the `opencode/` provider, as opposed to `opencode-go/`): usable
+    for smoke tests and mechanical work when quota is tight. Verified to
+    complete a write-a-file task, fastest first - ling-3.0-flash-fin-free
+    (~12s), muse-spark-1.3-contributor-free, big-pickle,
+    muse-spark-1.2-contributor-free, mimo-v2.5-free. Prefer mimo-v2.5-free for
+    anything past a one-liner; it is the only one seen to follow a
+    multi-field brief with shell substitutions.
+
+    Both Nemotron tiers FAILED and should not be used: nemotron-3.5-lightning-
+    free emitted malformed tool-call syntax and wrote nothing;
+    nemotron-3-ultra-free created the output directory, then produced nothing
+    for 120s and had to be killed. Free models are small - keep briefs
+    single-step and verify the output, since a plausible-looking return here
+    is weaker evidence than usual.
+
     OpenCode's top models are Claude-tier, so unlike ask_agy, judgment-shaped
     work - including writing the plan itself - is in scope here. Run
     `opencode stats` before and after big dispatches for real usage numbers.
