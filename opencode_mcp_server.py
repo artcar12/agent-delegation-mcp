@@ -289,6 +289,86 @@ def _await(proc: subprocess.Popen, cwd: str, since: float) -> str:
     return (out or "(opencode produced no output)") + artifacts
 
 
+def _git(repo: str, *args: str) -> str:
+    """One-line git query with a hard timeout. Never network, never mutating -
+    a diagnostic must not be able to hang the dispatch it is annotating."""
+    try:
+        p = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                           text=True, timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else ""
+
+
+def _installed_version() -> dict:
+    """install.sh stamps a VERSION next to this file. Its absence is a real
+    answer, not an error: dropping a single .py into a venv by hand is a
+    supported way to run this, and "unstamped" is what that looks like."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    data = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                key, _, val = line.partition("=")
+                if val:
+                    data[key.strip()] = val.strip()
+    except OSError:
+        return {}
+    return data
+
+
+# Memo, not a cache with a lifetime: a running server holds its code in memory,
+# so this answer cannot change without a /mcp reconnect, which re-imports.
+_STALENESS: list = []
+
+
+def _staleness() -> str:
+    """Appended to every dispatch, because a stale install is silent by
+    construction. The servers are file copies, so the only other evidence is an
+    mtime compared against `git log` by hand - which is how a committed
+    process-group fix sat uninstalled through a real incident.
+
+    Strictly local: comparing against the remote would mean a network call on
+    every dispatch. The upstream half reads the origin ref as of the checkout's
+    last fetch, so it under-reports rather than crying wolf. `delegation_status`
+    does the live check.
+    """
+    if _STALENESS:
+        return _STALENESS[0]
+    note = ""
+    version = _installed_version()
+    commit, src = version.get("commit", ""), version.get("source", "")
+    if commit and commit != "unknown" and src and os.path.isdir(src):
+        head = _git(src, "rev-parse", "--short", "HEAD")
+        if head and head != commit:
+            note = (f"\n\n[STALE WRAPPER: this server is running {commit}; {src} is at "
+                    f"{head}. Fixes committed there are NOT in effect. Run "
+                    f"{src}/install.sh, then /mcp reconnect.]")
+        elif head:
+            behind = _git(src, "rev-list", "--count", "HEAD..@{upstream}")
+            if behind.isdigit() and int(behind) > 0:
+                note = (f"\n\n[POSSIBLY BEHIND REMOTE: {src} is {behind} commit(s) behind its "
+                        f"upstream as of its last fetch. `git -C {src} pull && ./install.sh`, "
+                        f"then /mcp reconnect. Run delegation_status for a live check.]")
+    _STALENESS.append(note)
+    return note
+
+
+def _probe(argv: list) -> str:
+    """First line of a `--version`-style call, or a reason it produced none."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL, env=_child_env())
+    except FileNotFoundError:
+        return "(not found)"
+    except subprocess.TimeoutExpired:
+        return "(no answer within 10s)"
+    except OSError as exc:
+        return f"(failed: {exc})"
+    text = (p.stdout or p.stderr or "").strip().splitlines()
+    return text[0] if text else "(no output)"
+
+
 @mcp.tool()
 def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD) -> str:
     """
@@ -326,6 +406,20 @@ def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     work - including writing the plan itself - is in scope here. Run
     `opencode stats` before and after big dispatches for real usage numbers.
 
+    DELIVERABLE GOES IN A FILE, NOT STDOUT. Brief the delegate to write its
+    result to `.agent-runs/<topic>-<model>.md` and to append one line per phase
+    to `.agent-runs/<topic>.log`. Never brief it to "print the review to
+    stdout": stdout is lost outright if the MCP transport drops mid-run, and
+    truncated to a tail if the run is killed, so a stdout-only deliverable can
+    vanish after an hour of real work. A file survives both, and this tool
+    lists whatever was written there on every exit path. Read the .log while
+    the run is still going - a blocking subprocess gives no other progress
+    signal.
+
+    ONE DISPATCH AT A TIME. Do not put two delegation calls in a single tool
+    block. Concurrency risks a rate limit, and models sharing a provider share
+    a quota pool, so a second call can be the reason the first one dies.
+
     RETURN VALUE IS NOT EVIDENCE, in either direction. Verify with git and the
     gate.
     """
@@ -348,9 +442,73 @@ def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
         )
     except FileNotFoundError:
         return (f"Error: `opencode` CLI not found at {OPENCODE_BIN}. Install it, or "
-                "set OPENCODE_BIN to its absolute path and reconnect the MCP server.")
+                "set OPENCODE_BIN to its absolute path and reconnect the MCP server."
+                + _staleness())
 
-    return _await(proc, cwd, since)
+    return _await(proc, cwd, since) + _staleness()
+
+
+@mcp.tool()
+def delegation_status() -> str:
+    """
+    Reports what this wrapper actually is: which commit is installed, whether
+    that is behind the checkout it came from or behind the remote, where the
+    opencode CLI resolved to, and the timeouts a dispatch will run under.
+
+    Call this when a dispatch behaves in a way the docstring does not explain,
+    before concluding the tool is broken. A wrapper is installed as a file copy
+    and a running server holds its code in memory, so "the fix is committed" and
+    "the fix is running" are independent facts, and nothing else surfaces the
+    difference. Unlike the check baked into every dispatch, this one queries the
+    remote, so it costs a network round trip.
+    """
+    version = _installed_version()
+    src = version.get("source", "")
+    lines = [
+        "opencode-wrapper",
+        f"  installed:  {version.get('describe') or '(unstamped: not installed via install.sh)'}"
+        f"{' [dirty tree]' if version.get('dirty') == '1' else ''}",
+        f"  installed at: {version.get('installed', '(unknown)')}",
+        f"  source:     {src or '(unknown)'}",
+        f"  running:    {os.path.abspath(__file__)}",
+    ]
+
+    commit = version.get("commit", "")
+    if src and os.path.isdir(src) and commit and commit != "unknown":
+        head = _git(src, "rev-parse", "--short", "HEAD")
+        if not head:
+            lines.append(f"  vs source:  cannot read git in {src}")
+        elif head != commit:
+            lines.append(f"  vs source:  STALE - installed {commit}, checkout is at {head}. "
+                         f"Run {src}/install.sh, then /mcp reconnect.")
+        else:
+            lines.append(f"  vs source:  current ({head})")
+            remote = _git(src, "ls-remote", "--quiet", "origin", "HEAD")
+            remote_sha = remote.split()[0][:len(head)] if remote else ""
+            if not remote_sha:
+                lines.append("  vs remote:  could not reach origin")
+            elif remote_sha != head:
+                # Deliberately not called "behind": without fetching the remote
+                # objects we cannot tell ahead from behind, and telling someone
+                # to pull their own unpushed branch is worse than saying less.
+                lines.append(f"  vs remote:  DIFFERS - origin/HEAD is {remote_sha}, this checkout "
+                             f"is {head}. Either you are ahead (unpushed work) or behind "
+                             f"(`git -C {src} pull && ./install.sh`, then /mcp reconnect).")
+            else:
+                lines.append("  vs remote:  current")
+    else:
+        lines.append("  vs source:  not comparable (no stamp, or the source is gone)")
+
+    lines += [
+        f"  CLI:        {OPENCODE_BIN} -> {_probe([OPENCODE_BIN, '--version'])}",
+        f"  agent:      {AGENT}",
+        f"  model:      {DEFAULT_MODEL}",
+        f"  cwd:        {DEFAULT_CWD}",
+        f"  wall clock: {TIMEOUT_SECONDS}s",
+        f"  idle limit: {str(IDLE_SECONDS) + 's' if IDLE_SECONDS else 'off'}",
+        f"  fail-fast:  {len(FATAL_PATTERNS)} stderr patterns",
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

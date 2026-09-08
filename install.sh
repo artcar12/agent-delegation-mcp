@@ -6,6 +6,7 @@
 #   ./install.sh                          # both servers, user scope
 #   ./install.sh --servers opencode       # just one
 #   ./install.sh --default-cwd ~/code/app # pin a project instead of session cwd
+#   ./install.sh --check                  # is the installed copy current?
 #   ./install.sh --uninstall              # remove registrations and files
 #
 set -euo pipefail
@@ -19,6 +20,7 @@ SCOPE="user"
 DEFAULT_CWD=""
 REGISTER=1
 UNINSTALL=0
+CHECK=0
 ASSUME_YES=0
 
 if [ -t 1 ]; then
@@ -40,6 +42,7 @@ Claude Code. Safe to re-run.
   ./install.sh                          both servers, user scope
   ./install.sh --servers opencode       just one
   ./install.sh --default-cwd ~/code/app pin a project instead of session cwd
+  ./install.sh --check                  report installed vs repo version
   ./install.sh --uninstall              remove registrations and files
 
 Options:
@@ -49,6 +52,8 @@ Options:
   --default-cwd PATH   pin AGENT_MCP_DEFAULT_CWD; omit to use each session's cwd
   --scope SCOPE        claude mcp scope: user, project or local (default user)
   --no-register        install files only, skip `claude mcp add`
+  --check              compare the installed copy against this checkout and exit
+                       (exit 1 if stale, so it is usable as a guard in CI)
   --uninstall          deregister the servers and delete the installed files
   -y, --yes            do not prompt on uninstall
   -h, --help           this text
@@ -63,6 +68,7 @@ while [ $# -gt 0 ]; do
     --default-cwd)  DEFAULT_CWD="${2:?--default-cwd needs a path}"; shift 2 ;;
     --scope)        SCOPE="${2:?--scope needs a value}"; shift 2 ;;
     --no-register)  REGISTER=0; shift ;;
+    --check)        CHECK=1; shift ;;
     --uninstall)    UNINSTALL=1; shift ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     -h|--help)      usage; exit 0 ;;
@@ -96,6 +102,61 @@ deregister() {
   fi
 }
 
+# ------------------------------------------------------------------ version --
+# The servers are installed as plain file copies, so a stale install is
+# invisible: the only evidence is an mtime compared against `git log` by hand.
+# That is exactly how a committed process-group fix sat uninstalled through a
+# real incident. Stamp what was installed, and give both this script and the
+# servers' delegation_status tool something to compare against.
+src_commit() { git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown; }
+
+write_version() {
+  local commit describe dirty
+  commit="$(src_commit)"
+  if [ "$commit" != unknown ]; then
+    describe="$(git -C "$SRC_DIR" describe --tags --always --dirty 2>/dev/null || echo "$commit")"
+    if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then dirty=1; else dirty=0; fi
+  else
+    describe="unknown (not a git checkout)"; dirty=0
+  fi
+  cat > "$INSTALL_DIR/VERSION" <<EOF
+commit=$commit
+describe=$describe
+dirty=$dirty
+installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+source=$SRC_DIR
+EOF
+}
+
+if [ "$CHECK" = 1 ]; then
+  [ -f "$INSTALL_DIR/VERSION" ] || die "no VERSION at $INSTALL_DIR: either nothing is
+         installed there, or the install predates version stamping. Either way it is
+         not the current code - run ./install.sh"
+  i_commit=""; i_when=""; i_src=""; i_dirty=0
+  while IFS='=' read -r k v; do
+    case "$k" in
+      commit)    i_commit="$v" ;;
+      installed) i_when="$v" ;;
+      source)    i_src="$v" ;;
+      dirty)     i_dirty="$v" ;;
+    esac
+  done < "$INSTALL_DIR/VERSION"
+  head="$(src_commit)"
+  info "installed: $i_commit ($i_when, from ${i_src:-unknown})"
+  info "repo HEAD: $head ($SRC_DIR)"
+  if [ "$i_commit" = unknown ] || [ "$head" = unknown ]; then
+    warn "cannot compare: one side is not a git checkout"
+    exit 0
+  fi
+  if [ "$i_commit" != "$head" ]; then
+    die "STALE: installed $i_commit, this checkout is at $head. Run ./install.sh
+         (and then /mcp reconnect - a running server holds the old code in memory)."
+  fi
+  [ "$i_dirty" = 1 ] && warn "installed from a dirty working tree; the files may not match $head"
+  ok "up to date at $head"
+  exit 0
+fi
+
 # ---------------------------------------------------------------- uninstall --
 # Deletes only what this script installs, and only after confirming the venv is
 # a venv. It never recursively removes an arbitrary --dir.
@@ -118,7 +179,7 @@ if [ "$UNINSTALL" = 1 ]; then
     elif [ -e "$VENV" ]; then
       warn "$VENV does not look like a venv (no pyvenv.cfg); left alone"
     fi
-    for f in agy_mcp_server.py opencode_mcp_server.py requirements.txt README.md; do
+    for f in agy_mcp_server.py opencode_mcp_server.py requirements.txt README.md VERSION; do
       [ -f "$INSTALL_DIR/$f" ] && rm -f "$INSTALL_DIR/$f"
     done
     [ -d "$INSTALL_DIR/__pycache__" ] && find "$INSTALL_DIR/__pycache__" -depth -delete
@@ -166,7 +227,8 @@ mkdir -p "$INSTALL_DIR"
 [ "$WANT_OPENCODE" = 1 ] && install -m 0644 "$SRC_DIR/opencode_mcp_server.py" "$INSTALL_DIR/"
 install -m 0644 "$SRC_DIR/requirements.txt" "$INSTALL_DIR/"
 [ -f "$SRC_DIR/README.md" ] && install -m 0644 "$SRC_DIR/README.md" "$INSTALL_DIR/"
-ok "server files copied"
+write_version
+ok "server files copied ($(sed -n 's/^describe=//p' "$INSTALL_DIR/VERSION"))"
 
 # --------------------------------------------------------------------- venv --
 # Pin the interpreter. A stock `python3 -m venv` leaves bin/python as a symlink
@@ -266,7 +328,8 @@ cat <<EOF
 ${B}Done.${N} Restart Claude Code, or run /mcp reconnect in an open session.
 
   Tools:   mcp__agy-wrapper__ask_agy, mcp__opencode-wrapper__ask_opencode
-  Check:   claude mcp list
+  Check:   claude mcp list, ./install.sh --check
+  Version: $(sed -n 's/^describe=//p' "$INSTALL_DIR/VERSION")
   Scope:   ${SCOPE_DESC}
 
 The delegates these tools launch approve their own shell commands, file edits

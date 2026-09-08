@@ -152,12 +152,23 @@ when it has to fall back.
 
 ```bash
 git pull && ./install.sh          # update
+./install.sh --check              # is the installed copy current?
 ./install.sh --uninstall          # remove
 ```
 
 **Editing a server file does nothing until the server is reconnected.** The
 Python process is already running with the old code in memory. Use
 `/mcp reconnect`.
+
+**A stale install is silent.** The servers are installed as file copies, so
+committing a fix and *running* it are independent facts, and nothing in the tool
+output used to distinguish them - a hardening commit once sat uninstalled
+through a whole incident while the repo looked correct. `install.sh` now stamps
+a `VERSION` beside the copies, and three things read it: `--check` (exits 1 when
+stale, so it works as a CI guard), the `delegation_status` tool, and every
+dispatch, which appends a `[STALE WRAPPER: ...]` line when the installed commit
+is behind the checkout it came from. The dispatch check is strictly local and
+memoised; `delegation_status` is the one that queries the remote.
 
 ---
 
@@ -177,6 +188,10 @@ Everything is an environment variable, set on the MCP registration (`-e` on
 | `AGY_MCP_PRINT_TIMEOUT` | agy | `60m` | Passed to `agy --print-timeout`. See [§4](#4-what-the-tools-actually-run). |
 | `AGY_MCP_TIMEOUT` | agy | `3900` | Outer subprocess cap, in seconds. Keep it above `AGY_MCP_PRINT_TIMEOUT` so agy's own limit is the one that hits. |
 | `OPENCODE_MCP_TIMEOUT` | opencode | `3600` | Outer subprocess cap, in seconds. |
+| `OPENCODE_MCP_IDLE_TIMEOUT` | opencode | `600` | Kill a run that produces no output on either stream for this long, in seconds; `0` disables. Distinct from the wall clock, and reported distinctly: a wall clock cannot tell "thinking hard" from "dead". Safe as a default here only because `--print-logs` gives a per-step heartbeat. Raise it if a task legitimately runs silent for longer. |
+| `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
+| `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
+| `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
 
 ---
 
@@ -186,10 +201,11 @@ Everything is an environment variable, set on the MCP registration (`-e` on
 agy --dangerously-skip-permissions --new-project --disable-slash-commands \
     --print-timeout 60m --model <model> --print <prompt>
 
-opencode run --auto --agent build --dir <cwd> --model <model> <prompt>
+opencode run --auto --agent build --print-logs --dir <cwd> --model <model> \
+    -- <prompt>
 ```
 
-Six flags there are non-obvious, and **each one fails silently when dropped**.
+Seven flags there are non-obvious, and **each one fails silently when dropped**.
 Every one cost a debugging session.
 
 - **`--print`** is headless single-prompt mode. Without it `agy` launches an
@@ -213,6 +229,13 @@ Every one cost a debugging session.
 - **`--agent build`** is mandatory whenever `~/.config/opencode/opencode.json`
   sets `"default_agent": "plan"`, which is read-only. Without the override the
   tool returns a plan, edits nothing, and looks like it worked.
+- **`--print-logs`** is what makes opencode's failures *visible*. Its stream
+  errors - including the provider quota wall - go to
+  `~/.local/share/opencode/log/opencode.log` and **never to stdout**, and the
+  CLI does not exit on them: it sits at 0% CPU until something else kills it.
+  Without this flag the wrapper has nothing to match on and blocks for the full
+  hour on a failure the CLI knew about in twenty seconds. The per-step log lines
+  it emits double as the heartbeat that makes the idle timeout safe to enable.
 - **`--auto`** and **`--dangerously-skip-permissions`** are what make the run
   unattended, and are the entire risk surface. See the warning at the top.
 
@@ -247,6 +270,18 @@ This has burned both ways on the same tool:
 Both server files now return partial stdout *plus* a warning on non-zero exit
 rather than swallowing the output, precisely because of the second case.
 
+There is a third case, and it is the one that costs most: **no return value at
+all.** `Connection closed` from a delegation tool reads identically whether the
+server crashed, the transport dropped, or another session deliberately tore the
+MCP connections down - and in none of those cases does the delegate stop. It
+keeps running as an orphan. Nothing the wrapper writes can reach you here, so
+this rule cannot live in a tool docstring; it has to live with you.
+
+> **`Connection closed` is not evidence the delegate died.** `pgrep -f opencode`
+> (or `agy`), look for the file in `.agent-runs/`, and wait. **Never
+> re-dispatch**: concurrent load may be the very thing that caused it, and a
+> second run doubles it.
+
 **Standing practice: after every dispatch, check `git log` and `git status`, and
 re-run the typecheck and test gate yourself, whatever the call returned.**
 
@@ -257,6 +292,16 @@ doing for up to an hour. So every prompt or plan file includes, near the top:
 
 > Append one line to `.agent-runs/<slug>.log` as each phase completes, including
 > the gate result. Update it as you move to the next step.
+
+This is not a nicety, and it is not only about visibility. **stdout is the one
+channel that does not survive failure**: it is lost outright when the transport
+drops mid-run, and truncated to a tail when a run is killed. A brief that says
+"your entire deliverable is a written review printed to stdout" therefore has a
+total-loss failure mode - verified the hard way, on an hour of real work. A file
+on disk survives both, so the deliverable itself belongs in
+`.agent-runs/<topic>-<model>.md`, not just the progress log. Both wrappers list
+whatever appeared under `.agent-runs/` during the run on **every** exit path,
+including the failing ones.
 
 Then `Read` that file while the task is still running. A real example:
 
@@ -427,6 +472,10 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Gate passes, feature does not work | tests cover the helper, not the caller | the §5.5 checklist |
 | No visibility during a long run | blocking subprocess, no interim output | the mandatory progress file |
 | `ImportError: mcp.server.fastmcp` | mcp 2.0 removed that module | already handled: the servers import `MCPServer` and fall back to `FastMCP` |
+| An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
+| `Connection closed`, immediately | the MCP server went away; the delegate did **not** | `pgrep`, check `.agent-runs/`, wait. Never re-dispatch. See §5.1 |
+| Killed as hung, but the task was fine | idle timeout is below what that task quietly needs | raise `OPENCODE_MCP_IDLE_TIMEOUT`, or set it to `0` |
+| A fix is committed but nothing changes | the installed copy is a stale file copy | `./install.sh --check`, or the `delegation_status` tool; then `install.sh` and `/mcp reconnect` |
 
 ---
 
