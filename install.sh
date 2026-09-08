@@ -115,7 +115,9 @@ write_version() {
   commit="$(src_commit)"
   if [ "$commit" != unknown ]; then
     describe="$(git -C "$SRC_DIR" describe --tags --always --dirty 2>/dev/null || echo "$commit")"
-    if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then dirty=1; else dirty=0; fi
+    # -uno: untracked files cannot change what was just copied, and counting
+    # them would stamp every install "dirty" for an unrelated scratch file.
+    if [ -n "$(git -C "$SRC_DIR" status --porcelain -uno 2>/dev/null)" ]; then dirty=1; else dirty=0; fi
   else
     describe="unknown (not a git checkout)"; dirty=0
   fi
