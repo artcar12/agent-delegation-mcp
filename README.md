@@ -1,21 +1,32 @@
+<div align="center">
+
 # agent-delegation-mcp
 
-A Claude Code plugin providing two local MCP stdio servers, which let **Claude
-Code** hand implementation work to the **Antigravity CLI** (`agy`, Gemini) and to
-**OpenCode**, run it fully autonomously, and then gate the result.
+**Claude plans. Cheaper models build. Claude decides whether it's correct.**
+
+Two local MCP stdio servers, shipped as a Claude Code plugin, that let Claude Code
+hand implementation work to the **Antigravity CLI** (`agy`, Gemini) and to
+**OpenCode**, run it fully unattended, and then gate the result.
+
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![plugin](https://img.shields.io/badge/claude%20code-plugin-8A63D2)
+![python](https://img.shields.io/badge/python-%E2%89%A53.10-3776AB)
+![status](https://img.shields.io/badge/verified-agy%201.1.27%20%C2%B7%20opencode%201.18.29-success)
 
 ```bash
 claude plugin marketplace add artcar12/agent-delegation-mcp
 claude plugin install agent-delegation@agent-delegation-mcp
 ```
 
-Claude plans and reviews. Cheaper or higher-quota models do the bulk
-implementation. Claude decides whether the work is correct.
+</div>
+
+---
 
 The whole trick is small: an MCP tool wrapping `subprocess.run(["agy", ...])`.
-What is not small is the set of flags and operating rules that make it reliable,
-and most of this README is that. Every "verified" claim below was established by
-mutation testing on a real project, at the versions listed in
+
+What is *not* small is the set of flags and operating rules that make it
+reliable, and most of this README is that. Every "verified" claim below was
+established by mutation testing on a real project, at the versions listed in
 [Verified against](#verified-against).
 
 > [!WARNING]
@@ -27,11 +38,50 @@ mutation testing on a real project, at the versions listed in
 > shell, and read [Operating rules](#5-operating-rules) before the first real
 > dispatch.
 
+### Contents
+
+| | |
+|---|---|
+| [1. The mental model](#1-the-mental-model) | Three roles, and who this is *not* for |
+| [2. Install](#2-install) | Prerequisites, plugin install, why there is no venv |
+| [3. Configuration](#3-configuration) | Every environment variable |
+| [4. What the tools actually run](#4-what-the-tools-actually-run) | The argv, the seven silent flags, the await loop |
+| [5. Operating rules](#5-operating-rules) | The part that took weeks instead of an hour |
+| [6. Repo conventions](#6-repo-conventions-that-make-this-work) | Where state lives |
+| [7. Known failure modes](#7-known-failure-modes-condensed) | Symptom → cause → fix |
+| [8. Minimum viable version](#8-minimum-viable-version) | The smallest useful slice |
+
 ---
 
 ## 1. The mental model
 
-Three roles, deliberately separated:
+Three roles, deliberately separated.
+
+```mermaid
+flowchart LR
+    U(["You"]) --> C
+
+    subgraph scarce["Anthropic quota &mdash; scarce"]
+        C["<b>Claude Code · Opus</b><br/>architect · reviewer · the gate"]
+    end
+
+    C -->|"writes"| P[["plan file<br/>.agent-runs/*_plan.md"]]
+
+    subgraph plentiful["Someone else's quota &mdash; plentiful"]
+        A["<b>agy</b> → Gemini<br/>mechanical &amp; bulk execution"]
+        O["<b>opencode</b> → GLM · Kimi · GPT · Grok<br/>harder work, incl. writing plans"]
+    end
+
+    C -->|"ask_agy"| A
+    C -->|"ask_opencode"| O
+    P -.->|"read &amp; execute"| A
+    P -.->|"read &amp; execute"| O
+
+    A --> R[("target repo<br/>commits · .agent-runs/*.log")]
+    O --> R
+
+    R ==>|"git diff · test gate · review"| C
+```
 
 | Role | Who | What it does |
 |---|---|---|
@@ -43,6 +93,17 @@ Three roles, deliberately separated:
 Gemini quota is enormous, and OpenCode fronts a wide roster with generous
 per-5-hour limits. So Claude's tokens get spent on judgment (architecture,
 review, the gate) while the mechanical work goes elsewhere.
+
+> [!IMPORTANT]
+> **Who this is not for.** If you work somewhere that will pay for as many
+> Anthropic API tokens as you can burn, this whole project is pointless — just
+> run Opus on everything and skip the entire apparatus below. Every decision
+> here is downstream of one constraint: *the best model is the one you are
+> rationing*. Remove that constraint and you should remove this too.
+>
+> What survives even then is [§5](#5-operating-rules) and
+> [§6](#6-repo-conventions-that-make-this-work): those are about supervising *any*
+> unattended agent, and they apply just as well to a Claude subagent.
 
 ---
 
@@ -62,7 +123,7 @@ review, the gate) while the mechanical work goes elsewhere.
    Check with `command -v uv`, and check it again after upgrading uv, because
    this failure is silent in the worst way. `.mcp.json` invokes `uv` by name; if
    the name does not resolve, the server never starts and **the tools simply do
-   not appear in Claude** - no error in the session, nothing to notice. A
+   not appear in Claude** — no error in the session, nothing to notice. A
    `brew upgrade uv` that leaves the keg unlinked produces exactly this (fix:
    `brew link --overwrite uv`), and so does any install that puts uv somewhere a
    GUI-launched Claude Code does not inherit.
@@ -95,7 +156,7 @@ the two stdio servers, and is picked up automatically:
   "mcpServers": {
     "opencode-wrapper": {
       "command": "uv",
-      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT}/opencode_mcp_server.py"]
+      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT:-.}/opencode_mcp_server.py"]
     }
   }
 }
@@ -114,14 +175,20 @@ the top of the server file:
 and resolves the interpreter and the `mcp` package itself, caching them after the
 first run (about 2s to start once warm).
 
-That block replaces a venv this project used to build and pin by hand, and the
-reason it was pinned is worth keeping in mind if you register these servers some
-other way. A stock `python3 -m venv` leaves `bin/python` as a symlink to whatever
-`python3` resolves to later. When a brew or distro upgrade moves it — 3.13 to
-3.14, say — `site-packages/python3.13/` no longer matches and **every MCP server
-here fails to start with no error anywhere**. The tools simply vanish from
-Claude's tool list. uv resolves an interpreter satisfying `requires-python` at
-each launch, so no symlink is left to go stale.
+The `:-.` fallback in that path matters only if you also open *this* repo as a
+project: `${CLAUDE_PLUGIN_ROOT}` is defined for a plugin and empty otherwise, and
+without a fallback the same `.mcp.json`, loaded as project config, points at
+`/opencode_mcp_server.py` and both servers die instantly with `Connection
+closed`.
+
+That PEP 723 block replaces a venv this project used to build and pin by hand,
+and the reason it was pinned is worth keeping in mind if you register these
+servers some other way. A stock `python3 -m venv` leaves `bin/python` as a
+symlink to whatever `python3` resolves to later. When a brew or distro upgrade
+moves it — 3.13 to 3.14, say — `site-packages/python3.13/` no longer matches and
+**every MCP server here fails to start with no error anywhere**. The tools simply
+vanish from Claude's tool list. uv resolves an interpreter satisfying
+`requires-python` at each launch, so no symlink is left to go stale.
 
 ### Running only one of the two
 
@@ -210,6 +277,7 @@ Code itself inherits. All are optional.
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
+| `AGENT_MCP_MAX_OUTPUT` | both | `100000` | Character cap on the returned output. Lines are also capped as they arrive (50k lines, 8k chars per line) so a runaway stream cannot eat memory before the cap applies. |
 
 ---
 
@@ -226,36 +294,80 @@ opencode run --auto --agent build --print-logs --dir <cwd> --model <model> \
 Seven flags there are non-obvious, and **each one fails silently when dropped**.
 Every one cost a debugging session.
 
-- **`--print`** is headless single-prompt mode. Without it `agy` launches an
-  *interactive* session against a subprocess with no TTY and hangs forever at
-  roughly 0% CPU. It looks exactly like "the model is thinking hard."
-  `stdin=subprocess.DEVNULL` in the wrapper is belt and braces against the same
-  hang.
-- **`--new-project`** exists because `agy` has its own persistent project
-  concept (`~/.gemini/config/projects/`) that is **separate from the OS-level
-  `cwd`**. Without it, agy writes files into `~/.gemini/antigravity-cli/scratch/`
-  while cheerfully reporting success.
-- **`--print-timeout 60m`** is mandatory. `agy` defaults its print-mode wait to
-  **5m0s**, independently of the Python subprocess timeout. Verified: a
-  `sleep 400` dispatch completed in 407s *with* the flag. This is almost
-  certainly the real cause of the "`timeout waiting for response`, but the
-  commits were already there" story people blame on summary generation.
-- **`--dir <cwd>`** is mandatory for opencode, which **ignores the subprocess
-  working directory**. Verified by mutation: with only `subprocess.run(cwd=...)`
-  set, it wrote the file into the *caller's* directory and reported success.
-  Same shape as agy's `--new-project` trap.
-- **`--agent build`** is mandatory whenever `~/.config/opencode/opencode.json`
-  sets `"default_agent": "plan"`, which is read-only. Without the override the
-  tool returns a plan, edits nothing, and looks like it worked.
-- **`--print-logs`** is what makes opencode's failures *visible*. Its stream
-  errors - including the provider quota wall - go to
-  `~/.local/share/opencode/log/opencode.log` and **never to stdout**, and the
-  CLI does not exit on them: it sits at 0% CPU until something else kills it.
-  Without this flag the wrapper has nothing to match on and blocks for the full
-  hour on a failure the CLI knew about in twenty seconds. The per-step log lines
-  it emits double as the heartbeat that makes the idle timeout safe to enable.
-- **`--auto`** and **`--dangerously-skip-permissions`** are what make the run
-  unattended, and are the entire risk surface. See the warning at the top.
+| Flag | What happens without it |
+|---|---|
+| `--print` | `agy` launches an *interactive* session against a subprocess with no TTY and hangs forever at ~0% CPU. Looks exactly like "the model is thinking hard." `stdin=subprocess.DEVNULL` in the wrapper is belt and braces against the same hang. |
+| `--new-project` | `agy` has its own persistent project concept (`~/.gemini/config/projects/`) **separate from the OS-level `cwd`**. Without it, agy writes files into `~/.gemini/antigravity-cli/scratch/` while cheerfully reporting success. |
+| `--print-timeout 60m` | `agy` defaults its print-mode wait to **5m0s**, independently of the Python subprocess timeout. Verified: a `sleep 400` dispatch completed in 407s *with* the flag. Almost certainly the real cause of the "`timeout waiting for response`, but the commits were already there" story people blame on summary generation. |
+| `--dir <cwd>` | `opencode` **ignores the subprocess working directory**. Verified by mutation: with only `subprocess.run(cwd=...)` set, it wrote the file into the *caller's* directory and reported success. Same shape as agy's `--new-project` trap. |
+| `--agent build` | Mandatory whenever `~/.config/opencode/opencode.json` sets `"default_agent": "plan"`, which is read-only. Without the override the tool returns a plan, edits nothing, and looks like it worked. |
+| `--print-logs` | What makes opencode's failures *visible*. Its stream errors — including the provider quota wall — go to `~/.local/share/opencode/log/opencode.log` and **never to stdout**, and the CLI does not exit on them: it sits at 0% CPU until something else kills it. Without this flag the wrapper has nothing to match on and blocks for the full hour on a failure the CLI knew about in twenty seconds. The per-step log lines double as the heartbeat that makes the idle timeout safe to enable. |
+| `--auto` / `--dangerously-skip-permissions` | Nothing fails — this is what makes the run unattended, and it is the entire risk surface. See the warning at the top. |
+
+### Anatomy of a dispatch
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CC as Claude Code
+    participant W as wrapper<br/>(MCP stdio)
+    participant CLI as opencode / agy
+    participant FS as target repo
+
+    CC->>W: ask_opencode(prompt, model, cwd)
+    W->>W: assemble argv · stdin = DEVNULL
+    W->>CLI: Popen(start_new_session=True)
+
+    par stdout reader thread
+        CLI-->>W: output lines → capped deque
+    and stderr reader thread
+        CLI-->>W: log lines → scanned for fatal patterns
+    end
+
+    loop poll every 1s
+        W->>W: fatal? · idle? · wall clock?
+    end
+
+    CLI->>FS: edits · commits · .agent-runs/*.log
+    Note over CC,FS: You Read the progress file here,<br/>while the call is still blocking.
+    CLI-->>W: exit
+    W->>FS: list .agent-runs/ files touched during the run
+    W-->>CC: output (or partial) + exit note + artifact list
+```
+
+### The await loop
+
+The reason the wrapper is 500 lines and not five: a delegate that has *stopped
+working* looks identical to one that is working hard. Four exit paths, and every
+one of them returns whatever stdout arrived plus the artifact list — nothing is
+swallowed.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Running
+
+    Running --> Fatal: stderr matches a<br/>fatal pattern
+    Running --> Idle: silent on both streams<br/>for IDLE_SECONDS
+    Running --> Wall: elapsed > TIMEOUT_SECONDS
+    Running --> Exited: process exits<br/>on its own
+
+    Fatal --> Killed
+    Idle --> Killed
+    Wall --> Killed
+    Killed: kill the whole process group
+    Killed --> Report
+    Exited --> Report
+
+    Report: partial stdout + .agent-runs/ listing<br/>+ what to check next
+    Report --> [*]
+
+    note right of Exited
+        Non-zero exit is reported,
+        never trusted: work may
+        already be committed.
+    end note
+```
 
 **Model availability is a live constraint, not a preference.** On the
 `opencode-go` tier both `deepseek-v4-pro` and `deepseek-v4-flash` are rejected
@@ -272,6 +384,26 @@ file, including the defaults.
 The wiring above takes an hour. These rules took weeks and several silent
 failures. Put them in your `CLAUDE.md` or Claude's memory so they are followed
 without being re-derived.
+
+```mermaid
+flowchart TD
+    A["Resolve every design question<br/><i>leave nothing open</i>"] --> B["Write the plan to<br/>.agent-runs/&lt;model&gt;_&lt;level&gt;_&lt;feature&gt;_plan.md"]
+    B --> C["Handoff entry in NEXT_STEPS.md"]
+    C --> D["<b>One</b> dispatch:<br/>&quot;read the plan and execute it&quot;"]
+    D --> E{"What came back?"}
+
+    E -->|"success"| V
+    E -->|"error / timeout"| V
+    E -->|"Connection closed"| G["pgrep · check .agent-runs/ · <b>wait</b><br/><i>never re-dispatch</i>"]
+    G --> V
+
+    V["<b>Ignore the return value.</b><br/>Verify from the repo instead."] --> H["git log · git status"]
+    H --> I["git diff --stat:<br/>were the plan's <i>named test files</i> modified?"]
+    I --> J["Re-run the typecheck and tests yourself"]
+    J --> K{"Gate green <i>and</i><br/>the caller is covered?"}
+    K -->|"yes"| L["Handoff entry back:<br/>gate result, commit SHAs"]
+    K -->|"no"| B
+```
 
 ### 5.1 Never trust the wrapper's return value, in either direction
 
@@ -291,10 +423,11 @@ rather than swallowing the output, precisely because of the second case.
 There is a third case, and it is the one that costs most: **no return value at
 all.** `Connection closed` from a delegation tool reads identically whether the
 server crashed, the transport dropped, or another session deliberately tore the
-MCP connections down - and in none of those cases does the delegate stop. It
+MCP connections down — and in none of those cases does the delegate stop. It
 keeps running as an orphan. Nothing the wrapper writes can reach you here, so
 this rule cannot live in a tool docstring; it has to live with you.
 
+> [!CAUTION]
 > **`Connection closed` is not evidence the delegate died.** `pgrep -f opencode`
 > (or `agy`), look for the file in `.agent-runs/`, and wait. **Never
 > re-dispatch**: concurrent load may be the very thing that caused it, and a
@@ -315,7 +448,7 @@ This is not a nicety, and it is not only about visibility. **stdout is the one
 channel that does not survive failure**: it is lost outright when the transport
 drops mid-run, and truncated to a tail when a run is killed. A brief that says
 "your entire deliverable is a written review printed to stdout" therefore has a
-total-loss failure mode - verified the hard way, on an hour of real work. A file
+total-loss failure mode — verified the hard way, on an hour of real work. A file
 on disk survives both, so the deliverable itself belongs in
 `.agent-runs/<topic>-<model>.md`, not just the progress log. Both wrappers list
 whatever appeared under `.agent-runs/` during the run on **every** exit path,
@@ -352,12 +485,10 @@ Never stuff a long plan into the prompt argument. Write
 `"read <file> and execute it"`. You get shell-escaping safety plus a reviewable
 artifact.
 
-- **Weaker model (Flash tier):** mechanical plans. Exact files, exact
-  before/after code, explicit commit messages, verification commands with
-  expected output, and an explicit do-not-touch list. **Decide every design
-  question in the plan and leave nothing open.**
-- **Frontier model (Gemini Pro, GPT/Kimi/GLM tier):** goal-level plans. Intent,
-  invariants, acceptance criteria, phase gates. Cheaper to write.
+| Delegate | Plan style | Contains |
+|---|---|---|
+| **Weaker model** (Flash tier) | Mechanical | Exact files, exact before/after code, explicit commit messages, verification commands with expected output, an explicit do-not-touch list. **Decide every design question in the plan and leave nothing open.** |
+| **Frontier model** (Gemini Pro, GPT/Kimi/GLM tier) | Goal-level | Intent, invariants, acceptance criteria, phase gates. Cheaper to write. |
 
 A good plan is phase-gated: each phase ends with the typecheck plus the test
 suite, and reports the counts. That is what makes the progress log meaningful.
@@ -418,18 +549,26 @@ alternative the inlined rule prescribed.
 for it: the top OpenCode models are Claude-tier, so judgment-shaped work
 (including *writing the plan*) is not off-limits there the way it is for Flash.
 
-Rough quota picture for the OpenCode tier used here, per 5 hours: DeepSeek V4
-Flash around 31k requests, DeepSeek V4 Pro around 4.3k, Kimi K2.7 Code around
-1.1k, GLM-5.2 around 880, Grok 4.5 around 220, Kimi K3 around 120. Pick per
-task rather than defaulting blindly.
+Rough quota picture for the OpenCode tier used here, per 5 hours:
+
+| Model | Requests / 5h |
+|---|---|
+| DeepSeek V4 Flash | ~31,000 |
+| DeepSeek V4 Pro | ~4,300 |
+| Kimi K2.7 Code | ~1,100 |
+| GLM-5.2 | ~880 |
+| Grok 4.5 | ~220 |
+| Kimi K3 | ~120 |
+
+Pick per task rather than defaulting blindly.
 
 One explicit policy worth deciding for yourself: for frontier-tier delegates,
 **assume the output is correct and do a spot check, not a full review.** Skim
 structure, sanity-check line counts, and grep-verify one to three of the most
 load-bearing or surprising factual claims. That policy is what makes the quota
 math work, and it applies to prose and planning artifacts as much as to code.
-It does **not** override §5.5. The gate and the test-file existence check are
-mechanical, and always run.
+It does **not** override [§5.5](#55-verify-the-plans-named-test-files-actually-exist-and-that-they-test-the-caller).
+The gate and the test-file existence check are mechanical, and always run.
 
 ---
 
@@ -484,14 +623,15 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Returns a plan, edits nothing | `"default_agent": "plan"` is read-only | `--agent build` |
 | `timeout waiting for response` after ~5 minutes | agy's print-mode default wait, not the subprocess timeout | `--print-timeout 60m`; check `git log` before believing the error |
 | Tools missing from Claude entirely | a hand-built venv's `python` symlink followed a system Python upgrade | let `uv run --script` resolve the interpreter, as the plugin does |
+| Tools missing, and this repo is the open project | `${CLAUDE_PLUGIN_ROOT}` is empty outside a plugin, so the path is `/…py` | the `${CLAUDE_PLUGIN_ROOT:-.}` fallback in `.mcp.json` |
 | Tool reports "CLI not found" after a node upgrade | nvm path carries the node version | set `OPENCODE_BIN` to a stable symlink |
 | Edits to a `.py` have no effect | the server process holds the old code | `/reload-plugins`, or `/mcp reconnect` |
 | Model id rejected | defaults go stale, or the model is region-gated | `agy models` / `opencode models` |
-| Gate passes, feature does not work | tests cover the helper, not the caller | the §5.5 checklist |
+| Gate passes, feature does not work | tests cover the helper, not the caller | the [§5.5](#55-verify-the-plans-named-test-files-actually-exist-and-that-they-test-the-caller) checklist |
 | No visibility during a long run | blocking subprocess, no interim output | the mandatory progress file |
 | `ImportError: mcp.server.fastmcp` | mcp 2.0 removed that module | already handled: the servers import `MCPServer` and fall back to `FastMCP` |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
-| `Connection closed`, immediately | the MCP server went away; the delegate did **not** | `pgrep`, check `.agent-runs/`, wait. Never re-dispatch. See §5.1 |
+| `Connection closed`, immediately | the MCP server went away; the delegate did **not** | `pgrep`, check `.agent-runs/`, wait. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
 | Killed as hung, but the task was fine | idle timeout is below what that task quietly needs | raise `OPENCODE_MCP_IDLE_TIMEOUT`, or set it to `0` |
 | A fix is committed but nothing changes | the running server is an older installed version | `delegation_status` for what is actually running; then `claude plugin update` and `/reload-plugins` |
 
