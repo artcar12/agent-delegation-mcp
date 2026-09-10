@@ -388,27 +388,43 @@ def ask_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     its own logfile, never to stdout, and it does not exit on them. Routed to
     stderr they can be caught in seconds instead of blocking for the full hour.
 
-    MODELS: the two deepseek tiers are China-hosted and rejected without an
-    explicit workspace opt-in, so they are not usable defaults. Verified
-    working here: opencode-go/glm-5.2 (default), opencode-go/kimi-k2.7-code
-    (higher quota, code-tuned), opencode-go/gpt-5.6-luna. Re-check with
-    `opencode models` - ids go stale. Note that models sharing a provider share
-    one quota pool: when one reports a usage limit, its siblings are also out.
+    MODELS - routing verdict (researched 2026-09-10). Full roster of all 34
+    ids, with per-model evidence, sourcing confidence and what is still
+    `unknown`, is in MODEL-ROSTER.md at the plugin root. Read it before
+    picking anything not named here.
 
-    FREE TIER (the `opencode/` provider, as opposed to `opencode-go/`): usable
-    for smoke tests and mechanical work when quota is tight. Verified to
-    complete a write-a-file task, fastest first - ling-3.0-flash-fin-free
-    (~12s), muse-spark-1.3-contributor-free, big-pickle,
-    muse-spark-1.2-contributor-free, mimo-v2.5-free. Prefer mimo-v2.5-free for
-    anything past a one-liner; it is the only one seen to follow a
-    multi-field brief with shell substitutions.
+    Prefer opencode-go/deepseek-v4-pro and opencode-go/minimax-m3. DeepSeek V4
+    persists reasoning state across sequential tool calls, so long unattended
+    loops do not drift; MiniMax M3 has demonstrated ~24h / 1,959 tool calls
+    unattended at 100 tok/s, so timeout risk is low. Caveat: both deepseek
+    tiers are rejected without an explicit workspace opt-in, so deepseek-v4-pro
+    is not a usable default until that is set. opencode-go/qwen3.8-flash is the
+    cheap high-volume fallback; glm-5.2 (current default), kimi-k2.7-code and
+    gpt-5.6-luna are the ids verified working here by direct test.
 
-    Both Nemotron tiers FAILED and should not be used: nemotron-3.5-lightning-
-    free emitted malformed tool-call syntax and wrote nothing;
-    nemotron-3-ultra-free created the output directory, then produced nothing
-    for 120s and had to be killed. Free models are small - keep briefs
-    single-step and verify the output, since a plausible-looking return here
-    is weaker evidence than usual.
+    Strictly avoid kimi-k2.6 (infinite repetition loop exhausts the context),
+    glm-5.3-flash (40-186s per call breaches wall-clock timeouts),
+    nemotron-3.5-lightning-free (drops the closing brace in tool JSON), and
+    omen-alpha (ignores the provided tools and rewrites files from scratch).
+
+    Free tier (`opencode/` rather than `opencode-go/`), for smoke tests and
+    mechanical work when quota is tight: mimo-v2.5-free is the pick - same
+    weights as paid, though it silently strips Authorization headers in
+    transport. ling-3.0-flash-fin-free, big-pickle and the muse-sparks also
+    pass a write-a-file probe. Block every muse-spark-*-contributor variant,
+    free AND paid, for proprietary code: Meta retains prompts and completions
+    for training. Both nemotron tiers FAILED here and the failures are
+    confirmed upstream bugs.
+
+    Models sharing a provider share one quota pool - when one reports a usage
+    limit its siblings are also out; qwen3.8-max and longcat-2.0 are a known
+    pair. Free models are small: keep briefs single-step and verify output,
+    since a plausible-looking return here is weaker evidence than usual.
+
+    Re-check with `opencode models` - ids go stale, and several above are
+    codenames or `preview` labels. When the roster moves, update
+    MODEL-ROSTER.md and this docstring together; MODEL-ROSTER.md's "Keeping
+    this current" section says how.
 
     OpenCode's top models are Claude-tier, so unlike ask_agy, judgment-shaped
     work - including writing the plan itself - is in scope here. Run
