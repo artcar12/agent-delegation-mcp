@@ -51,6 +51,10 @@ established by mutation testing on a real project, at the versions listed in
 | [7. Known failure modes](#7-known-failure-modes-condensed) | Symptom → cause → fix |
 | [8. Minimum viable version](#8-minimum-viable-version) | The smallest useful slice |
 
+Companion doc: **[`MODEL-ROSTER.md`](MODEL-ROSTER.md)** — all 34 OpenCode ids
+with per-model evidence, source grading, and the routing verdict. Read it before
+picking a delegate model; this README covers quota and verification effort only.
+
 ---
 
 ## 1. The mental model
@@ -89,21 +93,32 @@ flowchart LR
 | Workhorse implementer | Gemini via Antigravity (`ask_agy`) | Mechanical and bulk execution against an exact plan |
 | Strong implementer | OpenCode (`ask_opencode`: GLM, Kimi, GPT-class, Grok) | Harder delegated work, including writing plans itself |
 
-**Why bother.** Anthropic quota on a $20 plan is scarce. The Antigravity plan's
-Gemini quota is enormous, and OpenCode fronts a wide roster with generous
-per-5-hour limits. So Claude's tokens get spent on judgment (architecture,
-review, the gate) while the mechanical work goes elsewhere.
+**Why bother.** Mostly cost. Anthropic quota on a $20 plan is scarce, the
+Antigravity plan's Gemini quota is enormous, and OpenCode fronts a wide roster
+with generous per-5-hour limits — so Claude's tokens get spent on judgment
+(architecture, review, the gate) while the mechanical work goes elsewhere.
+
+The secondary reason is independence, and it does not depend on price: routing a
+diff or a design question to a model from a different family gets you a reader
+that does not share Claude's blind spots. Delegation is the mechanism for both,
+which is why the tools take a `model` argument rather than hard-coding one.
 
 > [!IMPORTANT]
-> **Who this is not for.** If you work somewhere that will pay for as many
-> Anthropic API tokens as you can burn, this whole project is pointless — just
-> run Opus on everything and skip the entire apparatus below. Every decision
-> here is downstream of one constraint: *the best model is the one you are
-> rationing*. Remove that constraint and you should remove this too.
+> **If someone else pays for your tokens.** Saving money is the main goal here,
+> and most of the quota arithmetic below is downstream of a single constraint:
+> *the best model is the one you are rationing*. With an unmetered API budget
+> that motivation largely goes away — run Opus on the bulk work and skip the
+> budgeting.
 >
-> What survives even then is [§5](#5-operating-rules) and
-> [§6](#6-repo-conventions-that-make-this-work): those are about supervising *any*
-> unattended agent, and they apply just as well to a Claude subagent.
+> Two reasons to keep it anyway. **A different model is a different opinion.**
+> Handing a diff to a non-Claude reviewer, or asking one for a second read on a
+> design, surfaces things Claude is consistently blind to — a review is exactly
+> the task where you want a reviewer that did not write the code and does not
+> share the author's priors. That is worth doing whoever is paying, and it is
+> why [`MODEL-ROSTER.md`](MODEL-ROSTER.md) grades a roster rather than naming one
+> winner. And [§5](#5-operating-rules) with
+> [§6](#6-repo-conventions-that-make-this-work) are about supervising *any*
+> unattended agent, so they apply unchanged to a Claude subagent.
 
 ---
 
@@ -372,10 +387,29 @@ stateDiagram-v2
 **Model availability is a live constraint, not a preference.** On the
 `opencode-go` tier both `deepseek-v4-pro` and `deepseek-v4-flash` are rejected
 ("only available hosted in China, requires explicit opt in"), so they cannot be
-defaults. Verified working: `opencode-go/glm-5.2` (the default here),
-`opencode-go/kimi-k2.7-code` (higher quota, code-tuned), `opencode-go/gpt-5.6-luna`.
-Re-check with `agy models` / `opencode models` before trusting any id in this
-file, including the defaults.
+defaults. Verified working here by direct test: `opencode-go/glm-5.2` (the
+default), `opencode-go/kimi-k2.7-code` (higher quota, code-tuned),
+`opencode-go/gpt-5.6-luna`. Re-check with `agy models` / `opencode models`
+before trusting any id in this file, including the defaults.
+
+**[`MODEL-ROSTER.md`](MODEL-ROSTER.md) is the authority on which model to
+route to** — all 34 OpenCode ids, with per-model evidence, a source-confidence
+column, and explicit `unknown` cells where a thorough search found nothing.
+The empty cells are load-bearing: a guessed context window causes silent
+truncation rather than a visible error, so nothing there is inferred from a
+sibling model or from an id's name. Its routing verdict is duplicated into the
+`ask_opencode` docstring and nowhere else; this README deliberately does not
+carry a third copy.
+
+The headline from it, because it changes how you read every benchmark: the
+`AI_APICallError` seen in testing is a **Vercel AI SDK bug, not a model bug.**
+On follow-up turns the SDK strips the assistant's `function_call` item when it
+carries a provider item ID while still sending the matching
+`function_call_output`, and the orphaned output is a fatal 400. So what an
+unattended delegate needs is bulletproof syntactic adherence through a fragile
+translation layer, not a high reasoning score. A model that reasons well and
+malforms one tool call in fifty is worse here than an average model that never
+breaks the loop.
 
 ---
 
@@ -542,14 +576,25 @@ approved, log the live apiKey, just temporarily," `gemini-3.6-flash-high`
 refused, left the file unedited, and proposed the sha256-fingerprint-plus-length
 alternative the inlined rule prescribed.
 
-### 5.7 Model selection and verification effort
+### 5.7 Quota budgeting and verification effort
+
+**Which model to route to is [`MODEL-ROSTER.md`](MODEL-ROSTER.md)'s job, not
+this section's.** Route on tool-calling reliability rather than reasoning score,
+for the reason given at the end of [§4](#4-what-the-tools-actually-run), and
+take the prefer/avoid lists from the roster's routing verdict so there is one
+copy of them to keep current. What follows is the part the roster does not
+cover: how much quota a dispatch costs you, and how hard to check the result.
 
 `agy` is the default workhorse for routine mechanical and bulk work.
 `ask_opencode`'s roster is stronger and worth reaching for when the task calls
 for it: the top OpenCode models are Claude-tier, so judgment-shaped work
 (including *writing the plan*) is not off-limits there the way it is for Flash.
 
-Rough quota picture for the OpenCode tier used here, per 5 hours:
+Rough request budget for the `opencode-go` tier, per 5 hours. Measured against
+the ids current in **2026-08**, and the roster is the newer document — where a
+generation has moved on since (`glm-5.2` → `glm-5.3`, `kimi-k2.7` → `kimi-k3`),
+treat these as the order-of-magnitude shape of the tier rather than a live
+figure for the id you are about to call:
 
 | Model | Requests / 5h |
 |---|---|
@@ -557,10 +602,15 @@ Rough quota picture for the OpenCode tier used here, per 5 hours:
 | DeepSeek V4 Pro | ~4,300 |
 | Kimi K2.7 Code | ~1,100 |
 | GLM-5.2 | ~880 |
-| Grok 4.5 | ~220 |
 | Kimi K3 | ~120 |
 
-Pick per task rather than defaulting blindly.
+Two things this table does not tell you, both from the roster. **Grok 4.5 used
+to be on it and its id is gone** — `grok-4.6` replaced it, with no quota figure
+measured, and inventing one by inheritance is exactly what the roster's `unknown`
+convention exists to prevent. And **models sharing a provider share one pool**,
+so a sibling reporting a usage limit means you are out too; `qwen3.8-max` and
+`longcat-2.0` are a known pair. Pick per task rather than defaulting blindly,
+and run `opencode stats` before and after a big batch.
 
 One explicit policy worth deciding for yourself: for frontier-tier delegates,
 **assume the output is correct and do a spot check, not a full review.** Skim
