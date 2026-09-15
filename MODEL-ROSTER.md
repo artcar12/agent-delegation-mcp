@@ -417,5 +417,5 @@ wrong when it was written.
   mixed into the researched table. First-hand evidence about *this* harness
   outranks any benchmark and should stay visually separable from it.
 - Keep [Routing verdict](#routing-verdict) under 200 words. It is duplicated
-  into the `ask_opencode` docstring, which is paid for on every session — if you
+  into the `dispatch_opencode` docstring, which is paid for on every session — if you
   change the verdict here, change it there too.

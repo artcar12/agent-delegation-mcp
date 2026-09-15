@@ -45,7 +45,7 @@ established by mutation testing on a real project, at the versions listed in
 | [1. The mental model](#1-the-mental-model) | Three roles, and who this is *not* for |
 | [2. Install](#2-install) | Prerequisites, plugin install, why there is no venv |
 | [3. Configuration](#3-configuration) | Every environment variable |
-| [4. What the tools actually run](#4-what-the-tools-actually-run) | The argv, the seven silent flags, the await loop |
+| [4. What the tools actually run](#4-what-the-tools-actually-run) | The argv, the seven silent flags, the five tools, the reconcile loop |
 | [5. Operating rules](#5-operating-rules) | The part that took weeks instead of an hour |
 | [6. Repo conventions](#6-repo-conventions-that-make-this-work) | Where state lives |
 | [7. Known failure modes](#7-known-failure-modes-condensed) | Symptom → cause → fix |
@@ -76,8 +76,8 @@ flowchart LR
         O["<b>opencode</b> → GLM · Kimi · GPT · Grok<br/>harder work, incl. writing plans"]
     end
 
-    C -->|"ask_agy"| A
-    C -->|"ask_opencode"| O
+    C -->|"dispatch_agy"| A
+    C -->|"dispatch_opencode"| O
     P -.->|"read &amp; execute"| A
     P -.->|"read &amp; execute"| O
 
@@ -90,8 +90,8 @@ flowchart LR
 | Role | Who | What it does |
 |---|---|---|
 | Architect / reviewer | Claude Code (Opus) | Design decisions, writing the plan file, diff review, running the typecheck and test gate, unblocking |
-| Workhorse implementer | Gemini via Antigravity (`ask_agy`) | Mechanical and bulk execution against an exact plan |
-| Strong implementer | OpenCode (`ask_opencode`: GLM, Kimi, GPT-class, Grok) | Harder delegated work, including writing plans itself |
+| Workhorse implementer | Gemini via Antigravity (`dispatch_agy`) | Mechanical and bulk execution against an exact plan |
+| Strong implementer | OpenCode (`dispatch_opencode`: GLM, Kimi, GPT-class, Grok) | Harder delegated work, including writing plans itself |
 
 **Why bother.** Mostly cost. Anthropic quota on a $20 plan is scarce, the
 Antigravity plan's Gemini quota is enormous, and OpenCode fronts a wide roster
@@ -154,7 +154,7 @@ claude plugin install agent-delegation@agent-delegation-mcp
 ```
 
 Then `/reload-plugins`, or restart Claude Code. The tools appear as
-`mcp__agy-wrapper__ask_agy` and `mcp__opencode-wrapper__ask_opencode`.
+`mcp__agy-wrapper__dispatch_agy` and `mcp__opencode-wrapper__dispatch_opencode`.
 
 > [!NOTE]
 > Read the two server files before installing. You are installing something that
@@ -292,7 +292,9 @@ Code itself inherits. All are optional.
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
-| `AGENT_MCP_MAX_OUTPUT` | both | `100000` | Character cap on the returned output. Lines are also capped as they arrive (50k lines, 8k chars per line) so a runaway stream cannot eat memory before the cap applies. |
+| `AGENT_MCP_MAX_OUTPUT` | both | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
+| `AGENT_MCP_RUN_DIR` | both | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. Both servers share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
+| `AGENT_MCP_RUN_RETENTION_DAYS` | both | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
 
 ---
 
@@ -319,6 +321,30 @@ Every one cost a debugging session.
 | `--print-logs` | What makes opencode's failures *visible*. Its stream errors — including the provider quota wall — go to `~/.local/share/opencode/log/opencode.log` and **never to stdout**, and the CLI does not exit on them: it sits at 0% CPU until something else kills it. Without this flag the wrapper has nothing to match on and blocks for the full hour on a failure the CLI knew about in twenty seconds. The per-step log lines double as the heartbeat that makes the idle timeout safe to enable. |
 | `--auto` / `--dangerously-skip-permissions` | Nothing fails — this is what makes the run unattended, and it is the entire risk surface. See the warning at the top. |
 
+### The five tools
+
+Each server exposes the same shape: one dispatch tool named for its CLI, plus
+four that work on runs regardless of which CLI started them.
+
+| Tool | What it does |
+|---|---|
+| `dispatch_agy` / `dispatch_opencode` | Starts a delegate and **returns a run id in milliseconds**. `wait_seconds=N` blocks up to N seconds for a short task and returns the finished result inline instead; the run is unaffected when the wait expires, only the waiting stops. `force=True` overrides the refusal to start a second concurrent run on the same CLI. |
+| `check_run(run_id)` | State, elapsed, how long it has been silent, the tail of both streams, and anything written under `.agent-runs/`. Cheap, and the intended way to follow a long dispatch. Calling it is also what applies the run's deadlines when no server is watching. |
+| `cancel_run(run_id)` | SIGTERM then SIGKILL to the whole process group, so an auto-approving delegate cannot keep mutating the repo afterwards. Verifies the pid is still the process it started before signalling anything. |
+| `list_runs()` | Every run on the machine, both CLIs, all sessions, reconciled and marked live or not. The answer to "did something get left behind?". |
+| `delegation_status()` | Version actually running, resolved CLI path, the deadlines a dispatch will use, and the run store's location and depth. |
+
+Records live under `AGENT_MCP_RUN_DIR` (`~/.agent-delegation-mcp/runs` by
+default) as `<run-id>.json` with the captured streams beside them as
+`<run-id>.out` and `<run-id>.err`. Both servers share that directory
+deliberately — one `list_runs` should account for every delegate running on the
+machine, not just the ones this wrapper started. Finished records are pruned
+after `AGENT_MCP_RUN_RETENTION_DAYS`.
+
+The delegate's **deliverable** still belongs in the target repo's
+`.agent-runs/`, which is a different thing: the run store holds this wrapper's
+bookkeeping and raw logs, the repo holds the work product.
+
 ### Anatomy of a dispatch
 
 ```mermaid
@@ -329,33 +355,45 @@ sequenceDiagram
     participant CLI as opencode / agy
     participant FS as target repo
 
-    CC->>W: ask_opencode(prompt, model, cwd)
+    CC->>W: dispatch_opencode(prompt, model, cwd)
     W->>W: assemble argv · stdin = DEVNULL
-    W->>CLI: Popen(start_new_session=True)
+    W->>CLI: Popen(start_new_session=True,<br/>stdout/stderr → files)
+    W->>FS: write run record<br/>(pid · pgid · argv · cwd · output paths)
+    W-->>CC: run id — returns in milliseconds
 
-    par stdout reader thread
-        CLI-->>W: output lines → capped deque
-    and stderr reader thread
-        CLI-->>W: log lines → scanned for fatal patterns
+    par delegate works
+        CLI->>FS: edits · commits · .agent-runs/*.log
+        CLI-->>W: output → &lt;run-id&gt;.out / .err<br/>(straight to disk; no live parent needed)
+    and you follow along
+        CC->>W: check_run(run id)
+        W->>W: reconcile: fatal? · idle? · wall clock?
+        W-->>CC: state · log tail · artifacts
     end
 
-    loop poll every 1s
-        W->>W: fatal? · idle? · wall clock?
-    end
-
-    CLI->>FS: edits · commits · .agent-runs/*.log
-    Note over CC,FS: You Read the progress file here,<br/>while the call is still blocking.
     CLI-->>W: exit
-    W->>FS: list .agent-runs/ files touched during the run
-    W-->>CC: output (or partial) + exit note + artifact list
+    Note over CC,FS: If the connection drops anywhere above,<br/>the record and the output files are still there.<br/>list_runs finds the delegate from any session.
 ```
 
-### The await loop
+The dispatch call is no longer the thing holding the run together. What holds
+it together is the record: any later server process — a reconnect, a different
+session, the sibling CLI's wrapper — can read it, tail the same output files,
+apply the same deadlines and kill the same process group. The tool call is just
+the thing that started it.
 
-The reason the wrapper is 500 lines and not five: a delegate that has *stopped
-working* looks identical to one that is working hard. Four exit paths, and every
-one of them returns whatever stdout arrived plus the artifact list — nothing is
+### The reconcile loop
+
+The reason the wrapper is not five lines: a delegate that has *stopped working*
+looks identical to one that is working hard. Five exit paths, and every one of
+them leaves the captured output and the artifact list intact — nothing is
 swallowed.
+
+The loop runs in two places, which is the part that matters. A monitor thread
+runs it once a second while the server lives; `check_run` and `list_runs` run
+exactly the same function when nobody was watching. So a run whose server died
+still gets the wall clock, the idle limit and the fail-fast patterns it was
+dispatched under — applied by whichever session looks at it next. Deadlines are
+read from the record, not from the current process's environment, so they
+travel with the run.
 
 ```mermaid
 stateDiagram-v2
@@ -367,12 +405,16 @@ stateDiagram-v2
     Running --> Wall: elapsed > TIMEOUT_SECONDS
     Running --> Exited: process exits<br/>on its own
 
-    Fatal --> Killed
-    Idle --> Killed
-    Wall --> Killed
-    Killed: kill the whole process group
+    Running --> Lost: pid answers, but is<br/>no longer our process
+
+    Fatal --> Stopping
+    Idle --> Stopping
+    Wall --> Stopping
+    Stopping: verdict written FIRST,<br/>then SIGTERM → SIGKILL the group
+    Stopping --> Killed
     Killed --> Report
     Exited --> Report
+    Lost --> Report
 
     Report: partial stdout + .agent-runs/ listing<br/>+ what to check next
     Report --> [*]
@@ -398,7 +440,7 @@ column, and explicit `unknown` cells where a thorough search found nothing.
 The empty cells are load-bearing: a guessed context window causes silent
 truncation rather than a visible error, so nothing there is inferred from a
 sibling model or from an id's name. Its routing verdict is duplicated into the
-`ask_opencode` docstring and nowhere else; this README deliberately does not
+`dispatch_opencode` docstring and nowhere else; this README deliberately does not
 carry a third copy.
 
 The headline from it, because it changes how you read every benchmark: the
@@ -426,10 +468,10 @@ flowchart TD
     C --> D["<b>One</b> dispatch:<br/>&quot;read the plan and execute it&quot;"]
     D --> E{"What came back?"}
 
-    E -->|"success"| V
-    E -->|"error / timeout"| V
-    E -->|"Connection closed"| G["pgrep · check .agent-runs/ · <b>wait</b><br/><i>never re-dispatch</i>"]
-    G --> V
+    E -->|"run id"| P["check_run until it ends"]
+    P --> V
+    E -->|"Connection closed"| G["reconnect · <b>list_runs</b><br/><i>never re-dispatch</i>"]
+    G --> P
 
     V["<b>Ignore the return value.</b><br/>Verify from the repo instead."] --> H["git log · git status"]
     H --> I["git diff --stat:<br/>were the plan's <i>named test files</i> modified?"]
@@ -454,33 +496,49 @@ This has burned both ways on the same tool:
 Both server files now return partial stdout *plus* a warning on non-zero exit
 rather than swallowing the output, precisely because of the second case.
 
-There is a third case, and it is the one that costs most: **no return value at
-all.** `Connection closed` from a delegation tool reads identically whether the
-server crashed, the transport dropped, or another session deliberately tore the
-MCP connections down — and in none of those cases does the delegate stop. It
-keeps running as an orphan. Nothing the wrapper writes can reach you here, so
-this rule cannot live in a tool docstring; it has to live with you.
+There is a third case, and it used to be the one that cost most: **no return
+value at all.** `Connection closed` from a delegation tool reads identically
+whether the server crashed, the transport dropped, or another session
+deliberately tore the MCP connections down — and in none of those cases does
+the delegate stop. It keeps running.
 
-> [!CAUTION]
-> **`Connection closed` is not evidence the delegate died.** `pgrep -f opencode`
-> (or `agy`), look for the file in `.agent-runs/`, and wait. **Never
-> re-dispatch**: concurrent load may be the very thing that caused it, and a
-> second run doubles it.
+That last part has not changed, and should not: killing an hour-long run
+because a transport blipped is worse than letting it finish. What changed is
+that the run is no longer *unreachable* while it does. Every dispatch writes a
+record — pid, pgid, argv, cwd, the paths its output is being written to — under
+`AGENT_MCP_RUN_DIR`, and the delegate's streams go straight to files rather
+than through a pipe this server has to stay alive to drain. So there is nothing
+left for a dying server to take with it.
+
+> [!TIP]
+> **`Connection closed` is still not evidence the delegate died — but you no
+> longer have to `pgrep` to find out.** Reconnect and call `list_runs`. It
+> covers both CLIs and every session on this machine, reconciles each record
+> before reporting, and marks what is still live. Then `check_run` for the
+> output and `cancel_run` if you want it stopped. **Still never re-dispatch**:
+> concurrent load may be the very thing that caused the drop, and a second run
+> doubles it. The wrapper now refuses that second run by default anyway.
+
+Calling `check_run` is also what applies a run's deadlines when no server is
+watching, so a hung delegate left behind by a dead session is killed the next
+time anyone looks at it rather than running until the machine reboots.
 
 **Standing practice: after every dispatch, check `git log` and `git status`, and
 re-run the typecheck and test gate yourself, whatever the call returned.**
 
 ### 5.2 Always make the delegate write a progress file
 
-A blocking subprocess produces zero interim output. You cannot see what it is
-doing for up to an hour. So every prompt or plan file includes, near the top:
+`check_run` gives you the tail of whatever the CLI happened to print, which is
+not the same as knowing what phase the work is in. So every prompt or plan file
+includes, near the top:
 
 > Append one line to `.agent-runs/<slug>.log` as each phase completes, including
 > the gate result. Update it as you move to the next step.
 
-This is not a nicety, and it is not only about visibility. **stdout is the one
-channel that does not survive failure**: it is lost outright when the transport
-drops mid-run, and truncated to a tail when a run is killed. A brief that says
+This is not a nicety, and it is not only about visibility. Raw stdout is now
+captured to a file and survives a dropped transport, but it is still an
+undifferentiated stream you have to read backwards to interpret, and it is
+truncated to a tail in the report. A brief that says
 "your entire deliverable is a written review printed to stdout" therefore has a
 total-loss failure mode — verified the hard way, on an hour of real work. A file
 on disk survives both, so the deliverable itself belongs in
@@ -507,7 +565,9 @@ dispatches.
 
 ### 5.3 Dispatch sequentially, not in parallel
 
-Fanning out five `ask_agy` calls in one message risks a per-minute rate limit.
+Fanning out five `dispatch_agy` calls in one message risks a per-minute rate limit.
+The wrapper now refuses a second concurrent run to the same CLI rather than
+relying on this being remembered; `force=True` is there for when you mean it.
 Verified-safe pattern for a batch of 26: one cheap round trip first ("reply with
 exactly OK") to confirm no limit is already in effect, then one call at a time,
 waiting for each result. Slower in wall-clock, no failures.
@@ -586,7 +646,7 @@ copy of them to keep current. What follows is the part the roster does not
 cover: how much quota a dispatch costs you, and how hard to check the result.
 
 `agy` is the default workhorse for routine mechanical and bulk work.
-`ask_opencode`'s roster is stronger and worth reaching for when the task calls
+`dispatch_opencode`'s roster is stronger and worth reaching for when the task calls
 for it: the top OpenCode models are Claude-tier, so judgment-shaped work
 (including *writing the plan*) is not off-limits there the way it is for Flash.
 
@@ -678,10 +738,12 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Edits to a `.py` have no effect | the server process holds the old code | `/reload-plugins`, or `/mcp reconnect` |
 | Model id rejected | defaults go stale, or the model is region-gated | `agy models` / `opencode models` |
 | Gate passes, feature does not work | tests cover the helper, not the caller | the [§5.5](#55-verify-the-plans-named-test-files-actually-exist-and-that-they-test-the-caller) checklist |
-| No visibility during a long run | blocking subprocess, no interim output | the mandatory progress file |
+| No visibility during a long run | dispatch used to block with no interim output | `check_run` for the log tail; the mandatory progress file for real phase-by-phase progress |
 | `ImportError: mcp.server.fastmcp` | mcp 2.0 removed that module | already handled: the servers import `MCPServer` and fall back to `FastMCP` |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
-| `Connection closed`, immediately | the MCP server went away; the delegate did **not** | `pgrep`, check `.agent-runs/`, wait. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
+| `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
+| A delegate left over from a session that ended | nothing kills a run when its server dies, by design | `list_runs` finds it; `cancel_run` stops it; `check_run` applies its deadlines |
+| A run reports `lost` / `pid-recycled` | the record is old enough that its pid now belongs to something else | nothing was signalled — that is the point. The delegate ended long ago; read its output files |
 | Killed as hung, but the task was fine | idle timeout is below what that task quietly needs | raise `OPENCODE_MCP_IDLE_TIMEOUT`, or set it to `0` |
 | A fix is committed but nothing changes | the running server is an older installed version | `delegation_status` for what is actually running; then `claude plugin update` and `/reload-plugins` |
 
