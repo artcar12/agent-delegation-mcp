@@ -50,6 +50,7 @@ established by mutation testing on a real project, at the versions listed in
 | [6. Repo conventions](#6-repo-conventions-that-make-this-work) | Where state lives |
 | [7. Known failure modes](#7-known-failure-modes-condensed) | Symptom → cause → fix |
 | [8. Minimum viable version](#8-minimum-viable-version) | The smallest useful slice |
+| [9. Release notes](#9-release-notes) | What changed in each tagged version |
 
 Companion doc: **[`MODEL-ROSTER.md`](MODEL-ROSTER.md)** — all 34 OpenCode ids
 with per-model evidence, source grading, and the routing verdict. Read it before
@@ -194,8 +195,8 @@ The token has to be exactly `${CLAUDE_PLUGIN_ROOT}`. Claude Code substitutes tha
 literal string for the install directory; it does not evaluate shell-style
 defaults, so `${CLAUDE_PLUGIN_ROOT:-.}` is left for ordinary env expansion, comes
 out as `.`, and both servers die instantly with `Connection closed` because the
-path is resolved against whatever project is open. Versions 1.1.0 and earlier
-1.1.x installs shipped with that form and were broken for every user.
+path is resolved against whatever project is open. Version 1.1.0 shipped with
+that form and was broken for every plugin install; see the release notes.
 
 The root `.mcp.json` is a separate thing: it exists so that opening *this* repo
 as a project also loads the servers, and it uses plain `./` paths. When
@@ -766,6 +767,40 @@ claude mcp add opencode-wrapper -s user \
   -e OPENCODE_BIN="$(command -v opencode)" \
   -- uv run --script "$PWD/opencode_mcp_server.py"
 ```
+
+---
+
+## 9. Release notes
+
+Tags are `agent-delegation--v<version>`. Only versions with something a user has
+to act on are written up here; the rest is `git log` between tags.
+
+### 1.1.1 (2026-09-17)
+
+**Fix: both servers failed to start on every plugin install of 1.1.0.** The
+plugin's `.mcp.json` used `${CLAUDE_PLUGIN_ROOT:-.}`. Claude Code substitutes
+only the exact `${CLAUDE_PLUGIN_ROOT}` token, so the default form fell through to
+ordinary environment expansion, became `.`, and `uv` was asked for
+`./agy_mcp_server.py` relative to whatever project was open. Both servers exited
+with `Connection closed` at startup and the tools never appeared. The change that
+introduced it was meant to make the repo work when opened as a project, and did.
+
+The two purposes now live in two files. `.claude-plugin/plugin.json` declares the
+servers inline with the exact token, and a plugin that declares `mcpServers` in
+its manifest no longer loads the root `.mcp.json`. The root `.mcp.json` keeps
+plain `./` paths and serves in-repo use only.
+
+To pick it up:
+
+```bash
+claude plugin marketplace update agent-delegation-mcp
+claude plugin update agent-delegation
+```
+
+then start a new session. `claude mcp list` should show both wrappers as
+Connected before you do.
+
+No changes to the servers themselves, their tools, or their flags.
 
 ---
 
