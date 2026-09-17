@@ -163,15 +163,15 @@ Then `/reload-plugins`, or restart Claude Code. The tools appear as
 
 ### What installing actually does
 
-`.claude-plugin/plugin.json` declares the plugin. `.mcp.json` beside it declares
-the two stdio servers, and is picked up automatically:
+`.claude-plugin/plugin.json` declares the plugin and, inline, the two stdio
+servers:
 
 ```json
 {
   "mcpServers": {
     "opencode-wrapper": {
       "command": "uv",
-      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT:-.}/opencode_mcp_server.py"]
+      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT}/opencode_mcp_server.py"]
     }
   }
 }
@@ -190,11 +190,17 @@ the top of the server file:
 and resolves the interpreter and the `mcp` package itself, caching them after the
 first run (about 2s to start once warm).
 
-The `:-.` fallback in that path matters only if you also open *this* repo as a
-project: `${CLAUDE_PLUGIN_ROOT}` is defined for a plugin and empty otherwise, and
-without a fallback the same `.mcp.json`, loaded as project config, points at
-`/opencode_mcp_server.py` and both servers die instantly with `Connection
-closed`.
+The token has to be exactly `${CLAUDE_PLUGIN_ROOT}`. Claude Code substitutes that
+literal string for the install directory; it does not evaluate shell-style
+defaults, so `${CLAUDE_PLUGIN_ROOT:-.}` is left for ordinary env expansion, comes
+out as `.`, and both servers die instantly with `Connection closed` because the
+path is resolved against whatever project is open. Versions 1.1.0 and earlier
+1.1.x installs shipped with that form and were broken for every user.
+
+The root `.mcp.json` is a separate thing: it exists so that opening *this* repo
+as a project also loads the servers, and it uses plain `./` paths. When
+`plugin.json` declares `mcpServers` inline, the root `.mcp.json` is not loaded
+by the plugin, so the two files no longer have to serve both purposes.
 
 That PEP 723 block replaces a venv this project used to build and pin by hand,
 and the reason it was pinned is worth keeping in mind if you register these
@@ -733,7 +739,7 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Returns a plan, edits nothing | `"default_agent": "plan"` is read-only | `--agent build` |
 | `timeout waiting for response` after ~5 minutes | agy's print-mode default wait, not the subprocess timeout | `--print-timeout 60m`; check `git log` before believing the error |
 | Tools missing from Claude entirely | a hand-built venv's `python` symlink followed a system Python upgrade | let `uv run --script` resolve the interpreter, as the plugin does |
-| Tools missing, and this repo is the open project | `${CLAUDE_PLUGIN_ROOT}` is empty outside a plugin, so the path is `/…py` | the `${CLAUDE_PLUGIN_ROOT:-.}` fallback in `.mcp.json` |
+| Tools missing, both servers `Connection closed` on every install | `${CLAUDE_PLUGIN_ROOT:-.}` in the plugin config; Claude Code only substitutes the exact `${CLAUDE_PLUGIN_ROOT}` token, so the path became `./…py` relative to the open project | plain `${CLAUDE_PLUGIN_ROOT}` in `plugin.json`; the root `.mcp.json` uses `./` and serves in-repo use only |
 | Tool reports "CLI not found" after a node upgrade | nvm path carries the node version | set `OPENCODE_BIN` to a stable symlink |
 | Edits to a `.py` have no effect | the server process holds the old code | `/reload-plugins`, or `/mcp reconnect` |
 | Model id rejected | defaults go stale, or the model is region-gated | `agy models` / `opencode models` |
