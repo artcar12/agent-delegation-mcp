@@ -958,6 +958,47 @@ claude mcp add opencode-wrapper -s user \
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
 
+### 1.2.0 (2026-09-18)
+
+**New: a third server, `gemini-web-wrapper`.** `agy` and `opencode` reach Gemini
+through an API that has no Deep Research, no Canvas, no Gems, no conversation
+history and no attachments. Those live only in the logged-in web app. This
+server drives a dedicated Chrome profile to reach them, with the same run store
+as the other two, so a run still outlives the server that started it.
+
+Sign in once before first use — the script never sees your credentials:
+
+```bash
+uv run --script gemini_web.py login
+```
+
+New tools: `gemini_ask`, `dispatch_gemini`, `gemini_research`,
+`dispatch_research`, `gemini_conversations`, `gemini_read_conversation`.
+
+Deep Research is two calls, not one. `dispatch_gemini(mode="deep-research")`
+returns a conversation id in about 45 seconds; Google then researches
+server-side — about 40 minutes on a measured run — and
+`gemini_research(<that id>)` brings the report back. "Still running" is a normal
+answer from it, not a failure; calling again later is the whole protocol.
+
+One behaviour change to the existing servers: the `cli` column in `list_runs`
+widened from 8 to 10 characters, because `gemini-web` overflowed it. Applied to
+all three so the shared core stays byte-identical. No flags, tool names or
+env vars changed.
+
+> [!WARNING]
+> Automating the Gemini web UI is outside Google's terms for automated access.
+> A driven account can be rate-limited. The dedicated profile, real Chrome
+> channel and one-call-at-a-time serialization lower the odds; they do not
+> remove them.
+
+To pick it up:
+
+```bash
+claude plugin marketplace update agent-delegation-mcp
+claude plugin update agent-delegation
+```
+
 ### 1.1.1 (2026-09-17)
 
 **Fix: both servers failed to start on every plugin install of 1.1.0.** The
