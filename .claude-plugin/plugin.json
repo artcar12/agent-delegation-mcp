@@ -32,6 +32,14 @@
         "--script",
         "${CLAUDE_PLUGIN_ROOT}/agy_mcp_server.py"
       ]
+    },
+    "gemini-web-wrapper": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--script",
+        "${CLAUDE_PLUGIN_ROOT}/gemini_web_mcp_server.py"
+      ]
     }
   }
 }

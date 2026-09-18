@@ -4,9 +4,10 @@
 
 **Claude plans. Cheaper models build. Claude decides whether it's correct.**
 
-Two local MCP stdio servers, shipped as a Claude Code plugin, that let Claude Code
-hand implementation work to the **Antigravity CLI** (`agy`, Gemini) and to
-**OpenCode**, run it fully unattended, and then gate the result.
+Three local MCP stdio servers, shipped as a Claude Code plugin, that let Claude Code
+hand implementation work to the **Antigravity CLI** (`agy`, Gemini), to
+**OpenCode**, and to the **Gemini web app**, run it fully unattended, and then
+gate the result.
 
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![plugin](https://img.shields.io/badge/claude%20code-plugin-8A63D2)
@@ -46,6 +47,7 @@ established by mutation testing on a real project, at the versions listed in
 | [2. Install](#2-install) | Prerequisites, plugin install, why there is no venv |
 | [3. Configuration](#3-configuration) | Every environment variable |
 | [4. What the tools actually run](#4-what-the-tools-actually-run) | The argv, the seven silent flags, the five tools, the reconcile loop |
+| [4.5 The Gemini web wrapper](#45-the-gemini-web-wrapper) | Driving the browser app, and the sign-in you have to do by hand |
 | [5. Operating rules](#5-operating-rules) | The part that took weeks instead of an hour |
 | [6. Repo conventions](#6-repo-conventions-that-make-this-work) | Where state lives |
 | [7. Known failure modes](#7-known-failure-modes-condensed) | Symptom → cause → fix |
@@ -286,7 +288,7 @@ Code itself inherits. All are optional.
 
 | Variable | Applies to | Default | Why you would change it |
 |---|---|---|---|
-| `AGENT_MCP_DEFAULT_CWD` | both | the session's working directory | Pin every dispatch to one project regardless of where Claude was started. The `cwd` tool argument always wins. |
+| `AGENT_MCP_DEFAULT_CWD` | all three | the session's working directory | Pin every dispatch to one project regardless of where Claude was started. The `cwd` tool argument always wins. |
 | `AGY_BIN` | agy | `agy` on PATH | PATH is not reliably inherited by an MCP subprocess. |
 | `OPENCODE_BIN` | opencode | `opencode` on PATH | Same, and more urgent: `opencode` usually lives under an nvm node dir whose path carries the node version, so it moves on every node upgrade. Point this at a stable symlink such as `/usr/local/bin/opencode`. |
 | `AGY_MCP_MODEL` | agy | `gemini-3.6-flash-high` | Model ids go stale. Check `agy models`. |
@@ -299,9 +301,20 @@ Code itself inherits. All are optional.
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
-| `AGENT_MCP_MAX_OUTPUT` | both | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
-| `AGENT_MCP_RUN_DIR` | both | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. Both servers share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
-| `AGENT_MCP_RUN_RETENTION_DAYS` | both | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
+| `AGENT_MCP_MAX_OUTPUT` | all three | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
+| `AGENT_MCP_RUN_DIR` | all three | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. All three share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
+| `AGENT_MCP_RUN_RETENTION_DAYS` | all three | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
+| `GEMINI_WEB_PROFILE` | gemini-web | `~/.agent-delegation-mcp/gemini-profile` | The Chrome user-data-dir the worker drives. Never point this at your daily profile: Chrome refuses to share one with a running instance. |
+| `GEMINI_WEB_CHROME` | gemini-web | the system Chrome | Only used by `login`, which needs a Chrome that Playwright is *not* driving. |
+| `GEMINI_WEB_HEADLESS` | gemini-web | off | `1` runs the automation without a window. Off by default: headless is likelier to trip Google's bot heuristics, and the clipboard extraction path needs a focused window. |
+| `GEMINI_WEB_WORKER` | gemini-web | `gemini_web.py` beside the server | Point the server at a worker somewhere else. |
+| `GEMINI_WEB_UV_BIN` | gemini-web | `uv` on PATH | `uv run --script` is what honours the worker's inline dependency block, so this is the launcher, not python. PATH is not reliably inherited. |
+| `GEMINI_WEB_BIN` | gemini-web | — | Skip uv entirely and run this executable as the worker. Mostly an escape hatch for tests. |
+| `GEMINI_WEB_MCP_MODE` | gemini-web | `chat` | Default surface for `dispatch_gemini`. |
+| `GEMINI_WEB_MCP_WORKER_TIMEOUT` | gemini-web | `1500` | The worker's own deadline, in seconds. Keep it below the wall clock so the worker's limit is the one that hits: it exits with whatever the page had rendered, where the outer kill leaves nothing to show. |
+| `GEMINI_WEB_MCP_TIMEOUT` | gemini-web | `1800` | Outer subprocess cap, in seconds. Deep Research genuinely runs 10-20 minutes. |
+| `GEMINI_WEB_MCP_IDLE_TIMEOUT` | gemini-web | `0` (off) | Same knob as the others, and here it is close to a correctness requirement rather than a preference: a browser run prints nothing between launch and the final answer, so every healthy Deep Research run looks idle for its entire duration. |
+| `GEMINI_WEB_MCP_FATAL_PATTERNS` | gemini-web | — | Extra comma-separated stderr strings, as above. |
 
 ---
 
@@ -459,6 +472,128 @@ unattended delegate needs is bulletproof syntactic adherence through a fragile
 translation layer, not a high reasoning score. A model that reasons well and
 malforms one tool call in fifty is worse here than an average model that never
 breaks the loop.
+
+---
+
+## 4.5 The Gemini web wrapper
+
+`gemini-web-wrapper` is the third server and the odd one out: it does not wrap a
+CLI, it wraps **gemini.google.com in a real Chrome**.
+
+### Why it exists
+
+`agy` and `gemini` both reach Gemini through an API that has no Deep Research,
+no Canvas, no Gems, no conversation history and no attachments. Those exist only
+in the logged-in web app. If you have a Pro subscription, this is how a CLI agent
+reaches what you are already paying for.
+
+### Shape
+
+```
+MCP client  ->  gemini_web_mcp_server.py  ->  gemini_web.py  ->  Chrome  ->  gemini.google.com
+                (run store, tools)            (Playwright)       (dedicated profile)
+```
+
+Playwright deliberately does **not** run inside the MCP server. The worker is an
+ordinary child process with its fds redirected to files, exactly like `agy`, which
+is the whole reason a Deep Research run survives the server that started it. The
+run store, `check_run`, `cancel_run`, `list_runs`, retention and pruning are the
+same code as the other two servers, duplicated rather than imported (see
+[Repo conventions](#6-repo-conventions-that-make-this-work)).
+
+### Tools
+
+| Tool | Blocks? | Notes |
+|---|---|---|
+| `gemini_ask` | yes | The common case. ~20s floor: Chrome has to launch and the Angular app has to hydrate before a prompt can be typed. |
+| `dispatch_gemini` | no | Returns a run id. The only path for `mode="deep-research"`, which is a kick-off — see below. |
+| `gemini_conversations` | yes | Sidebar history as `id  title`. |
+| `gemini_read_conversation` | yes | Dump a thread as markdown without adding to it — including one you started by hand in the browser. |
+| `check_run` / `cancel_run` / `list_runs` | — | Identical to the other servers; they share one store. |
+| `delegation_status` | yes | Also reports whether the profile is still signed in. |
+
+Modes: `chat` (default), `deep-research`, `canvas`, `image`, `video`.
+
+Every answer reports a `conversation_id`. Pass it back to `gemini_ask` or
+`dispatch_gemini` to continue that thread instead of starting a new one.
+
+### Signing in: you have to do this by hand, once
+
+```bash
+uv run --script gemini_web.py login
+```
+
+That opens a **plain** Chrome against `~/.agent-delegation-mcp/gemini-profile`,
+waits for you to sign in and quit it, then verifies with Playwright.
+
+It has to work this way. Google refuses its own sign-in flow inside a browser
+under the DevTools protocol — you get *"Couldn't sign you in / This browser or app
+may not be secure"* and no user-agent or flag tweak gets past it. The block
+applies to the sign-in flow only, not to cookies that already exist, so the
+sign-in happens in an unautomated Chrome and Playwright picks the profile up
+afterwards. Chrome will not share a user-data-dir between instances, which is why
+`login` waits for you to quit rather than running alongside.
+
+Two traps worth naming:
+
+- **That window is its own Chrome instance.** No bookmarks, no other tabs, not
+  signed in. Signing into your everyday Chrome does nothing for it.
+- **Gemini serves anonymous visitors a fully working composer.** So "the prompt
+  box rendered" proves nothing — you can use that window for a while and quit it
+  still signed out, with nothing on screen having looked wrong. `login` lands you
+  on the account chooser rather than on Gemini for exactly this reason, and checks
+  the profile's cookies before it claims success.
+
+### Deep Research is a kick-off, not a question
+
+A deep-research prompt does not come back with a report. It comes back with a
+**plan** and a "Start research" button. Clicking that hands the job to Google,
+which runs it server-side — the chat turn says so outright: *"I'll let you know
+when your research is done. In the meantime, you can leave this chat."*
+
+So `dispatch_gemini(mode="deep-research")` sends the prompt, confirms the plan,
+and returns the conversation id in under a minute. The report lands in that
+conversation 10-20 minutes later.
+
+> [!NOTE]
+> **Bringing the report back is not implemented yet** (ADM-3). Open the
+> conversation in a browser to read it. Everything else about the mode works:
+> the prompt is sent, the plan is confirmed, and the research runs.
+
+Two things make this mode unlike the others, and both cost an afternoon to find:
+
+- The chat turn stays a **permanent stub**. It never gets the `message-actions`
+  row that every other mode completes with, so the usual completion check waits
+  forever — a 1500s timeout returning 169 characters.
+- The report is written into a `deep-research-immersive-panel`, not into the
+  chat turn, so it has to be read from somewhere else entirely.
+
+### One browser, one profile, one call at a time
+
+Every tool here refuses when another is running. On the sibling servers that
+refusal is quota etiquette; here it is a hard constraint — Chrome cannot open the
+same user-data-dir twice, and the alternative to refusing is a corrupted profile.
+
+### It is silent while it works
+
+A browser run prints **nothing** between launch and the final answer. An empty
+log tail in `check_run` means "still working", not "stuck" — judge it by elapsed
+time. This is also why `GEMINI_WEB_MCP_IDLE_TIMEOUT` defaults to off: every
+healthy Deep Research run looks idle for its entire duration.
+
+### When Google reshuffles the DOM
+
+Every selector is unversioned Angular internals, collected in one `SELECTORS`
+dict at the top of `gemini_web.py`. A redesign is a one-file fix, and the worker
+fails naming the selector that moved rather than hanging. Response extraction
+prefers Gemini's own copy-to-clipboard markdown and falls back to an HTML ->
+Markdown pass in Python — which is Python rather than JS in the page precisely so
+`test/test_gemini_web_worker.py` can test it offline against captured fixtures.
+
+> [!WARNING]
+> Automating the web UI is outside Google's terms for automated access. A driven
+> account can be rate-limited or suspended. Using a stock Chrome build with a
+> persistent profile lowers the odds; it does not remove them.
 
 ---
 
@@ -747,6 +882,14 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Gate passes, feature does not work | tests cover the helper, not the caller | the [§5.5](#55-verify-the-plans-named-test-files-actually-exist-and-that-they-test-the-caller) checklist |
 | No visibility during a long run | dispatch used to block with no interim output | `check_run` for the log tail; the mandatory progress file for real phase-by-phase progress |
 | `ImportError: mcp.server.fastmcp` | mcp 2.0 removed that module | already handled: the servers import `MCPServer` and fall back to `FastMCP` |
+| gemini-web: sign in, verify, "still signed out" — every time | **the verification itself destroyed the session.** Playwright passes `--use-mock-keychain` by default; on macOS that hands Chrome a different cookie-encryption key than the real Keychain holds, so Chrome cannot decrypt the profile's cookies and silently deletes them on launch | already handled: `ignore_default_args=["--use-mock-keychain"]`. `login` now counts google.com cookies before and after and says so outright if they vanish |
+| gemini-web: "Couldn't sign you in / This browser or app may not be secure" | Google refuses OAuth in a browser under the DevTools protocol. No user-agent or flag tweak gets past it | sign in via `gemini_web.py login`, which runs a Chrome that Playwright is *not* driving. Only the sign-in *flow* is blocked; existing cookies work fine |
+| gemini-web: `Failed to create a ProcessSingleton` | Chrome will not share a user-data-dir between instances, and a crash leaves a stale lock | quit the other Chrome on that profile; if none is running, delete `SingletonLock` in the profile dir |
+| gemini-web: prompt lands in the box and never sends, headless only | Angular ignores a synthetic Enter in headless Chrome | already handled: the send button is clicked, with Enter only as fallback |
+| gemini-web: `selector 'file_input' never appeared` | Gemini's file inputs are `class="hidden-file-input"` and Playwright waits for *visible* by default | already handled: that wait uses `state="attached"` |
+| gemini-web: deep-research returns 169 chars after a full timeout | the chat turn for a deep-research prompt is a permanent stub with no `message-actions`, so the usual completion check never fires; the report goes to a separate immersive panel | already handled: the mode is now a kick-off that returns once the plan is confirmed. Harvesting the report is ADM-3 |
+| gemini-web: "no tool labelled 'deep research'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
+| gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
 | A delegate left over from a session that ended | nothing kills a run when its server dies, by design | `list_runs` finds it; `cancel_run` stops it; `check_run` applies its deadlines |
@@ -797,7 +940,7 @@ claude plugin marketplace update agent-delegation-mcp
 claude plugin update agent-delegation
 ```
 
-then start a new session. `claude mcp list` should show both wrappers as
+then start a new session. `claude mcp list` should show all three wrappers as
 Connected before you do.
 
 No changes to the servers themselves, their tools, or their flags.
