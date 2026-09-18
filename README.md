@@ -552,6 +552,40 @@ to save a request. The instructions say plainly not to.
 > **Settings → Usage limits**, which is where to look if a call ever fails on
 > quota — not at this paragraph.
 
+### Deep Research is the rare case, not the headline
+
+The tempting read of this server is "it has Deep Research." That is backwards
+for a CLI agent. An agent can write a prompt of any length and ask as many
+follow-ups as it likes, and that covers most of what Deep Research is for — in
+half a minute instead of forty. The Redis-vs-Valkey comparison that took a
+40-minute research run below came back better as one long `gemini_ask` on Flash.
+
+So the guidance in the MCP instructions is: one long, specific prompt, then
+follow-ups into the same `conversation_id` to push on whatever came back thin.
+`mode="deep-research"` is reserved for the most taxing problems an agent gets
+handed, which in practice is very few of them — dozens of sources genuinely read
+end to end, a written report as the deliverable, forty minutes acceptable.
+Reaching for it because a prompt felt too big for one call is the wrong reason —
+make the prompt bigger.
+
+> [!WARNING]
+> **Deep Research is the least reliable thing in this server. Do not build a
+> plan that depends on it.** Of three kick-offs observed, one produced a report
+> in about 40 minutes and two wedged: panel frozen at the same character count
+> and thought count for over an hour, no error shown, the chip still reading
+> *"Researching 64 websites…"*. Cause unknown — both wedged runs were started
+> during the window when the mock-keychain bug was still destroying cookies
+> mid-flight, which is a plausible but unproven explanation. `gemini_research`
+> reports a stall honestly rather than inventing a report, but a wedged run
+> never recovers. If one has not moved in an hour, abandon it and ask the
+> question as a long `gemini_ask` instead.
+
+One prompting caveat, learned the annoying way: **asking for a verbatim quote
+per claim can make the model announce it has no web access and then answer from
+memory anyway.** Asking for a *URL* per claim is safe. If an answer ever claims
+it cannot browse, it is wrong — a control question came back with a Node.js
+release from two days earlier, URL included. Retry without the quote demand.
+
 ### Signing in: you have to do this by hand, once
 
 ```bash
@@ -961,6 +995,8 @@ reopening settled questions or rediscovering the same platform gotcha.
 | gemini-web: deep-research returns 169 chars after a full timeout | the chat turn for a deep-research prompt is a permanent stub with no `message-actions`, so the usual completion check never fires; the report goes to a separate immersive panel | already handled: the mode is a kick-off that returns once the plan is confirmed, and `gemini_research` harvests the report from the panel later |
 | gemini-web: a finished report reports `running` forever | the check was "is a loading skeleton still mounted?", and `thinking-panel-skeleton-loader` stays mounted and visible on a completed report | already handled: completion is the report body's presence, not the absence of a loader. See [the completion marker](#the-completion-marker-and-the-one-that-looks-right-and-isnt) |
 | gemini-web: `gemini_research` says a running conversation has no research in it | the immersive panel mounts ~5s after the chat turns beside it | already handled: 15s grace before `absent` is concluded |
+| gemini-web: a link in an answer goes to a Google redirect, not the page | Gemini rewrites outbound hrefs through `google.com/search?q=<real url>&utm_source=gemini` while the anchor text shows the real destination | already handled: the real URL is taken back out of the `q` parameter during extraction |
+| gemini-web: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | ask for a URL per claim instead of a quote, and retry |
 | gemini-web: "no tool labelled 'deep research'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
 | gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
@@ -990,6 +1026,29 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.2.2 (2026-09-18)
+
+**Deep Research is now documented as the rare case, and as flaky.** The previous
+release read as though Deep Research were the headline feature. For a CLI agent
+it is not: an agent can write a prompt of any length and ask follow-ups, which
+covers most of what Deep Research is for in half a minute rather than forty. The
+instructions now say to reserve it for the most taxing problems, and to expect
+those to be few. They also record what testing actually showed — one of three
+kick-offs finished, two wedged with no error — so a session does not plan around
+it.
+
+**Fix: links in answers pointed at a Google redirect, not the page.** Gemini
+rewrites outbound hrefs to `google.com/search?q=<real url>&utm_source=gemini`
+while the anchor text shows the real destination, so a markdown link looked
+correct and went somewhere else. The real URL is now taken back out of the query
+string. That matters most for exactly the workflow this server is recommended
+for: asking for a URL per claim so the answer can be checked.
+
+Also documented: asking for a *verbatim quote* per claim can make the model
+announce it has no web access and then answer from memory anyway. Asking for a
+URL does not. It can browse — a control question returned a Node.js release from
+two days earlier, with a link.
 
 ### 1.2.1 (2026-09-18)
 

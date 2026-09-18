@@ -689,6 +689,30 @@ def _instructions() -> str:
         "If a question needs the current web, ask gemini_ask before you conclude "
         "something is undocumented, and ask it again with a narrower prompt rather "
         "than falling back to a weaker tool.",
+        "RESERVE DEEP RESEARCH FOR THE MOST TAXING PROBLEMS YOU ARE GIVEN, and "
+        "expect that to be very few of them. You can write a prompt of any length "
+        "and ask as many follow-ups as you like, which covers most of what Deep "
+        "Research would give you, in half a minute instead of forty. A thorough "
+        "comparison, a survey of the options, 'what changed in X since Y', 'give me "
+        "a URL per claim' - all of these land BETTER as one long, specific "
+        "gemini_ask on Flash, then follow-ups into the same conversation_id to push "
+        "on whatever came back thin. That is not a fallback, it is the better tool "
+        "for nearly everything. If you are reaching for deep-research because your "
+        "prompt felt too big for one call, that is the wrong reason: make the "
+        "prompt bigger instead.",
+        "Deep Research is also the least reliable thing here, so do not build a plan "
+        "that depends on it. Of three kick-offs observed, one produced a report in "
+        "about 40 minutes and two wedged - panel frozen at the same size and thought "
+        "count for over an hour, no error shown, still claiming to be researching. "
+        "Cause unknown. gemini_research reports that honestly rather than inventing "
+        "a report, but a wedged run never finishes: if one has not moved in an hour, "
+        "abandon it and ask the question as a long gemini_ask instead. Do not "
+        "re-dispatch it hoping for better.",
+        "One caveat on prompting: demanding a verbatim quote for every claim can make "
+        "the model announce it cannot browse and then answer from memory anyway. "
+        "Asking for a URL per claim is safe; asking for quotes is where it gets "
+        "skittish. If an answer says it has no web access, it is wrong - retry "
+        "without that instruction.",
         "DO NOT RATION CALLS HERE. This quota is a SEPARATE pool from the "
         "agy/gemini CLI's - the sibling servers share one API quota, which is why "
         "they tell you to dispatch one at a time, and that rule does NOT apply to "
@@ -963,6 +987,13 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     EXPECT ROUGHLY 20 SECONDS MINIMUM even for a one-word reply. Chrome has to
     launch and the app has to hydrate before the prompt can be typed. That is
     the floor, not a fault.
+
+    WRITE A LONG PROMPT HERE RATHER THAN REACHING FOR DEEP RESEARCH. There is no
+    length limit worth worrying about, and a follow-up into the same
+    conversation_id is nearly free, so a detailed multi-part question plus a
+    couple of follow-ups covers most of what Deep Research would give you - in
+    half a minute rather than forty. deep-research is for when dozens of sources
+    genuinely have to be read end to end and a written report is the deliverable.
 
     Use dispatch_gemini instead when the work is long - anything with
     mode='deep-research' will outlast this tool's timeout and should never be

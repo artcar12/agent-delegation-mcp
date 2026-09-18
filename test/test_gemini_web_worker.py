@@ -166,6 +166,32 @@ class MarkdownExtractionTests(unittest.TestCase):
                 self.assertNotIn("<div", out, f"{name} leaked raw HTML")
 
 
+class LinkUnwrappingTests(unittest.TestCase):
+    """Gemini routes outbound links through a google.com redirect: the anchor
+    text shows the real destination, the href does not. An answer whose whole
+    value is that you can check it must not hand back links that go somewhere
+    else."""
+
+    def test_a_wrapped_link_comes_back_pointing_at_the_real_page(self):
+        out = gw.html_to_markdown(
+            '<a href="https://www.google.com/search?q=https%3A%2F%2Fgithub.com'
+            '%2Fnodejs%2Fnode%2Freleases%2Ftag%2Fv26.9.0&utm_source=gemini">'
+            'github.com/nodejs/node</a>')
+        self.assertEqual(
+            out, "[github.com/nodejs/node]"
+                 "(https://github.com/nodejs/node/releases/tag/v26.9.0)")
+
+    def test_an_ordinary_link_is_left_alone(self):
+        self.assertEqual(gw._unwrap_google_redirect("https://vite.dev/blog"),
+                         "https://vite.dev/blog")
+
+    def test_a_genuine_google_search_link_survives(self):
+        """The q parameter only holds a URL when it IS a redirect. A real
+        search link has a query in there and must not be mangled."""
+        url = "https://www.google.com/search?q=redis+vs+valkey"
+        self.assertEqual(gw._unwrap_google_redirect(url), url)
+
+
 class DeepResearchReportTests(unittest.TestCase):
     """The two captured panels are a matched pair, taken minutes apart from two
     conversations whose own chat turns said, verbatim, "I'm on it. I'll let you

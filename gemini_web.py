@@ -316,7 +316,7 @@ class _MarkdownExtractor(HTMLParser):
             self._newline(2)
             self._emit("> ")
         elif tag == "a":
-            self._href = attrd.get("href", "")
+            self._href = _unwrap_google_redirect(attrd.get("href", ""))
             self._link_text = []
         elif tag == "table":
             self._table_rows = []
@@ -420,6 +420,34 @@ class _MarkdownExtractor(HTMLParser):
         text = re.sub(r"[ \t]+\n", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+
+_REDIRECT_HOSTS = ("www.google.com/url", "www.google.com/search",
+                   "google.com/url", "google.com/search")
+
+
+def _unwrap_google_redirect(href: str) -> str:
+    """Gemini rewrites outbound links through a google.com redirect.
+
+    The anchor TEXT shows the real destination while the href points at
+    `google.com/search?q=<the real url>&utm_source=gemini`. Left alone, a
+    markdown link looks right and goes somewhere else -- which is the worst
+    failure for an answer whose whole job is to be checkable. The real URL is
+    sitting in the q (or url) parameter, so take it back.
+    """
+    if not href or not any(h in href for h in _REDIRECT_HOSTS):
+        return href
+    try:
+        from urllib.parse import parse_qs, unquote, urlsplit
+        qs = parse_qs(urlsplit(href).query)
+    except Exception:
+        return href
+    for key in ("q", "url"):
+        for value in qs.get(key, []):
+            target = unquote(value)
+            if target.startswith(("http://", "https://")):
+                return target
+    return href
 
 
 def html_to_markdown(source: str) -> str:
