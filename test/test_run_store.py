@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Exercises the run store in both servers against fake CLIs.
+"""Exercises the run store in all three servers against fake CLIs.
 
 Runs with plain `python3 test/test_run_store.py` - no MCP install needed. The
 decorator is the only thing the servers use from the SDK, so a stub that
@@ -74,7 +74,7 @@ def _load(filename, alias, env):
 
 
 def _fake_cli(directory, body):
-    """A stand-in for agy/opencode: a shell script we fully control."""
+    """A stand-in for agy/opencode/gemini_web: a shell script we control."""
     path = os.path.join(directory, "fake-cli")
     with open(path, "w") as fh:
         fh.write("#!/bin/sh\n" + body)
@@ -87,6 +87,10 @@ class RunStoreTests(unittest.TestCase):
     BIN_VAR = "AGY_BIN"
     TIMEOUT_VAR = "AGY_MCP_TIMEOUT"
     IDLE_VAR = "AGY_MCP_IDLE_TIMEOUT"
+    # A phrase this server actually fail-fasts on. The mechanism is shared, the
+    # patterns are not: a browser wrapper has no reason to watch for a provider
+    # quota string, so the subclass names one of its own.
+    FATAL_PHRASE = "usage limit reached"
     counter = 0
 
     def setUp(self):
@@ -231,13 +235,14 @@ class RunStoreTests(unittest.TestCase):
         self.assertFalse(mod._pid_exists(pid))
 
     def test_fatal_stderr_pattern_kills_the_run(self):
-        mod = self.server("echo 'AI_APICallError: quota exceeded' >&2; sleep 300\n")
+        phrase = self.FATAL_PHRASE
+        mod = self.server(f"echo 'prefix: {phrase} here' >&2; sleep 300\n")
         run_id = self.run_id_from(self.dispatch(mod))
         self.assertTrue(self.wait_until(
             lambda: mod._read_record(run_id)["state"] != "running"))
         record = mod._read_record(run_id)
         self.assertEqual(record["verdict"], "fatal")
-        self.assertIn("quota exceeded", record["fatal_line"])
+        self.assertIn(phrase, record["fatal_line"])
 
     def test_fatal_line_split_across_two_scans_is_still_caught(self):
         """The scan consumes only up to the last newline, so a message still
@@ -247,15 +252,16 @@ class RunStoreTests(unittest.TestCase):
             "run_id": "x", "stderr_path": os.path.join(self.tmp, "e"),
             "scan_offset": 0, "fatal_line": None,
         }
+        head, tail = self.FATAL_PHRASE[:6], self.FATAL_PHRASE[6:]
         with open(record["stderr_path"], "wb") as fh:
-            fh.write(b"fine\nusage limit ")          # no trailing newline
+            fh.write(b"fine\n" + head.encode())      # no trailing newline
         mod._scan_fatal(record)
         self.assertIsNone(record["fatal_line"])
         self.assertEqual(record["scan_offset"], 5)   # only "fine\n" consumed
         with open(record["stderr_path"], "ab") as fh:
-            fh.write(b"reached now\n")
+            fh.write(tail.encode() + b" now\n")
         mod._scan_fatal(record)
-        self.assertEqual(record["fatal_line"], "usage limit reached now")
+        self.assertEqual(record["fatal_line"], self.FATAL_PHRASE + " now")
 
     def test_recycled_pid_is_never_signalled(self):
         """A stale record must not be able to kill an unrelated process."""
@@ -359,13 +365,24 @@ class RunStoreTests(unittest.TestCase):
 
 
 class OpenCodeRunStoreTests(RunStoreTests):
-    """The two servers are self-contained duplicates by design, so the store
-    has to be verified in both - a fix applied to one and not the other is the
+    """The servers are self-contained duplicates by design, so the store has to
+    be verified in each one - a fix applied to one and not the others is the
     exact failure this suite exists to catch."""
     SERVER = "opencode_mcp_server.py"
     BIN_VAR = "OPENCODE_BIN"
     TIMEOUT_VAR = "OPENCODE_MCP_TIMEOUT"
     IDLE_VAR = "OPENCODE_MCP_IDLE_TIMEOUT"
+
+
+class GeminiWebRunStoreTests(RunStoreTests):
+    """Same store, third copy. GEMINI_WEB_BIN is the escape hatch that runs a
+    ready-made executable instead of `uv run --script gemini_web.py`, which is
+    what lets the fake CLI stand in for the worker here."""
+    SERVER = "gemini_web_mcp_server.py"
+    BIN_VAR = "GEMINI_WEB_BIN"
+    TIMEOUT_VAR = "GEMINI_WEB_MCP_TIMEOUT"
+    IDLE_VAR = "GEMINI_WEB_MCP_IDLE_TIMEOUT"
+    FATAL_PHRASE = "not signed in"
 
 
 if __name__ == "__main__":

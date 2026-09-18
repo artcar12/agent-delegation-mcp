@@ -4,19 +4,29 @@
 # dependencies = ["mcp>=1.29,<3"]
 # ///
 """
-opencode-wrapper: exposes the OpenCode CLI to Claude Code as a local MCP stdio
-server.
+gemini-web-wrapper: exposes the Gemini *web app* to MCP clients as a local
+stdio server.
 
-A dispatch does not block. It spawns the delegate, records the run on disk and
-returns a run id; check_run, cancel_run and list_runs work on that record from
-any session, including one started after this server has been restarted. See
-the run-store comment below for why.
+The sibling servers reach Gemini through an API that has no Deep Research, no
+Canvas, no Gems, no conversation history and no attachments. Those live only in
+the logged-in web app. gemini_web.py drives it with Playwright; this file wraps
+that worker exactly the way agy_mcp_server.py wraps `agy`, so a browser run is
+recorded on disk and stays checkable, tailable and cancellable across dropped
+connections, session ends and server restarts.
 
-Self-contained on purpose: nothing is imported from its sibling server, and the
-dependency is declared inline above, so `uv run --script` on this one file is a
-complete way to run it. The run store is therefore duplicated into both servers
-rather than factored out; they share RUN_DIR at runtime, not code. Every knob is
-an environment variable; the full list is in the README.
+Playwright deliberately does NOT run in this process. The worker is an ordinary
+child process whose fds are redirected to files, which is the whole reason a
+run outlives the server that started it.
+
+Self-contained on purpose: nothing is imported from its sibling servers, and
+the dependency is declared inline above, so `uv run --script` on this one file
+is a complete way to run it. The run store is therefore duplicated into all
+three servers rather than factored out; they share RUN_DIR at runtime, not
+code. Every knob is an environment variable; the full list is in the README.
+
+One browser, one profile, so genuinely one run at a time -- the per-CLI refusal
+in _dispatch is not just quota etiquette here, it is a hard constraint. Chrome
+will not open the same user-data-dir twice.
 """
 
 import json
@@ -35,10 +45,10 @@ try:
 except ImportError:
     from mcp.server.fastmcp import FastMCP as _Server  # mcp 1.x
 
-SERVER_NAME = "opencode-wrapper"
-CLI_LABEL = "opencode"
-BIN_ENV_VAR = "OPENCODE_BIN"
-TOOL_NAME = "dispatch_opencode"
+SERVER_NAME = "gemini-web-wrapper"
+CLI_LABEL = "gemini-web"
+BIN_ENV_VAR = "GEMINI_WEB_BIN"
+TOOL_NAME = "dispatch_gemini"
 
 
 def _env(name: str, default: str) -> str:
@@ -48,7 +58,7 @@ def _env(name: str, default: str) -> str:
 def _int_env(name: str, default: int, allow_zero: bool = False) -> int:
     """A malformed value must not take the whole server down on import: warn to
     stderr and fall back, rather than letting int() raise (which silently drops
-    the tool from Claude with no visible cause)."""
+    the tool from the client with no visible cause)."""
     raw = _env(name, str(default))
     try:
         val = int(raw)
@@ -62,68 +72,76 @@ def _int_env(name: str, default: int, allow_zero: bool = False) -> int:
         return default
 
 
-# `opencode` usually lives in an nvm-managed node dir, which an MCP subprocess
-# may not inherit on PATH - and whose path carries the node version, so it moves
-# on a node upgrade. shutil.which answers from whatever PATH this process was
-# given, which is not necessarily a login shell's: set OPENCODE_BIN to an
-# absolute path, or point a stable symlink at it, when that comes up empty.
-OPENCODE_BIN = _env("OPENCODE_BIN", shutil.which("opencode") or "opencode")
+# The worker lives beside this file. Resolved absolutely because a client may
+# spawn this server from anywhere, and because the run record has to name
+# something a later session can still make sense of.
+WORKER = _env("GEMINI_WEB_WORKER",
+              os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "gemini_web.py"))
 
-# Claude Code spawns this server in the session's directory, so cwd is the right
+# `uv run --script` is what honours the worker's inline dependency block, so it
+# is the launcher, not python. Absolute path beats PATH: a client spawns this
+# process without necessarily inheriting a login shell's PATH, so shutil.which
+# can come up empty where `uv` runs fine in a terminal. Set GEMINI_WEB_BIN to a
+# ready-made executable to skip uv entirely.
+UV_BIN = _env("GEMINI_WEB_UV_BIN", shutil.which("uv") or "uv")
+GEMINI_WEB_BIN = _env(BIN_ENV_VAR, "")
+
+
+def _worker_argv(*args: str) -> list:
+    """The command that runs one worker subcommand."""
+    if GEMINI_WEB_BIN:
+        return [GEMINI_WEB_BIN, *args]
+    return [UV_BIN, "run", "--script", WORKER, *args]
+
+
+# A client spawns this server in the session's directory, so cwd is the right
 # default. Set AGENT_MCP_DEFAULT_CWD to pin one project regardless of session.
 DEFAULT_CWD = _env("AGENT_MCP_DEFAULT_CWD", os.getcwd())
 
-DEFAULT_MODEL = _env("OPENCODE_MCP_MODEL", "opencode-go/glm-5.2")
+# The web app has no model flag; what varies is which *surface* the prompt is
+# sent to. This rides in the run record's `model` field so list_runs shows
+# something worth reading.
+DEFAULT_MODEL = _env("GEMINI_WEB_MCP_MODE", "chat")
+MODES = ("chat", "deep-research", "canvas", "image", "video")
 
-# Overrides opencode.json's "default_agent". See the docstring: the usual
-# default is `plan`, which is read-only and silently edits nothing.
-AGENT = _env("OPENCODE_MCP_AGENT", "build")
+# MUST stay below TIMEOUT_SECONDS: the worker's own deadline is the one that
+# should hit, because it exits cleanly with whatever the page had rendered
+# instead of being killed with nothing to show.
+WORKER_TIMEOUT = _int_env("GEMINI_WEB_MCP_WORKER_TIMEOUT", 1500)
 
-TIMEOUT_SECONDS = _int_env("OPENCODE_MCP_TIMEOUT", 3600)
+# Outer cap. Deep Research genuinely runs for 10-20 minutes.
+TIMEOUT_SECONDS = _int_env("GEMINI_WEB_MCP_TIMEOUT", 1800)
 
-# Wall clock cannot tell "thinking hard" from "dead": a quota-exhausted run sits
-# at 0% CPU forever and burns the full TIMEOUT_SECONDS in silence. This is the
-# inner limit `opencode run` does not have - unlike agy, it exposes no timeout
-# flag of its own, so nothing else in the stack will ever cut a hung run short.
-# Safe to enable by default only because --print-logs below gives a per-step
-# heartbeat on stderr; without it a quiet-but-healthy run would be killed.
-# 0 disables.
-IDLE_SECONDS = _int_env("OPENCODE_MCP_IDLE_TIMEOUT", 600, allow_zero=True)
+# Off by default, and unlike the other two servers this is not a tuning
+# preference but close to a correctness requirement: a browser run prints
+# NOTHING between launch and the final answer. Every healthy Deep Research run
+# looks idle for its entire duration. Only set this if you have added progress
+# logging to the worker.
+IDLE_SECONDS = _int_env("GEMINI_WEB_MCP_IDLE_TIMEOUT", 0, allow_zero=True)
 
-# Caps what a tool RETURNS, not what the delegate writes: output goes straight
-# to a file on disk, so nothing is lost by keeping the response small.
+# Caps what a tool RETURNS, not what the worker writes: output goes straight to
+# a file on disk, so nothing is lost by keeping the response small.
 MAX_OUTPUT_CHARS = _int_env("AGENT_MCP_MAX_OUTPUT", 100_000)
 
 POLL_SECONDS = 1.0
 
-# Matched case-insensitively against the child's stderr, and ONLY stderr: these
-# strings appear routinely in stdout that merely discusses quotas or auth, and a
-# false match kills a healthy run. Each one is a wall the CLI reports and then
-# does NOT exit on - it keeps the process alive at 0% CPU, which is what turns a
-# 20-second failure into an hour of waiting.
-#
-# Deliberately narrow. "stream error" is excluded: it also covers transient
-# drops the CLI retries past on its own, and the quota line that motivated this
-# list carries AI_APICallError in the same record anyway. Add provider-specific
-# strings via OPENCODE_MCP_FATAL_PATTERNS (comma-separated) rather than widening
-# these.
+# Matched case-insensitively against the child's stderr, and ONLY stderr.
+# Narrow on purpose. The worker exits on its own errors, so these exist for the
+# cases where Playwright leaves a process alive with nothing left to do.
 FATAL_PATTERNS = tuple(
     p for p in (
-        "ai_apicallerror",
-        "usage limit reached",
-        "quota exceeded",
-        "insufficient credit",
-        "invalid api key",
-        "authentication failed",
+        "not signed in",
+        "executable doesn't exist",
+        "browsertype.launchpersistentcontext",
     ) + tuple(
         s.strip().lower()
-        for s in _env("OPENCODE_MCP_FATAL_PATTERNS", "").split(",")
+        for s in _env("GEMINI_WEB_MCP_FATAL_PATTERNS", "").split(",")
     ) if p
 )
 
 # Where the delegate's DELIVERABLE belongs, inside the target project. Distinct
 # from RUN_DIR below, which holds this wrapper's own bookkeeping and raw logs.
-# Reported on every exit path. Matches the convention in README 5.2.
 ARTIFACT_DIR = ".agent-runs"
 ARTIFACT_LIMIT = 20
 
@@ -653,28 +671,38 @@ def _probe(argv: list) -> str:
 
 def _instructions() -> str:
     """Handed to the client at connect time, so it lands in the session before
-    the first dispatch rather than after it. What belongs here is exactly the
-    rules a tool result arrives too late to convey.
+    the first call rather than after it. What belongs here is exactly the rules
+    a tool result arrives too late to convey.
     """
     version = _plugin_version()
     return "\n\n".join([
-        f"opencode-wrapper {version or '(dev checkout)'} - delegates coding and "
-        f"research tasks to the opencode CLI, unattended and self-approving.",
-        "dispatch_opencode returns a run id immediately; it does not block. Follow the run "
-        "with check_run, stop it with cancel_run, and find runs left by earlier "
-        "sessions with list_runs.",
+        f"gemini-web-wrapper {version or '(dev checkout)'} - drives the Gemini "
+        f"WEB APP (Deep Research, Canvas, conversation history, attachments) "
+        f"through a real Chrome. Not the Gemini API.",
+        "gemini_ask blocks and returns the answer. dispatch_gemini returns a run id "
+        "immediately; follow it with check_run, stop it with cancel_run, and find runs "
+        "left by earlier sessions with list_runs.",
         "Rules a tool result cannot deliver in time:\n"
-        "- Brief every delegate to write its deliverable to .agent-runs/<topic>.md. Its "
-        "raw stdout is captured to a file too, but the deliverable is what you will "
-        "actually want to read.\n"
-        "- One dispatch at a time. Models sharing a provider share a quota pool, so a "
-        "second call can be why the first one dies. dispatch_opencode now refuses a "
-        "concurrent run rather than trusting this to be remembered.\n"
-        "- `Connection closed` means this connection dropped, NOT that the delegate "
-        "died - it keeps running. Reconnect and call list_runs; do not re-dispatch.\n"
-        "- The return value is not evidence in either direction. Verify with git and by "
-        "re-running the gate yourself.",
+        "- There is ONE browser on ONE profile, so genuinely one call at a time. This is "
+        "not quota etiquette like the sibling servers, it is a hard constraint: Chrome "
+        "cannot open the same user-data-dir twice. Every tool here refuses rather than "
+        "corrupting the profile.\n"
+        "- gemini_ask has a floor of roughly 20 seconds: Chrome has to launch and the "
+        "Angular app has to hydrate before a prompt can even be typed. It is not hung.\n"
+        "- mode='deep-research' is a KICK-OFF. dispatch_gemini returns once the "
+        "research plan is confirmed, in under a minute; Google then runs the "
+        "research on its own side for 10-20 minutes and writes the report into "
+        "that conversation. Bringing the report back is not implemented - say so "
+        "rather than reporting the plan as the answer.\n"
+        "- A browser run prints nothing at all between launch and the final answer, so "
+        "an empty log tail in check_run means 'still working', not 'stuck'.\n"
+        "- If anything reports 'not signed in', the fix is a human one: run "
+        "`uv run --script gemini_web.py login` in a terminal and sign in by hand. "
+        "Google rejects its own sign-in flow inside an automated browser, so no tool "
+        "here can do it for you.\n"
+        "- The return value is not evidence that work landed on disk. Verify with git.",
     ])
+
 
 
 # `version` is where MCP expects a server to advertise itself (it rides in
@@ -821,128 +849,264 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "if this connection drops."
     )
 
+# --------------------------------------------------------------------------
+# Synchronous path
+#
+# The async path above records a run and returns; these block. They exist
+# because most questions are a 30-second round trip and a run id is pure
+# overhead for those. They share the single browser with the async path, so
+# they take the same lock and honour the same refusal.
+# --------------------------------------------------------------------------
+
+_browser_lock = threading.Lock()
+
+
+def _busy_note() -> str:
+    """Non-empty when something already holds the browser."""
+    live = _live_runs(CLI_LABEL)
+    if live:
+        listing = "\n".join(
+            f"  {r['run_id']}  {int(time.time() - r['started_at'])}s  {r.get('cwd','')}"
+            for r in live)
+        return (f"Refusing: {len(live)} {CLI_LABEL} run(s) already hold the browser.\n"
+                f"{listing}\n\n"
+                "Chrome cannot open the same profile twice, so this is a hard "
+                "conflict rather than a courtesy. check_run one of the above, or "
+                "cancel_run it.")
+    return ""
+
+
+def _worker_sync(args: list, timeout: int) -> tuple:
+    """Run one worker subcommand to completion. Returns (rc, stdout, stderr)."""
+    argv = _worker_argv(*args)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL,
+                              env=_child_env())
+    except FileNotFoundError:
+        return 127, "", (f"{argv[0]} not found. Set {BIN_ENV_VAR} to a ready-made "
+                         "executable, or GEMINI_WEB_UV_BIN to the uv binary.")
+    except subprocess.TimeoutExpired:
+        return 124, "", f"no answer within {timeout}s"
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _meta_of(stdout: str) -> dict:
+    """The worker's trailing GEMINI_WEB_META line, as a dict."""
+    for line in reversed(stdout.splitlines()):
+        if line.startswith("GEMINI_WEB_META "):
+            try:
+                return json.loads(line[len("GEMINI_WEB_META "):])
+            except ValueError:
+                return {}
+    return {}
+
+
+def _strip_meta(stdout: str) -> str:
+    return "\n".join(l for l in stdout.splitlines()
+                     if not l.startswith("GEMINI_WEB_META ")).strip()
+
+
 @mcp.tool()
-def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD,
-                      wait_seconds: int = 0, force: bool = False) -> str:
+def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
+               files: str = "", timeout_seconds: int = 240) -> str:
     """
-    Delegates a coding/research task to OpenCode, running fully autonomously
-    with NO permission prompts in between.
+    Asks the Gemini WEB APP a question and BLOCKS until the answer is back.
 
-    RETURNS IMMEDIATELY with a run id - it does not block for the length of the
-    run. Follow it with check_run(run_id), stop it with cancel_run(run_id).
-    Pass wait_seconds to block up to that long for a short task and get the
-    finished result in one round trip; the run is unaffected if the wait
-    expires first, only the waiting stops.
+    This is the Gemini behind the browser, not the API: it has your chat
+    history, your Gems, and whatever you have uploaded. Pass a conversation_id
+    from an earlier answer to continue that thread instead of starting a new
+    one; the id of the thread used is reported at the end of every answer.
 
-    Runs `opencode run --auto --agent build --print-logs --dir <cwd>
-    --model <model> -- <prompt>`, with stdout and stderr redirected to files
-    under the run store. Same dangerous-mode, secrets and scope caveats as
-    dispatch_agy: it self-approves shell commands, file edits and git
-    operations under `cwd` with no mid-run checkpoint, so calling this tool IS
-    the confirmation step. For long prompts, write a plan .md into
-    `.agent-runs/` in `cwd` and point this at it.
+    EXPECT ROUGHLY 20 SECONDS MINIMUM even for a one-word reply. Chrome has to
+    launch and the app has to hydrate before the prompt can be typed. That is
+    the floor, not a fault.
 
-    `--agent build` is NOT optional whenever ~/.config/opencode/opencode.json
-    sets "default_agent": "plan", which is read-only. Without the override this
-    tool silently returns a plan and edits nothing while looking like it worked.
+    Use dispatch_gemini instead when the work is long - anything with
+    mode='deep-research' will outlast this tool's timeout and should never be
+    sent here.
 
-    `--dir` is NOT optional either: opencode ignores the subprocess working
-    directory. Verified by mutation - with only subprocess(cwd=...) set, it
-    wrote the file into the CALLER's directory while reporting success. This is
-    the opencode analogue of agy's --new-project trap.
-
-    `--print-logs` is what makes failure visible: opencode's stream errors go to
-    its own logfile, never to stdout, and it does not exit on them. Routed to
-    stderr they can be caught in seconds instead of blocking for the full hour.
-
-    MODELS - routing verdict (researched 2026-09-10). Full roster of all 34
-    ids, with per-model evidence, sourcing confidence and what is still
-    `unknown`, is in MODEL-ROSTER.md at the plugin root. Read it before
-    picking anything not named here.
-
-    Prefer opencode-go/deepseek-v4-pro and opencode-go/minimax-m3. DeepSeek V4
-    persists reasoning state across sequential tool calls, so long unattended
-    loops do not drift; MiniMax M3 has demonstrated ~24h / 1,959 tool calls
-    unattended at 100 tok/s, so timeout risk is low. Caveat: both deepseek
-    tiers are rejected without an explicit workspace opt-in, so deepseek-v4-pro
-    is not a usable default until that is set. opencode-go/qwen3.8-flash is the
-    cheap high-volume fallback; glm-5.2 (current default), kimi-k2.7-code and
-    gpt-5.6-luna are the ids verified working here by direct test.
-
-    Strictly avoid kimi-k2.6 (infinite repetition loop exhausts the context),
-    glm-5.3-flash (40-186s per call breaches wall-clock timeouts),
-    nemotron-3.5-lightning-free (drops the closing brace in tool JSON), and
-    omen-alpha (ignores the provided tools and rewrites files from scratch).
-
-    Free tier (`opencode/` rather than `opencode-go/`), for smoke tests and
-    mechanical work when quota is tight: mimo-v2.5-free is the pick - same
-    weights as paid, though it silently strips Authorization headers in
-    transport. ling-3.0-flash-fin-free, big-pickle and the muse-sparks also
-    pass a write-a-file probe. Block every muse-spark-*-contributor variant,
-    free AND paid, for proprietary code: Meta retains prompts and completions
-    for training. Both nemotron tiers FAILED here and the failures are
-    confirmed upstream bugs.
-
-    Models sharing a provider share one quota pool - when one reports a usage
-    limit its siblings are also out; qwen3.8-max and longcat-2.0 are a known
-    pair. Free models are small: keep briefs single-step and verify output,
-    since a plausible-looking return here is weaker evidence than usual.
-
-    Re-check with `opencode models` - ids go stale, and several above are
-    codenames or `preview` labels. When the roster moves, update
-    MODEL-ROSTER.md and this docstring together; MODEL-ROSTER.md's "Keeping
-    this current" section says how.
-
-    OpenCode's top models are Claude-tier, so unlike dispatch_agy, judgment-
-    shaped work - including writing the plan itself - is in scope here. Run
-    `opencode stats` before and after big dispatches for real usage numbers.
-
-    DELIVERABLE GOES IN A FILE. Brief the delegate to write its result to
-    `.agent-runs/<topic>-<model>.md` and to append one line per phase to
-    `.agent-runs/<topic>.log`. Raw stdout is now captured to a file as well, so
-    it is no longer lost when this connection drops - but it is still whatever
-    the CLI happened to print, and the .log is the progress signal worth
-    reading while the run is going.
-
-    ONE DISPATCH AT A TIME, and this is now enforced: a second concurrent
-    opencode run is refused, naming the live one, unless you pass force=True.
-    Concurrency risks a rate limit, and models sharing a provider share a quota
-    pool, so a second call can be the reason the first one dies.
-
-    RETURN VALUE IS NOT EVIDENCE, in either direction. Verify with git and the
-    gate.
+    mode: chat | deep-research | canvas | image | video
+    files: comma-separated paths to attach (they are uploaded to the account).
     """
-    # `--` stops flag parsing so a prompt that starts with `-` (e.g. "--help")
-    # is treated as the prompt, not as an opencode flag.
-    argv = [OPENCODE_BIN, "run", "--auto", "--agent", AGENT, "--print-logs",
-            "--dir", os.path.expanduser(cwd), "--model", model, "--", prompt]
-    return _dispatch(prompt, argv, cwd, model, wait_seconds, force)
+    if mode not in MODES:
+        return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
+    if mode == "deep-research":
+        return ("Error: deep-research is a kick-off, not a question - the report "
+                "lands in the conversation 10-20 minutes later, on Google's side. "
+                "Use dispatch_gemini(mode='deep-research').")
+    busy = _busy_note()
+    if busy:
+        return busy
+    if not _browser_lock.acquire(blocking=False):
+        return ("Refusing: another gemini_ask is using the browser right now. "
+                "One profile, one Chrome - wait for it to return.")
+    try:
+        args = ["ask", "--prompt", prompt,
+                "--timeout", str(max(timeout_seconds - 20, 30))]
+        if conversation_id:
+            args += ["--conversation", conversation_id]
+        if mode != "chat":
+            args += ["--mode", mode]
+        for path in [f.strip() for f in files.split(",") if f.strip()]:
+            args += ["--file", path]
+        rc, out, err = _worker_sync(args, timeout_seconds)
+    finally:
+        _browser_lock.release()
+
+    if rc != 0:
+        return (f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}"
+                + ("\n\nSign in first: run `uv run --script gemini_web.py login` "
+                   "in a terminal. Google blocks its own sign-in flow inside an "
+                   "automated browser, so this cannot be done for you."
+                   if rc == 3 else ""))
+
+    meta = _meta_of(out)
+    answer = _strip_meta(out)
+    footer = []
+    if meta.get("conversation_id"):
+        footer.append(f"conversation_id: {meta['conversation_id']}  "
+                      f"(pass it back to continue this thread)")
+    if meta.get("elapsed_seconds"):
+        footer.append(f"{meta['elapsed_seconds']}s, extracted via "
+                      f"{meta.get('extraction', '?')}")
+    return _truncate(answer) + ("\n\n---\n" + "\n".join(footer) if footer else "")
+
+
+@mcp.tool()
+def gemini_conversations(query: str = "", limit: int = 20) -> str:
+    """
+    Lists the conversations in the Gemini sidebar, newest first, as id + title.
+
+    The ids are what gemini_ask(conversation_id=...) and
+    gemini_read_conversation() take. Pass `query` to filter on title text.
+
+    This opens a browser, so it costs the same ~20s as any other call here.
+    """
+    busy = _busy_note()
+    if busy:
+        return busy
+    args = ["list", "--limit", str(max(limit, 1))]
+    if query:
+        args += ["--query", query]
+    rc, out, err = _worker_sync(args, 180)
+    if rc != 0:
+        return f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}"
+    try:
+        rows = json.loads(out)
+    except ValueError:
+        return _truncate(out)
+    if not rows:
+        return "No conversations matched." if query else "No conversations found."
+    return "\n".join(f"{r['id']}  {r['title']}" for r in rows)
+
+
+@mcp.tool()
+def gemini_read_conversation(conversation_id: str) -> str:
+    """
+    Dumps an existing Gemini conversation as markdown, every turn, oldest
+    first, without adding to it.
+
+    Use this to pick up a thread you or Gemini started earlier - including one
+    started by hand in the browser - before continuing it with
+    gemini_ask(conversation_id=...). Find ids with gemini_conversations().
+    """
+    if not conversation_id.strip():
+        return "Error: conversation_id is required. List them with gemini_conversations()."
+    busy = _busy_note()
+    if busy:
+        return busy
+    rc, out, err = _worker_sync(
+        ["read", "--conversation", conversation_id.strip()], 240)
+    if rc != 0:
+        return f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}"
+    return _truncate(_strip_meta(out)) or "(the conversation rendered empty)"
+
+
+@mcp.tool()
+def dispatch_gemini(prompt: str, conversation_id: str = "", mode: str = DEFAULT_MODEL,
+                    files: str = "", out: str = "", cwd: str = DEFAULT_CWD,
+                    wait_seconds: int = 0, force: bool = False) -> str:
+    """
+    Sends a prompt to the Gemini WEB APP and RETURNS IMMEDIATELY with a run id.
+
+    Follow it with check_run(run_id), stop it with cancel_run(run_id). Pass
+    wait_seconds to block up to that long and get the finished result in one
+    round trip; the run is unaffected if the wait expires first.
+
+    mode="deep-research" is a KICK-OFF ONLY. It sends the prompt, confirms the
+    research plan, and returns the conversation id in under a minute. Google
+    then runs the research on its own side for 10-20 minutes and writes the
+    report into that conversation. This tool does NOT bring the report back
+    yet - open the conversation in a browser to read it.
+
+    A browser run is SILENT until it finishes - no streaming, no progress on
+    stdout. An empty tail in check_run means it is still working. Judge it by
+    elapsed time, not by output.
+
+    mode: chat | deep-research | canvas | image | video
+    conversation_id: continue an existing thread instead of starting one.
+    files: comma-separated paths to attach.
+    out: write the answer here as well, relative to cwd. Use the
+         .agent-runs/<topic>.md convention so check_run reports it as an
+         artifact on every exit path.
+    """
+    if mode not in MODES:
+        return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
+
+    args = ["ask", "--prompt", prompt, "--timeout", str(WORKER_TIMEOUT)]
+    if conversation_id:
+        args += ["--conversation", conversation_id]
+    if mode != "chat":
+        args += ["--mode", mode]
+    for path in [f.strip() for f in files.split(",") if f.strip()]:
+        args += ["--file", path]
+    if out:
+        args += ["--out", out if os.path.isabs(out)
+                 else os.path.join(os.path.expanduser(cwd), out)]
+
+    return _dispatch(prompt, _worker_argv(*args), cwd, mode, wait_seconds, force)
 
 
 @mcp.tool()
 def delegation_status() -> str:
     """
     Reports what this wrapper actually is: which plugin version is running,
-    where the opencode CLI resolved to, where runs are recorded, and the
-    timeouts a dispatch will actually run under.
+    where the worker and its Chrome profile live, whether that profile is still
+    signed in, where runs are recorded, and the timeouts a dispatch will run
+    under.
 
-    Call this when a dispatch behaves in a way the docstring does not explain,
-    before concluding the tool is broken. Claude Code starts an MCP server once
-    per session and holds its code in memory, so after a plugin update this
-    reports the version still serving this session, not the one on disk.
+    Call this when a call behaves in a way the docstring does not explain,
+    before concluding the tool is broken - a silently expired Google session
+    looks like a broken tool and is not one. Checking sign-in opens a browser,
+    so this is slower than the sibling servers' status.
     """
     version = _plugin_version()
     live = _live_runs()
+    if live:
+        signed_in = "(not checked: a run holds the browser)"
+    else:
+        rc, out, err = _worker_sync(["status"], 180)
+        try:
+            info = json.loads(out)
+            signed_in = ("yes, as " + (info.get("account") or "(unknown)")
+                         if info.get("logged_in")
+                         else "NO - run `uv run --script gemini_web.py login`")
+            profile = info.get("profile", "?")
+        except ValueError:
+            signed_in = f"unknown (worker exited {rc}: {err.strip()[:120]})"
+            profile = "?"
     lines = [
         SERVER_NAME,
         f"  version:    {version or '(dev checkout: no plugin manifest)'}",
         f"  running:    {os.path.abspath(__file__)}",
-        f"  CLI:        {OPENCODE_BIN} -> {_probe([OPENCODE_BIN, '--version'])}",
-        f"  agent:      {AGENT}",
-        f"  model:      {DEFAULT_MODEL}",
+        f"  worker:     {' '.join(_worker_argv())}",
+        f"  signed in:  {signed_in}",
+        f"  modes:      {', '.join(MODES)} (default {DEFAULT_MODEL})",
         f"  cwd:        {DEFAULT_CWD}",
+        f"  worker cap: {WORKER_TIMEOUT}s (inner; must stay under the wall clock)",
         f"  wall clock: {TIMEOUT_SECONDS}s",
-        f"  idle limit: {str(IDLE_SECONDS) + 's' if IDLE_SECONDS else 'off'}",
+        f"  idle limit: {str(IDLE_SECONDS) + 's' if IDLE_SECONDS else 'off (browser runs are silent by design)'}",
         f"  fail-fast:  {len(FATAL_PATTERNS)} stderr patterns",
         f"  run store:  {RUN_DIR} ({len(_record_ids())} records, "
         f"retention {RETENTION_DAYS or 'forever'}d)",

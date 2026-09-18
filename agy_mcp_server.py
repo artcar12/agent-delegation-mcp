@@ -1012,7 +1012,7 @@ def list_runs(cwd: str = "", include_finished: bool = True, limit: int = 20) -> 
         if state == "finished" and r.get("exit_code") is not None:
             verdict = f"exit {r['exit_code']}"
         lines.append(
-            f"{mark} {r['run_id']}  {state:<8} {elapsed:>6}s  {r.get('cli',''):<8} "
+            f"{mark} {r['run_id']}  {state:<8} {elapsed:>6}s  {r.get('cli',''):<10} "
             f"{verdict:<12} {r.get('cwd','')}")
 
     live = sum(1 for r in rows if r.get("state") == "running")
