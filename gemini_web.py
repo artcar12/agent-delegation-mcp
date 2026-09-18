@@ -80,6 +80,20 @@ SELECTORS = {
     # the plan, which is the most expensive kind of wrong answer here.
     "start_research": ('deep-research-confirmation-widget '
                        'button[aria-label="Start research"]'),
+    # Where a Deep Research report actually lands. NOT the chat turn, which
+    # stays a stub forever -- see research_state().
+    "research_panel": "deep-research-immersive-panel",
+    # Live progress, e.g. "Researching 64 websites...". Once the report lands
+    # this flips to the completion timestamp, e.g. "Sep 18, 1:43 PM".
+    "research_chip": "immersive-entry-chip",
+    # The report itself. Its presence is the completion marker -- see
+    # RESEARCH_STATE_JS -- and it is also what gets extracted, because the
+    # panel around it also holds the reasoning trace and the browse chips.
+    "research_body": "#extended-response-markdown-content",
+    # The "sources used" list, which lives outside the report body. Part of
+    # the deliverable: a research report without its citations is a worse
+    # report.
+    "research_sources": "deep-research-source-lists",
     "file_input": 'input[type="file"]',
     "mode_switcher": "bard-mode-switcher",
     # Signed-out marker. Gemini serves a fully working composer to anonymous
@@ -174,7 +188,12 @@ class GeminiWebError(Exception):
 # --------------------------------------------------------------------------
 
 _SKIP_TAGS = {"script", "style", "svg", "mat-icon", "message-actions",
-              "model-response-disclaimers", "response-info-line", "button"}
+              "model-response-disclaimers", "response-info-line", "button",
+              # A Deep Research panel holds the reasoning trace and the browse
+              # chips alongside the report. They are working notes, not the
+              # deliverable, and they dwarf it.
+              "thinking-panel", "thinking-panel-skeleton-loader",
+              "browse-chip-list", "mat-progress-spinner"}
 _BLOCK_TAGS = {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5",
                "h6", "ul", "ol", "pre", "blockquote", "table", "tr", "hr"}
 
@@ -409,6 +428,144 @@ def html_to_markdown(source: str) -> str:
     parser.feed(source)
     parser.close()
     return parser.result()
+
+
+class _SubtreeCapture(HTMLParser):
+    """Collect the inner HTML of every element matching a predicate.
+
+    A Deep Research panel is ~700KB of which the report is ~35KB; the rest is
+    the reasoning trace. Slicing it out with a regex is hopeless (nested
+    <div>s), and pulling in a real HTML library would break the single-file
+    `uv run --script` contract, so this walks the tag stream and re-emits the
+    bytes between a matching open tag and its own close tag.
+    """
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self, match):
+        super().__init__(convert_charrefs=False)
+        self._match = match
+        self._depth = 0          # nesting depth inside the captured element
+        self._tag = ""           # the tag we are capturing, to match its close
+        self._buf = []
+        self.found = []
+
+    def handle_starttag(self, tag, attrs):
+        raw = self.get_starttag_text() or ""
+        if self._depth:
+            if tag == self._tag and tag not in self.VOID:
+                self._depth += 1
+            self._buf.append(raw)
+        elif self._match(tag, dict(attrs)):
+            self._tag, self._depth, self._buf = tag, 1, []
+
+    def handle_startendtag(self, tag, attrs):
+        if self._depth:
+            self._buf.append(self.get_starttag_text() or "")
+
+    def handle_endtag(self, tag):
+        if not self._depth:
+            return
+        if tag == self._tag:
+            self._depth -= 1
+            if not self._depth:
+                self.found.append("".join(self._buf))
+                self._tag, self._buf = "", []
+                return
+        self._buf.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._depth:
+            self._buf.append(data)
+
+    def handle_entityref(self, name):
+        if self._depth:
+            self._buf.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._depth:
+            self._buf.append(f"&#{name};")
+
+
+def _first_subtree(source: str, match) -> str:
+    parser = _SubtreeCapture(match)
+    parser.feed(source)
+    parser.close()
+    return parser.found[0] if parser.found else ""
+
+
+def research_html_to_markdown(panel_html: str) -> str:
+    """Panel HTML -> the report, and only the report.
+
+    Falls back to the whole panel if the body element is missing, so a Google
+    rename degrades to a noisy report rather than an empty one.
+    """
+    body_id = SELECTORS["research_body"].lstrip("#")
+    body = _first_subtree(panel_html, lambda t, a: a.get("id") == body_id)
+    report = html_to_markdown(body or panel_html)
+    if not body:
+        return report
+
+    sources = _first_subtree(
+        panel_html, lambda t, a: t == SELECTORS["research_sources"])
+    cited = _sources_markdown(sources) if sources else ""
+    if cited:
+        report = f"{report.rstrip()}\n\n## Sources\n\n{cited}"
+    return report
+
+
+class _SourceListExtractor(HTMLParser):
+    """The cited-sources list as `- [Title](url) -- domain`.
+
+    Worth its own parser rather than the generic walk: each source is a link
+    wrapping two block <div>s (domain, title), and the generic walk flattens
+    everything inside an <a> into the link text, producing "[vite.devVite 8.1
+    is out!](...)".
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._href = ""
+        self._field = ""
+        self._parts = {}
+        self.items = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "a" and a.get("href", "").startswith("http"):
+            self._href, self._parts = a["href"], {}
+        elif self._href:
+            self._field = {"domain-name": "domain",
+                           "sub-title": "title"}.get(a.get("data-test-id", ""), "")
+
+    def handle_data(self, data):
+        if self._href and self._field and data.strip():
+            self._parts[self._field] = (
+                self._parts.get(self._field, "") + data.strip())
+
+    def handle_endtag(self, tag):
+        if tag == "div":
+            self._field = ""
+        elif tag == "a" and self._href:
+            title = self._parts.get("title") or self._parts.get("domain", "")
+            if title:
+                self.items.append((title, self._href,
+                                   self._parts.get("domain", "")))
+            self._href, self._parts = "", {}
+
+
+def _sources_markdown(sources_html: str) -> str:
+    parser = _SourceListExtractor()
+    parser.feed(sources_html)
+    parser.close()
+    seen, lines = set(), []
+    for title, href, domain in parser.items:
+        if href in seen:
+            continue
+        seen.add(href)
+        lines.append(f"- [{title}]({href})" + (f" -- {domain}" if domain else ""))
+    return "\n".join(lines)
 
 
 def parse_meta_line(stdout: str) -> dict:
@@ -736,6 +893,113 @@ class Session:
         self.page.wait_for_timeout(3_000)   # let the hand-off register
         return True
 
+    # -- deep research ----------------------------------------------------
+    #
+    # This mode does not finish the way the others do. The chat turn is a
+    # permanent stub, so nothing about it ever says "done"; the report is
+    # written into a separate immersive panel minutes to an hour later, and
+    # Google does the work server-side whether or not a browser is watching.
+    # State therefore has to be read off the panel, not the conversation.
+
+    # The marker below was established by sampling two conversations side by
+    # side -- one whose chat turn read "I'm on it. I'll let you know when your
+    # research is done", one whose read "I've completed your research" -- and
+    # keeping only the differences:
+    #
+    #                                   running        complete
+    #   #extended-response-markdown...  absent         present, aria-busy=false
+    #   mat-progress-spinner            1              0
+    #   toc-menu                        0              1
+    #   thinking-panel-skeleton-loader  1              1   <- NOT a signal
+    #
+    # The skeleton loader is the trap. It is still mounted, visible and 200px
+    # tall on a finished report, so the obvious "is anything still loading?"
+    # check reports every completed report as running, forever. The report
+    # body's own presence is the honest marker: no report element, no report.
+    RESEARCH_STATE_JS = """(sel) => {
+        const p = document.querySelector(sel.panel);
+        if (!p) return {state: 'absent'};
+        const chip = document.querySelector(sel.chip);
+        const body = p.querySelector(sel.body);
+        const busy = !body
+                     || body.getAttribute('aria-busy') === 'true'
+                     || !!p.querySelector('mat-progress-spinner');
+        return {
+            state: busy ? 'running' : 'complete',
+            progress: chip ? (chip.innerText || '').trim() : '',
+            chars: (body || p).innerText.length,
+        };
+    }"""
+
+    # The panel mounts several seconds AFTER the chat turns it sits beside, so
+    # reading state the instant open() returns calls a running report 'absent'.
+    # Measured at ~4.7s on a warm profile; 15s leaves room and only costs that
+    # long in the genuinely-absent case.
+    PANEL_GRACE_MS = 15_000
+
+    def research_state(self) -> dict:
+        """{'state': 'absent'|'running'|'complete', 'progress', 'chars'}.
+
+        'absent' means this conversation has no research panel at all -- either
+        it is an ordinary chat, or the kick-off never took (a conversation
+        wedged at "Starting research..." with the browser closed mid-hand-off
+        looks like this).
+        """
+        try:
+            self.page.wait_for_selector(SELECTORS["research_panel"],
+                                        timeout=self.PANEL_GRACE_MS)
+        except Exception:
+            pass  # genuinely absent, or slower than the grace -- JS decides
+        return self.page.evaluate(
+            self.RESEARCH_STATE_JS,
+            {"panel": SELECTORS["research_panel"], "chip": SELECTORS["research_chip"],
+             "body": SELECTORS["research_body"]},
+        )
+
+    def research_report(self) -> tuple[str, str]:
+        """The finished report as (markdown, how). Call only when complete.
+
+        The clipboard route is preferred as everywhere else, but the panel has
+        no copy button of its own in any state observed so far, so the HTML
+        pass is the one that normally runs.
+
+        Extraction is scoped to the report body rather than the panel: the
+        panel also holds the reasoning trace, 26 thought items and a browse
+        chip per site visited. _SKIP_TAGS would drop most of that anyway, but
+        scoping is the cheaper and more honest cut -- on the report measured
+        here it is 32k of report against 692k of panel.
+        """
+        panel = self.page.locator(SELECTORS["research_panel"]).first
+        try:
+            self.page.bring_to_front()
+            copy = panel.locator(SELECTORS["copy_button"]).first
+            if copy.count():
+                copy.click(timeout=5_000)
+                self.page.wait_for_timeout(300)
+                text = self.page.evaluate("navigator.clipboard.readText()")
+                if text and text.strip():
+                    return text.strip(), "clipboard"
+        except Exception:
+            pass
+        return research_html_to_markdown(panel.inner_html()), "dom"
+
+    def await_research(self, wait_s: float, poll_s: float = 60.0,
+                       on_progress=None) -> dict:
+        """Poll until the report is done, or until the budget runs out.
+
+        Returns the last state either way: "not ready yet" is an answer, not a
+        failure, and must not be reported as one -- the research is still
+        running on Google's side regardless of what this process does.
+        """
+        deadline = time.monotonic() + max(wait_s, 0)
+        while True:
+            state = self.research_state()
+            if on_progress:
+                on_progress(state)
+            if state["state"] != "running" or time.monotonic() >= deadline:
+                return state
+            self.page.wait_for_timeout(int(min(poll_s, 300) * 1000))
+
     # -- extraction -------------------------------------------------------
     def last_response(self) -> tuple[str, str]:
         """Returns (markdown, how) where how is 'clipboard' or 'dom'."""
@@ -937,6 +1201,52 @@ def cmd_ask(args) -> int:
     return EXIT_OK
 
 
+def cmd_research(args) -> int:
+    """Harvest a Deep Research report, or report how far along it is.
+
+    Exits 0 for both "here is the report" and "still running": the research is
+    proceeding on Google's side either way, and a caller that treats not-ready
+    as a failure will re-dispatch work that is already in flight. The status is
+    in the meta line, not the exit code.
+    """
+    started = time.monotonic()
+    with Session() as s:
+        s.open(args.conversation, expect_history=True)
+        state = (s.await_research(args.wait, args.poll)
+                 if args.wait else s.research_state())
+        report, how = ("", "")
+        if state["state"] == "complete":
+            report, how = s.research_report()
+        cid = conversation_id_from_url(s.page.url)
+
+    if state["state"] == "absent":
+        print(f"No Deep Research in conversation {cid}. Either it is an "
+              "ordinary chat, or the research was never started in it.",
+              file=sys.stderr)
+        _emit_meta(conversation_id=cid, status="absent")
+        return EXIT_OK
+
+    if state["state"] == "running":
+        print(state.get("progress") or "Research is still running.")
+        print(f"\nStill running after {int(time.monotonic() - started)}s of "
+              "waiting here; it continues on Google's side whether or not "
+              "anything is watching. Call again later.")
+        _emit_meta(conversation_id=cid, status="running",
+                   progress=state.get("progress", ""), chars=state.get("chars", 0))
+        return EXIT_OK
+
+    sys.stdout.write(report.rstrip() + "\n")
+    if args.out:
+        path = os.path.expanduser(args.out)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(report.rstrip() + "\n")
+    _emit_meta(conversation_id=cid, status="complete", extraction=how,
+               chars=len(report), out=args.out or "",
+               elapsed_seconds=round(time.monotonic() - started, 1))
+    return EXIT_OK
+
+
 def cmd_read(args) -> int:
     with Session() as s:
         s.open(args.conversation, expect_history=True)
@@ -983,6 +1293,16 @@ def build_parser() -> argparse.ArgumentParser:
     ak.add_argument("--out", default="", help="also write the markdown here")
     ak.add_argument("--timeout", type=float, default=300.0)
     ak.set_defaults(func=cmd_ask)
+
+    rs = sub.add_parser("research",
+                        help="harvest a Deep Research report, or report progress")
+    rs.add_argument("--conversation", required=True)
+    rs.add_argument("--wait", type=float, default=0.0,
+                    help="poll this many seconds for the report before giving up")
+    rs.add_argument("--poll", type=float, default=60.0,
+                    help="seconds between polls while waiting")
+    rs.add_argument("--out", default="", help="also write the report here")
+    rs.set_defaults(func=cmd_research)
 
     rd = sub.add_parser("read", help="dump a conversation as markdown")
     rd.add_argument("--conversation", required=True)

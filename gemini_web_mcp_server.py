@@ -689,11 +689,13 @@ def _instructions() -> str:
         "corrupting the profile.\n"
         "- gemini_ask has a floor of roughly 20 seconds: Chrome has to launch and the "
         "Angular app has to hydrate before a prompt can even be typed. It is not hung.\n"
-        "- mode='deep-research' is a KICK-OFF. dispatch_gemini returns once the "
-        "research plan is confirmed, in under a minute; Google then runs the "
-        "research on its own side for 10-20 minutes and writes the report into "
-        "that conversation. Bringing the report back is not implemented - say so "
-        "rather than reporting the plan as the answer.\n"
+        "- mode='deep-research' is a KICK-OFF, and its two halves are separate "
+        "tools. dispatch_gemini returns once the plan is confirmed, in under a "
+        "minute, with a conversation id; Google then researches on its own side "
+        "for a long time - observed well past 20 minutes - and writes the report "
+        "into that conversation. Collect it with gemini_research(<id>), or wait "
+        "in the background with dispatch_research(<id>). A 'still running' answer "
+        "is normal: call again later, never re-dispatch, or you pay for two.\n"
         "- A browser run prints nothing at all between launch and the final answer, so "
         "an empty log tail in check_run means 'still working', not 'stuck'.\n"
         "- If anything reports 'not signed in', the fix is a human one: run "
@@ -1024,6 +1026,82 @@ def gemini_read_conversation(conversation_id: str) -> str:
 
 
 @mcp.tool()
+def gemini_research(conversation_id: str, wait_seconds: int = 0) -> str:
+    """
+    Fetches a finished Deep Research report by conversation id, or reports how
+    far along it is.
+
+    This is the other half of dispatch_gemini(mode="deep-research"), which only
+    starts the research. Google then works on it server-side for a long time -
+    about 40 minutes on a measured run - and writes the report into the
+    conversation. Call this with the id that dispatch returned.
+
+    "Still running" is a normal answer, not a failure. Do NOT re-dispatch on
+    it: the research is already in flight and starting another costs a second
+    one for nothing. Just call again later.
+
+    wait_seconds blocks here, holding the one browser, so keep it small. To
+    wait properly, use dispatch_research, which records the wait as a run and
+    leaves this server free.
+    """
+    if not conversation_id.strip():
+        return ("Error: conversation_id is required - it is the id "
+                "dispatch_gemini(mode='deep-research') returned.")
+    busy = _busy_note()
+    if busy:
+        return busy
+    args = ["research", "--conversation", conversation_id.strip()]
+    if wait_seconds > 0:
+        args += ["--wait", str(wait_seconds)]
+    rc, out, err = _worker_sync(args, max(wait_seconds, 0) + 240)
+    if rc != 0:
+        return f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}"
+
+    meta = _meta_of(out)
+    body = _strip_meta(out)
+    status = meta.get("status", "?")
+    if status == "complete":
+        return _truncate(body) + f"\n\n---\nreport complete, {meta.get('chars', 0)} chars"
+    if status == "running":
+        return (f"Still running.\n\n{body}\n\nCall gemini_research"
+                f"('{conversation_id.strip()}') again later. Do not re-dispatch.")
+    return (f"No Deep Research found in conversation {conversation_id.strip()}.\n"
+            f"{_truncate(err.strip() or body)}")
+
+
+@mcp.tool()
+def dispatch_research(conversation_id: str, wait_seconds: int = 3000,
+                      out: str = "", cwd: str = DEFAULT_CWD,
+                      force: bool = False) -> str:
+    """
+    Waits for a Deep Research report in the background and RETURNS IMMEDIATELY
+    with a run id.
+
+    The recommended way to collect a report: dispatch_gemini(mode=
+    "deep-research") to start it, then this to pick it up. The wait is recorded
+    as an ordinary run, so it survives this server, and check_run reports it
+    like any other.
+
+    Note this DOES hold the browser for the whole wait - one profile, one
+    Chrome - so nothing else here can run until it returns. Size wait_seconds
+    to the job rather than leaving it maximal.
+
+    out: write the report here as well, relative to cwd. Use the
+         .agent-runs/<topic>.md convention.
+    """
+    if not conversation_id.strip():
+        return ("Error: conversation_id is required - it is the id "
+                "dispatch_gemini(mode='deep-research') returned.")
+    args = ["research", "--conversation", conversation_id.strip(),
+            "--wait", str(max(wait_seconds, 60))]
+    if out:
+        args += ["--out", out if os.path.isabs(out)
+                 else os.path.join(os.path.expanduser(cwd), out)]
+    return _dispatch(f"harvest deep research {conversation_id.strip()}",
+                     _worker_argv(*args), cwd, "deep-research-harvest", 0, force)
+
+
+@mcp.tool()
 def dispatch_gemini(prompt: str, conversation_id: str = "", mode: str = DEFAULT_MODEL,
                     files: str = "", out: str = "", cwd: str = DEFAULT_CWD,
                     wait_seconds: int = 0, force: bool = False) -> str:
@@ -1036,9 +1114,9 @@ def dispatch_gemini(prompt: str, conversation_id: str = "", mode: str = DEFAULT_
 
     mode="deep-research" is a KICK-OFF ONLY. It sends the prompt, confirms the
     research plan, and returns the conversation id in under a minute. Google
-    then runs the research on its own side for 10-20 minutes and writes the
-    report into that conversation. This tool does NOT bring the report back
-    yet - open the conversation in a browser to read it.
+    then runs the research on its own side - 40 minutes on a measured run - and
+    writes the report into that conversation. Collect it with gemini_research(<that id>),
+    or wait for it in the background with dispatch_research(<that id>).
 
     A browser run is SILENT until it finishes - no streaming, no progress on
     stdout. An empty tail in check_run means it is still working. Judge it by
