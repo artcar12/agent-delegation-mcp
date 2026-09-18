@@ -991,6 +991,18 @@ claude mcp add opencode-wrapper -s user \
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
 
+### 1.2.1 (2026-09-18)
+
+Text only, but it is text a connecting agent acts on, and the plugin cache is
+keyed by version — 1.2.0 could not pick it up without this bump.
+
+The `gemini-web-wrapper` MCP instructions now tell a session two things before
+its first call: that this searches the live web better than its own built-in
+tools, and that its quota is a **separate** pool from the `agy`/`gemini` CLI's,
+large enough that calls should not be rationed. Agents ration tool calls by
+default — bundling questions, skipping verification passes — and here that only
+makes the answers worse.
+
 ### 1.2.0 (2026-09-18)
 
 **New: a third server, `gemini-web-wrapper`.** `agy` and `opencode` reach Gemini
