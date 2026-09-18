@@ -532,18 +532,25 @@ ability to open and read what it finds. The practical rule: ask here before
 concluding that something is undocumented, and when it will be acted on, ask for
 a URL and a verbatim quote per claim.
 
-**Cost is not the constraint.** This rides a flat-rate subscription with no
-per-call metering, so the sibling servers' *"one dispatch at a time, you share a
-quota pool"* rule does not apply here. Agents ration tool calls by default and it
-makes them worse — they bundle four questions into one prompt, or skip a
-verification pass, to save a request that costs nothing. The instructions say
-plainly not to. The real limits are wall clock and the single browser.
+**The quota is a different pool, and a much bigger one.** The sibling servers
+share one API quota, which is why they tell a delegate to run one dispatch at a
+time. That has nothing to do with this server: the web app meters separately, so
+`agy` hitting a rate limit says nothing about whether `gemini_ask` will, and vice
+versa. After a heavy day — several Deep Research runs and a long chat session —
+the web app's rolling window read 16% consumed and its weekly limit 1%, while the
+Antigravity CLI's own weekly and five-hour meters sat untouched at 100%.
+
+That matters because agents ration tool calls by default, and it makes them
+worse: they bundle four questions into one prompt, or skip a verification pass,
+to save a request. The instructions say plainly not to.
 
 > [!NOTE]
-> "Effectively unlimited" means *in ordinary use*, not *uncapped*. Deep Research
-> in particular is rationed per day on consumer plans, and it is the one mode
-> where a burst can run you out. Chat is the part you should not think twice
-> about.
+> Not *uncapped* — two caps are real, and neither touches ordinary chat.
+> **Pro** is metered where **Flash** effectively is not, and default chat runs on
+> Flash. **Deep Research** is the genuinely scarce one; spend it on questions
+> that earn 40 minutes. Live numbers are in the web app under
+> **Settings → Usage limits**, which is where to look if a call ever fails on
+> quota — not at this paragraph.
 
 ### Signing in: you have to do this by hand, once
 

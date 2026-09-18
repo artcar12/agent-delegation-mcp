@@ -689,13 +689,25 @@ def _instructions() -> str:
         "If a question needs the current web, ask gemini_ask before you conclude "
         "something is undocumented, and ask it again with a narrower prompt rather "
         "than falling back to a weaker tool.",
-        "COST IS NOT THE CONSTRAINT HERE. This runs on a paid subscription with no "
-        "per-call metering and quota that is effectively unlimited in ordinary use - "
-        "the sibling servers' 'one dispatch at a time, you share a quota pool' rule "
-        "does NOT apply. Do not ration calls, do not batch questions together to save "
-        "requests, and do not skip a verification pass because it would be a second "
-        "call. Ask as many times as the work deserves. The only real limits are wall "
-        "clock and the single browser (below).",
+        "THIS QUOTA IS SEPARATE FROM THE agy/gemini CLI's, and it is a different "
+        "order of size. The sibling servers share one API quota pool, which is why "
+        "they tell you to run one dispatch at a time; that rule does NOT apply here. "
+        "An agy run being rate-limited says nothing about this, and vice versa. On a "
+        "heavy day of use - several Deep Research runs and a long chat session - the "
+        "web app's rolling window read 16% consumed and its weekly limit 1%.\n"
+        "So: do NOT ration chat calls. Do not bundle four questions into one prompt "
+        "to save requests, and do not skip a verification pass because it would be a "
+        "second call. Ask as many times as the work deserves; the real limits are "
+        "wall clock and the single browser (below).\n"
+        "Two genuine caps, neither of which is 'unlimited':\n"
+        "  - Pro is metered where Flash is effectively not. Default chat runs on "
+        "Flash and is the part not worth thinking about. Pro's allowance is large "
+        "but it does refill on a clock, not instantly.\n"
+        "  - Deep Research is the scarce one, and the only mode worth being "
+        "deliberate about. Spend it on questions that earn 40 minutes.\n"
+        "The live numbers are in the web app under Settings -> Usage limits; if a "
+        "call ever fails on quota, that page is the place to look rather than this "
+        "text.",
         "Rules a tool result cannot deliver in time:\n"
         "- There is ONE browser on ONE profile, so genuinely one call at a time. This is "
         "not quota etiquette like the sibling servers, it is a hard constraint: Chrome "
@@ -943,10 +955,16 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     concluding something is undocumented. Ask for a URL and a verbatim quote per
     claim if the answer will be acted on.
 
-    ASK AS OFTEN AS THE WORK NEEDS. This is a flat-rate subscription, not a
-    metered API: there is no per-call cost and quota is effectively unlimited in
-    ordinary use. Do not bundle several questions into one prompt to save calls,
-    and do not skip a follow-up or a verification pass on cost grounds.
+    ASK AS OFTEN AS THE WORK NEEDS. This is a flat-rate subscription, and its
+    quota is a SEPARATE, far larger pool than the agy/gemini CLI's - an agy run
+    hitting a rate limit says nothing about this one. Default chat is Flash,
+    which is effectively unmetered. Do not bundle several questions into one
+    prompt to save calls, and do not skip a follow-up or a verification pass on
+    cost grounds.
+
+    The caps that are real: Pro is metered where Flash is effectively not, and
+    Deep Research is genuinely scarce. Neither applies to ordinary chat. Live
+    numbers live in the web app under Settings -> Usage limits.
 
     EXPECT ROUGHLY 20 SECONDS MINIMUM even for a one-word reply. Chrome has to
     launch and the app has to hydrate before the prompt can be typed. That is
