@@ -7,8 +7,8 @@
   "plugins": [
     {
       "name": "agent-delegation",
-      "description": "Delegates long-running coding and research tasks to the OpenCode and Antigravity (agy) CLIs, and to the Gemini web app, as unattended MCP subagents. Dispatch returns a run id immediately and records the run on disk, so a delegate stays reachable - checkable, tailable, cancellable - across dropped connections, session ends and server restarts. Fails fast on provider quota walls instead of blocking for the full hour, kills hung delegates on an idle timer, and reports whatever the delegate wrote to .agent-runs/ on every exit path. The Gemini wrapper drives a dedicated Chrome profile to reach Deep Research, Canvas, Gems and conversation history, which no Gemini API exposes.",
-      "version": "1.2.2",
+      "description": "Delegates long-running coding and research tasks to the OpenCode and Antigravity (agy) CLIs, and to the Gemini web app, as unattended MCP subagents. Dispatch returns a run id immediately and records the run on disk, so a delegate stays reachable - checkable, tailable, cancellable - across dropped connections, session ends and server restarts. Fails fast on provider quota walls instead of blocking for the full hour, kills hung delegates on an idle timer, and reports whatever the delegate wrote to .agent-runs/ on every exit path. The Gemini wrapper drives a dedicated Chrome profile to reach live Google search, Canvas, Gems and conversation history, which no Gemini API exposes.",
+      "version": "1.3.0",
       "source": "./",
       "author": {
         "name": "Arthur Carroll"

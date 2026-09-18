@@ -7,8 +7,8 @@
 gemini-web-wrapper: exposes the Gemini *web app* to MCP clients as a local
 stdio server.
 
-The sibling servers reach Gemini through an API that has no Deep Research, no
-Canvas, no Gems, no conversation history and no attachments. Those live only in
+The sibling servers reach Gemini through an API that has no Canvas, no Gems,
+no conversation history and no attachments. Those live only in
 the logged-in web app. gemini_web.py drives it with Playwright; this file wraps
 that worker exactly the way agy_mcp_server.py wraps `agy`, so a browser run is
 recorded on disk and stays checkable, tailable and cancellable across dropped
@@ -103,21 +103,22 @@ DEFAULT_CWD = _env("AGENT_MCP_DEFAULT_CWD", os.getcwd())
 # sent to. This rides in the run record's `model` field so list_runs shows
 # something worth reading.
 DEFAULT_MODEL = _env("GEMINI_WEB_MCP_MODE", "chat")
-MODES = ("chat", "deep-research", "canvas", "image", "video")
+MODES = ("chat", "canvas", "image", "video")
 
 # MUST stay below TIMEOUT_SECONDS: the worker's own deadline is the one that
 # should hit, because it exits cleanly with whatever the page had rendered
 # instead of being killed with nothing to show.
 WORKER_TIMEOUT = _int_env("GEMINI_WEB_MCP_WORKER_TIMEOUT", 1500)
 
-# Outer cap. Deep Research genuinely runs for 10-20 minutes.
+# Outer cap. Generous because Canvas and image/video generation can
+# take minutes, and a cold Chrome launch is ~20s before anything starts.
 TIMEOUT_SECONDS = _int_env("GEMINI_WEB_MCP_TIMEOUT", 1800)
 
 # Off by default, and unlike the other two servers this is not a tuning
 # preference but close to a correctness requirement: a browser run prints
-# NOTHING between launch and the final answer. Every healthy Deep Research run
-# looks idle for its entire duration. Only set this if you have added progress
-# logging to the worker.
+# NOTHING between launch and the final answer, so every healthy run looks idle
+# for its entire duration. Only set this if you have added progress logging
+# to the worker.
 IDLE_SECONDS = _int_env("GEMINI_WEB_MCP_IDLE_TIMEOUT", 0, allow_zero=True)
 
 # Caps what a tool RETURNS, not what the worker writes: output goes straight to
@@ -677,7 +678,8 @@ def _instructions() -> str:
     version = _plugin_version()
     return "\n\n".join([
         f"gemini-web-wrapper {version or '(dev checkout)'} - drives the Gemini "
-        f"WEB APP (Deep Research, Canvas, conversation history, attachments) "
+        f"WEB APP (live Google search, Canvas, conversation history, "
+        f"attachments) "
         f"through a real Chrome. Not the Gemini API.",
         "gemini_ask blocks and returns the answer. dispatch_gemini returns a run id "
         "immediately; follow it with check_run, stop it with cancel_run, and find runs "
@@ -689,25 +691,23 @@ def _instructions() -> str:
         "If a question needs the current web, ask gemini_ask before you conclude "
         "something is undocumented, and ask it again with a narrower prompt rather "
         "than falling back to a weaker tool.",
-        "RESERVE DEEP RESEARCH FOR THE MOST TAXING PROBLEMS YOU ARE GIVEN, and "
-        "expect that to be very few of them. You can write a prompt of any length "
-        "and ask as many follow-ups as you like, which covers most of what Deep "
-        "Research would give you, in half a minute instead of forty. A thorough "
+        "THERE IS NO DEEP RESEARCH TOOL HERE, AND YOU DO NOT NEED ONE. It was "
+        "built, tested and removed in 1.3.0: two of three kick-offs wedged silently "
+        "for hours with no error, and a wedged run never recovers. Known-brittle "
+        "machinery is worse than none, because it invites a plan that depends on "
+        "it.\n"
+        "What replaces it is not a workaround, it is the better tool for nearly "
+        "everything: ONE long, specific gemini_ask, then follow-ups into the same "
+        "conversation_id to push on whatever came back thin. There is no prompt "
+        "length worth worrying about and follow-ups are free. A thorough "
         "comparison, a survey of the options, 'what changed in X since Y', 'give me "
-        "a URL per claim' - all of these land BETTER as one long, specific "
-        "gemini_ask on Flash, then follow-ups into the same conversation_id to push "
-        "on whatever came back thin. That is not a fallback, it is the better tool "
-        "for nearly everything. If you are reaching for deep-research because your "
-        "prompt felt too big for one call, that is the wrong reason: make the "
-        "prompt bigger instead.",
-        "Deep Research is also the least reliable thing here, so do not build a plan "
-        "that depends on it. Of three kick-offs observed, one produced a report in "
-        "about 40 minutes and two wedged - panel frozen at the same size and thought "
-        "count for over an hour, no error shown, still claiming to be researching. "
-        "Cause unknown. gemini_research reports that honestly rather than inventing "
-        "a report, but a wedged run never finishes: if one has not moved in an hour, "
-        "abandon it and ask the question as a long gemini_ask instead. Do not "
-        "re-dispatch it hoping for better.",
+        "a URL per claim' - all of these land better this way, in half a minute "
+        "rather than forty. A head-to-head on exactly this proved it: the long "
+        "prompt answered in 37 seconds and the Deep Research run never finished.\n"
+        "If a job truly does need Deep Research - dozens of sources read end to "
+        "end, a written report as the deliverable - ASK THE USER to run it in the "
+        "browser and hand you the conversation id. You can then read the finished "
+        "thread with gemini_read_conversation. Do not try to drive it yourself.",
         "One caveat on prompting: demanding a verbatim quote for every claim can make "
         "the model announce it cannot browse and then answer from memory anyway. "
         "Asking for a URL per claim is safe; asking for quotes is where it gets "
@@ -718,15 +718,15 @@ def _instructions() -> str:
         "they tell you to dispatch one at a time, and that rule does NOT apply to "
         "this server. An agy run being rate-limited says nothing about this one. "
         "The web app's allowance is large enough that ordinary use does not "
-        "approach it: after a heavy day, several Deep Research runs plus a long "
-        "chat session, its rolling window read 16% consumed and its weekly 1%.\n"
+        "approach it: after a heavy day of use its rolling window read 16% "
+        "consumed and its weekly limit 1%.\n"
         "So ask as many times as the work deserves. Do not bundle four questions "
         "into one prompt to save requests, do not skip a follow-up, and do not "
         "skip a verification pass because it would be a second call. The real "
         "limits are wall clock and the single browser (below), not quota.\n"
-        "There is exactly ONE way to run out, and you have to go looking for it: "
-        "several Deep Research runs on Pro High inside the same five-hour window. "
-        "Nothing else you can do here will get close. If a call ever does fail on "
+        "Running out through this server is not really achievable - the one way "
+        "to do it is several Deep Research runs on Pro High inside a five-hour "
+        "window, and this server cannot start those. If a call ever does fail on "
         "quota, the live numbers are in the web app under Settings -> Usage "
         "limits - look there rather than trusting this text.",
         "Rules a tool result cannot deliver in time:\n"
@@ -736,15 +736,6 @@ def _instructions() -> str:
         "corrupting the profile.\n"
         "- gemini_ask has a floor of roughly 20 seconds: Chrome has to launch and the "
         "Angular app has to hydrate before a prompt can even be typed. It is not hung.\n"
-        "- mode='deep-research' is a KICK-OFF, and its two halves are separate "
-        "tools. dispatch_gemini returns once the plan is confirmed, in under a "
-        "minute, with a conversation id; Google then researches on its own side "
-        "for a long time - about 40 minutes on a measured run - and writes the "
-        "report into that conversation. Collect it with gemini_research(<id>), or "
-        "wait in the background with dispatch_research(<id>). A 'still running' "
-        "answer is normal: call again later, never re-dispatch. This is the one "
-        "mode worth not wasting - deep research is rationed per day where chat is "
-        "not, and a second kick-off does not make the first one finish sooner.\n"
         "- A browser run prints nothing at all between launch and the final answer, so "
         "an empty log tail in check_run means 'still working', not 'stuck'.\n"
         "- If anything reports 'not signed in', the fix is a human one: run "
@@ -981,34 +972,28 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     a rate limit says nothing about this one - and nothing you can do through
     this tool will approach it. Do not bundle several questions into one prompt
     to save calls, and do not skip a follow-up or a verification pass on cost
-    grounds. The only way to run out is several Deep Research runs on Pro High in
-    one five-hour window, which is not this tool.
+    grounds. Running out through this tool is not realistically achievable.
 
     EXPECT ROUGHLY 20 SECONDS MINIMUM even for a one-word reply. Chrome has to
     launch and the app has to hydrate before the prompt can be typed. That is
     the floor, not a fault.
 
-    WRITE A LONG PROMPT HERE RATHER THAN REACHING FOR DEEP RESEARCH. There is no
+    WRITE ONE LONG PROMPT HERE RATHER THAN SPLITTING THE QUESTION UP. There is no
     length limit worth worrying about, and a follow-up into the same
-    conversation_id is nearly free, so a detailed multi-part question plus a
-    couple of follow-ups covers most of what Deep Research would give you - in
-    half a minute rather than forty. deep-research is for when dozens of sources
-    genuinely have to be read end to end and a written report is the deliverable.
+    conversation_id is nearly free. A detailed multi-part question plus a couple
+    of follow-ups is the strongest thing this server does - it is what replaced
+    the Deep Research tool, and it beat it head to head: 37 seconds against a run
+    that never finished. If a job genuinely needs Deep Research, ask the USER to
+    run it in the browser and hand you the conversation id.
 
-    Use dispatch_gemini instead when the work is long - anything with
-    mode='deep-research' will outlast this tool's timeout and should never be
-    sent here.
+    Use dispatch_gemini instead when the work is long enough to outlast this
+    tool's timeout.
 
-    mode: chat | deep-research | canvas | image | video
+    mode: chat | canvas | image | video
     files: comma-separated paths to attach (they are uploaded to the account).
     """
     if mode not in MODES:
         return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
-    if mode == "deep-research":
-        return ("Error: deep-research is a kick-off, not a question - the report "
-                "lands in the conversation much later, on Google's side (about 40 "
-                "minutes on a measured run). Use dispatch_gemini("
-                "mode='deep-research'), then gemini_research(<id>).")
     busy = _busy_note()
     if busy:
         return busy
@@ -1098,82 +1083,6 @@ def gemini_read_conversation(conversation_id: str) -> str:
 
 
 @mcp.tool()
-def gemini_research(conversation_id: str, wait_seconds: int = 0) -> str:
-    """
-    Fetches a finished Deep Research report by conversation id, or reports how
-    far along it is.
-
-    This is the other half of dispatch_gemini(mode="deep-research"), which only
-    starts the research. Google then works on it server-side for a long time -
-    about 40 minutes on a measured run - and writes the report into the
-    conversation. Call this with the id that dispatch returned.
-
-    "Still running" is a normal answer, not a failure. Do NOT re-dispatch on
-    it: the research is already in flight and starting another costs a second
-    one for nothing. Just call again later.
-
-    wait_seconds blocks here, holding the one browser, so keep it small. To
-    wait properly, use dispatch_research, which records the wait as a run and
-    leaves this server free.
-    """
-    if not conversation_id.strip():
-        return ("Error: conversation_id is required - it is the id "
-                "dispatch_gemini(mode='deep-research') returned.")
-    busy = _busy_note()
-    if busy:
-        return busy
-    args = ["research", "--conversation", conversation_id.strip()]
-    if wait_seconds > 0:
-        args += ["--wait", str(wait_seconds)]
-    rc, out, err = _worker_sync(args, max(wait_seconds, 0) + 240)
-    if rc != 0:
-        return f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}"
-
-    meta = _meta_of(out)
-    body = _strip_meta(out)
-    status = meta.get("status", "?")
-    if status == "complete":
-        return _truncate(body) + f"\n\n---\nreport complete, {meta.get('chars', 0)} chars"
-    if status == "running":
-        return (f"Still running.\n\n{body}\n\nCall gemini_research"
-                f"('{conversation_id.strip()}') again later. Do not re-dispatch.")
-    return (f"No Deep Research found in conversation {conversation_id.strip()}.\n"
-            f"{_truncate(err.strip() or body)}")
-
-
-@mcp.tool()
-def dispatch_research(conversation_id: str, wait_seconds: int = 3000,
-                      out: str = "", cwd: str = DEFAULT_CWD,
-                      force: bool = False) -> str:
-    """
-    Waits for a Deep Research report in the background and RETURNS IMMEDIATELY
-    with a run id.
-
-    The recommended way to collect a report: dispatch_gemini(mode=
-    "deep-research") to start it, then this to pick it up. The wait is recorded
-    as an ordinary run, so it survives this server, and check_run reports it
-    like any other.
-
-    Note this DOES hold the browser for the whole wait - one profile, one
-    Chrome - so nothing else here can run until it returns. Size wait_seconds
-    to the job rather than leaving it maximal.
-
-    out: write the report here as well, relative to cwd. Use the
-         .agent-runs/<topic>.md convention.
-    """
-    if not conversation_id.strip():
-        return ("Error: conversation_id is required - it is the id "
-                "dispatch_gemini(mode='deep-research') returned.")
-    args = ["research", "--conversation", conversation_id.strip(),
-            "--wait", str(max(wait_seconds, 60))]
-    if out:
-        args += ["--out", out if os.path.isabs(out)
-                 else os.path.join(os.path.expanduser(cwd), out)]
-    return _dispatch(f"harvest deep research {conversation_id.strip()}",
-                     _worker_argv(*args), cwd, "deep-research-harvest", 0, force)
-
-
-@mcp.tool()
 def dispatch_gemini(prompt: str, conversation_id: str = "", mode: str = DEFAULT_MODEL,
                     files: str = "", out: str = "", cwd: str = DEFAULT_CWD,
                     wait_seconds: int = 0, force: bool = False) -> str:
@@ -1184,17 +1093,11 @@ def dispatch_gemini(prompt: str, conversation_id: str = "", mode: str = DEFAULT_
     wait_seconds to block up to that long and get the finished result in one
     round trip; the run is unaffected if the wait expires first.
 
-    mode="deep-research" is a KICK-OFF ONLY. It sends the prompt, confirms the
-    research plan, and returns the conversation id in under a minute. Google
-    then runs the research on its own side - 40 minutes on a measured run - and
-    writes the report into that conversation. Collect it with gemini_research(<that id>),
-    or wait for it in the background with dispatch_research(<that id>).
-
     A browser run is SILENT until it finishes - no streaming, no progress on
     stdout. An empty tail in check_run means it is still working. Judge it by
     elapsed time, not by output.
 
-    mode: chat | deep-research | canvas | image | video
+    mode: chat | canvas | image | video
     conversation_id: continue an existing thread instead of starting one.
     files: comma-separated paths to attach.
     out: write the answer here as well, relative to cwd. Use the

@@ -125,10 +125,10 @@ class MarkdownExtractionTests(unittest.TestCase):
         self.assertTrue(out.rstrip().endswith("```"), out[-60:])
         self.assertNotIn("Python\n\n```", out, "language leaked as a text line")
 
-    def test_thinking_trace_is_not_part_of_the_report(self):
-        """A Deep Research panel holds the reasoning trace and the browse chips
-        alongside the report, and they dwarf it. Only the report is the
-        deliverable."""
+    def test_a_reasoning_trace_is_not_part_of_the_answer(self):
+        """This wrapper no longer drives Deep Research, but you can still start
+        one by hand and read the thread back. Its panel carries the reasoning
+        trace and a browse chip per site visited, which dwarf the answer."""
         out = self.md(
             "<deep-research-immersive-panel>"
             "<thinking-panel><thought-item>Analyzing the evolution of memory "
@@ -139,9 +139,9 @@ class MarkdownExtractionTests(unittest.TestCase):
             "</deep-research-immersive-panel>")
         self.assertEqual(out, "# Redis vs Valkey\n\nThe fork diverged in 2024.")
 
-    def test_a_still_running_panel_yields_no_report_text(self):
-        """While running, the panel is nothing but trace and a spinner. It must
-        not read as a short report."""
+    def test_a_panel_that_is_still_working_yields_nothing(self):
+        """Mid-run it is trace and a spinner and nothing else. It must come back
+        empty rather than reading as a short answer."""
         out = self.md(
             "<deep-research-immersive-panel><mat-progress-spinner>"
             "</mat-progress-spinner><thinking-panel-skeleton-loader>"
@@ -190,90 +190,6 @@ class LinkUnwrappingTests(unittest.TestCase):
         search link has a query in there and must not be mangled."""
         url = "https://www.google.com/search?q=redis+vs+valkey"
         self.assertEqual(gw._unwrap_google_redirect(url), url)
-
-
-class DeepResearchReportTests(unittest.TestCase):
-    """The two captured panels are a matched pair, taken minutes apart from two
-    conversations whose own chat turns said, verbatim, "I'm on it. I'll let you
-    know when your research is done" and "I've completed your research."
-
-    That pairing is the point. The completion marker in RESEARCH_STATE_JS was
-    not reasoned about, it was read off these two DOMs by keeping only what
-    differed -- and the obvious marker, "is a loading skeleton still mounted?",
-    is present in BOTH, which is exactly the mistake these fixtures exist to
-    stop anyone making again.
-    """
-
-    COMPLETE = "deep-research-report.html"
-    RUNNING = "deep-research-running.html"
-
-    def fixture(self, name):
-        path = os.path.join(FIXTURES, name)
-        if not os.path.isfile(path):
-            self.skipTest(f"{name} not captured")
-        with open(path) as fh:
-            return fh.read()
-
-    # The Python mirror of RESEARCH_STATE_JS's `busy` expression. Structural,
-    # so it can run over captured HTML with no browser.
-    @staticmethod
-    def busy(html):
-        body = 'id="extended-response-markdown-content"' in html
-        return (not body
-                or 'aria-busy="true"' in html
-                or "<mat-progress-spinner" in html)
-
-    def test_the_pair_is_actually_a_pair(self):
-        """If both fixtures ever read the same way, every other test in this
-        class is vacuous."""
-        self.assertFalse(self.busy(self.fixture(self.COMPLETE)))
-        self.assertTrue(self.busy(self.fixture(self.RUNNING)))
-
-    def test_the_skeleton_loader_is_not_the_marker(self):
-        """It is mounted, visible and 200px tall on a FINISHED report. Checking
-        it reports every completed report as running, forever -- which is the
-        bug this fixture was captured to close."""
-        self.assertIn("thinking-panel-skeleton-loader",
-                      self.fixture(self.COMPLETE))
-        self.assertNotIn("thinking-panel-skeleton-loader",
-                         gw.Session.RESEARCH_STATE_JS)
-
-    def test_completed_panel_yields_the_report(self):
-        out = gw.research_html_to_markdown(self.fixture(self.COMPLETE))
-        self.assertTrue(out.startswith("# Architectural Foundations"), out[:80])
-        self.assertIn("Rolldown", out)
-
-    def test_the_reasoning_trace_stays_out_of_the_report(self):
-        """26 thought items and 81 browse chips sit in the same panel as the
-        report. They are working notes; shipping them as the deliverable buries
-        it."""
-        out = gw.research_html_to_markdown(self.fixture(self.COMPLETE))
-        for leak in ("I'm sorting through it", "bringing it all together",
-                     "thought-header"):
-            self.assertNotIn(leak, out)
-
-    def test_sources_become_a_citation_list(self):
-        """A research report without its citations is a worse report, and the
-        generic walk flattens each source into "[vite.devVite 8.1 is out!]"
-        because the domain and title are block divs inside one <a>."""
-        out = gw.research_html_to_markdown(self.fixture(self.COMPLETE))
-        self.assertIn("## Sources", out)
-        tail = out[out.index("## Sources"):]
-        self.assertRegex(tail, r"\n- \[[^\]]+\]\(https?://[^)]+\) -- \S+")
-        self.assertNotRegex(tail, r"\[[a-z0-9.-]+\.[a-z]{2,}[A-Z]")
-
-    def test_a_running_panel_never_yields_a_report(self):
-        """The failure that costs the most: returning the research PLAN, or a
-        few hundred characters of trace, as though it were the deliverable."""
-        out = gw.research_html_to_markdown(self.fixture(self.RUNNING))
-        self.assertNotIn("## Sources", out)
-        self.assertLess(len(out), 200, out[:300])
-
-    def test_the_panel_grace_outlasts_its_measured_mount(self):
-        """The panel mounts seconds after the chat turns beside it; reading
-        state immediately calls a running report 'absent', which reads as a
-        terminal answer."""
-        self.assertGreaterEqual(gw.Session.PANEL_GRACE_MS, 10_000)
 
 
 class MetaLineTests(unittest.TestCase):
@@ -342,17 +258,6 @@ class WorkerCliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.parse(["read"])
 
-    def test_research_defaults_to_not_waiting(self):
-        """The default has to be a single cheap check: the browser is a shared
-        singleton and the research outlasts any sensible block."""
-        args = self.parse(["research", "--conversation", "abc"])
-        self.assertEqual(args.wait, 0.0)
-        self.assertEqual(args.poll, 60.0)
-
-    def test_research_requires_a_conversation(self):
-        with self.assertRaises(SystemExit):
-            self.parse(["research"])
-
 
 class ServerArgvTests(unittest.TestCase):
     """The server builds the worker's command line; a drift between the two is
@@ -400,30 +305,6 @@ class ServerArgvTests(unittest.TestCase):
         self.assertEqual(self.srv._meta_of(out),
                          gw.parse_meta_line(out))
         self.assertEqual(self.srv._strip_meta(out), "answer")
-
-    def test_deep_research_is_refused_by_the_synchronous_tool(self):
-        """It runs for 10-20 minutes; letting it into gemini_ask only produces
-        a timeout with the work already half-done on the account."""
-        out = self.srv.gemini_ask("x", mode="deep-research")
-        self.assertIn("dispatch_gemini", out)
-
-    def test_research_tools_refuse_an_empty_conversation_id(self):
-        """Without an id there is nothing to open, and a browser launch costs
-        ~20s before it could say so."""
-        for out in (self.srv.gemini_research(""),
-                    self.srv.dispatch_research("   ")):
-            self.assertIn("conversation_id is required", out)
-
-    def test_harvest_wait_has_a_floor(self):
-        """dispatch_research exists to wait. A zero or tiny wait would record a
-        run that returns "still running" instantly and teaches the caller
-        nothing."""
-        import unittest.mock as mock
-        with mock.patch.object(self.srv, "_dispatch",
-                               side_effect=lambda *a, **k: a[1]) as _:
-            argv = self.srv.dispatch_research("abc", wait_seconds=0)
-        self.assertIn("--wait", argv)
-        self.assertGreaterEqual(int(argv[argv.index("--wait") + 1]), 60)
 
     def test_an_unknown_mode_is_refused_before_a_browser_opens(self):
         self.assertIn("mode must be one of",

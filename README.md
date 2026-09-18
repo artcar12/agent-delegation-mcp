@@ -312,8 +312,8 @@ Code itself inherits. All are optional.
 | `GEMINI_WEB_BIN` | gemini-web | — | Skip uv entirely and run this executable as the worker. Mostly an escape hatch for tests. |
 | `GEMINI_WEB_MCP_MODE` | gemini-web | `chat` | Default surface for `dispatch_gemini`. |
 | `GEMINI_WEB_MCP_WORKER_TIMEOUT` | gemini-web | `1500` | The worker's own deadline, in seconds. Keep it below the wall clock so the worker's limit is the one that hits: it exits with whatever the page had rendered, where the outer kill leaves nothing to show. |
-| `GEMINI_WEB_MCP_TIMEOUT` | gemini-web | `1800` | Outer subprocess cap, in seconds. A measured Deep Research run took about 40 minutes, so a `dispatch_research` wait can outlast this default. |
-| `GEMINI_WEB_MCP_IDLE_TIMEOUT` | gemini-web | `0` (off) | Same knob as the others, and here it is close to a correctness requirement rather than a preference: a browser run prints nothing between launch and the final answer, so every healthy Deep Research run looks idle for its entire duration. |
+| `GEMINI_WEB_MCP_TIMEOUT` | gemini-web | `1800` | Outer subprocess cap, in seconds. Generous because Canvas and image/video generation take minutes, and a cold Chrome launch is ~20s before anything starts. |
+| `GEMINI_WEB_MCP_IDLE_TIMEOUT` | gemini-web | `0` (off) | Same knob as the others, and here it is close to a correctness requirement rather than a preference: a browser run prints nothing between launch and the final answer, so every healthy run looks idle for its entire duration. |
 | `GEMINI_WEB_MCP_FATAL_PATTERNS` | gemini-web | — | Extra comma-separated stderr strings, as above. |
 
 ---
@@ -482,7 +482,7 @@ CLI, it wraps **gemini.google.com in a real Chrome**.
 
 ### Why it exists
 
-`agy` and `gemini` both reach Gemini through an API that has no Deep Research,
+`agy` and `gemini` both reach Gemini through an API that has no live search,
 no Canvas, no Gems, no conversation history and no attachments. Those exist only
 in the logged-in web app. If you have a Pro subscription, this is how a CLI agent
 reaches what you are already paying for.
@@ -496,7 +496,7 @@ MCP client  ->  gemini_web_mcp_server.py  ->  gemini_web.py  ->  Chrome  ->  gem
 
 Playwright deliberately does **not** run inside the MCP server. The worker is an
 ordinary child process with its fds redirected to files, exactly like `agy`, which
-is the whole reason a Deep Research run survives the server that started it. The
+is the whole reason a browser run survives the server that started it. The
 run store, `check_run`, `cancel_run`, `list_runs`, retention and pruning are the
 same code as the other two servers, duplicated rather than imported (see
 [Repo conventions](#6-repo-conventions-that-make-this-work)).
@@ -506,15 +506,13 @@ same code as the other two servers, duplicated rather than imported (see
 | Tool | Blocks? | Notes |
 |---|---|---|
 | `gemini_ask` | yes | The common case. ~20s floor: Chrome has to launch and the Angular app has to hydrate before a prompt can be typed. |
-| `dispatch_gemini` | no | Returns a run id. The only path for `mode="deep-research"`, which is a kick-off — see below. |
-| `gemini_research` | yes | Fetch a finished report by conversation id, or report how far along it is. |
-| `dispatch_research` | no | Wait for a report in the background, recorded as a run. |
+| `dispatch_gemini` | no | Returns a run id. For work long enough to outlast the synchronous tool. |
 | `gemini_conversations` | yes | Sidebar history as `id  title`. |
 | `gemini_read_conversation` | yes | Dump a thread as markdown without adding to it — including one you started by hand in the browser. |
 | `check_run` / `cancel_run` / `list_runs` | — | Identical to the other servers; they share one store. |
 | `delegation_status` | yes | Also reports whether the profile is still signed in. |
 
-Modes: `chat` (default), `deep-research`, `canvas`, `image`, `video`.
+Modes: `chat` (default), `canvas`, `image`, `video`.
 
 Every answer reports a `conversation_id`. Pass it back to `gemini_ask` or
 `dispatch_gemini` to continue that thread instead of starting a new one.
@@ -536,49 +534,56 @@ a URL and a verbatim quote per claim.
 servers share one API quota, which is why they tell a delegate to run one
 dispatch at a time. That has nothing to do with this server: the web app meters
 separately, so `agy` hitting a rate limit says nothing about whether `gemini_ask`
-will, and vice versa. After a heavy day — several Deep Research runs and a long
-chat session — the web app's rolling window read 16% consumed and its weekly
-limit 1%, while the Antigravity CLI's own weekly and five-hour meters sat
-untouched at 100%.
+will, and vice versa. After a heavy day of use the web app's rolling window read
+16% consumed and its weekly limit 1%, while the Antigravity CLI's own weekly and
+five-hour meters sat untouched at 100%.
 
 That matters because agents ration tool calls by default, and it makes them
 worse: they bundle four questions into one prompt, or skip a verification pass,
 to save a request. The instructions say plainly not to.
 
 > [!NOTE]
-> There is one way to actually run out, and you have to go looking for it:
-> several Deep Research runs on **Pro High** inside the same five-hour window.
-> Nothing else here gets close. Live numbers are in the web app under
+> Running out through this server is not realistically achievable — the one way
+> to do it is several Deep Research runs on **Pro High** in a five-hour window,
+> and this server cannot start those. Live numbers are in the web app under
 > **Settings → Usage limits**, which is where to look if a call ever fails on
 > quota — not at this paragraph.
 
-### Deep Research is the rare case, not the headline
+### There is no Deep Research here, on purpose
 
-The tempting read of this server is "it has Deep Research." That is backwards
-for a CLI agent. An agent can write a prompt of any length and ask as many
-follow-ups as it likes, and that covers most of what Deep Research is for — in
-half a minute instead of forty. The Redis-vs-Valkey comparison that took a
-40-minute research run below came back better as one long `gemini_ask` on Flash.
+It was built, tested, and taken back out in 1.3.0. Both halves of that decision
+are worth recording, because the obvious instinct is to put it back.
 
-So the guidance in the MCP instructions is: one long, specific prompt, then
-follow-ups into the same `conversation_id` to push on whatever came back thin.
-`mode="deep-research"` is reserved for the most taxing problems an agent gets
-handed, which in practice is very few of them — dozens of sources genuinely read
-end to end, a written report as the deliverable, forty minutes acceptable.
-Reaching for it because a prompt felt too big for one call is the wrong reason —
-make the prompt bigger.
+**It did not work reliably.** Of three kick-offs, one produced a report in about
+40 minutes and two wedged: panel frozen at the same character count and thought
+count for over an hour, no error shown, the chip still reading *"Researching 64
+websites…"*, and no recovery. The harvest code reported that honestly rather
+than inventing a report, but honest reporting of a two-thirds failure rate is
+not a feature. Known-brittle machinery is worse than none, because it invites a
+plan that depends on it.
 
-> [!WARNING]
-> **Deep Research is the least reliable thing in this server. Do not build a
-> plan that depends on it.** Of three kick-offs observed, one produced a report
-> in about 40 minutes and two wedged: panel frozen at the same character count
-> and thought count for over an hour, no error shown, the chip still reading
-> *"Researching 64 websites…"*. Cause unknown — both wedged runs were started
-> during the window when the mock-keychain bug was still destroying cookies
-> mid-flight, which is a plausible but unproven explanation. `gemini_research`
-> reports a stall honestly rather than inventing a report, but a wedged run
-> never recovers. If one has not moved in an hour, abandon it and ask the
-> question as a long `gemini_ask` instead.
+**And it was solving a problem a CLI agent does not have.** An agent can write a
+prompt of any length and ask as many follow-ups as it likes. That covers most of
+what Deep Research is for, in half a minute rather than forty. Tested head to
+head on the same question — a detailed Redis vs Valkey comparison — the long
+`gemini_ask` on Flash answered in **37 seconds** with governance, divergence,
+benchmarks, an ecosystem table and recommendations split by situation. The Deep
+Research run on the identical question never finished.
+
+So the shape now is: **one long, specific prompt, then follow-ups into the same
+`conversation_id`** to push on whatever came back thin. That is not a
+workaround; it is the better tool.
+
+If a job genuinely does need Deep Research, the MCP instructions tell the agent
+to **ask you to run it in the browser** and hand back the conversation id.
+`gemini_read_conversation` then reads the finished thread — extraction still
+drops the reasoning trace and browse chips, so that path works today and is
+covered by tests.
+
+The removed code is in git history at tag `agent-delegation--v1.2.2`, along with
+the one genuinely hard-won piece of knowledge in it: a finished report keeps its
+`thinking-panel-skeleton-loader` mounted and visible, so "is a loader still
+showing?" reports every completed report as running forever. See ADM-4.
 
 One prompting caveat, learned the annoying way: **asking for a verbatim quote
 per claim can make the model announce it has no web access and then answer from
@@ -613,66 +618,6 @@ Two traps worth naming:
   on the account chooser rather than on Gemini for exactly this reason, and checks
   the profile's cookies before it claims success.
 
-### Deep Research is two halves
-
-A deep-research prompt does not come back with a report. It comes back with a
-**plan** and a "Start research" button. Clicking that hands the job to Google,
-which runs it server-side — the chat turn says so outright: *"I'll let you know
-when your research is done. In the meantime, you can leave this chat."*
-
-```
-dispatch_gemini(mode="deep-research")   ->  conversation id, in ~45s
-   ... Google researches, server-side, for a long time ...
-gemini_research(conversation_id)        ->  the report, or how far along it is
-dispatch_research(conversation_id)      ->  same, waited for in the background
-```
-
-Three things make this mode unlike the others, and each cost real time to find:
-
-- The chat turn is a **permanent stub**. It never gets the `message-actions`
-  row that every other mode completes with, so the usual completion check waits
-  forever — a 1500s timeout returning 169 characters.
-- The report is written into a `deep-research-immersive-panel`, not the chat
-  turn, so state has to be read off the panel — and the marker is not the
-  obvious one. See below.
-- The panel also holds the **reasoning trace** and the browse chips, which
-  dwarf the report: on a measured run, 32KB of report inside 692KB of panel.
-  Extraction is scoped to the report body for that reason.
-
-**"Still running" is a normal answer, not a failure.** Never re-dispatch on it
-— the research is already in flight and starting another buys a second one for
-nothing. Call `gemini_research` again later.
-
-> [!WARNING]
-> These take a long time. A measured run took about 40 minutes end to end.
-> Size `dispatch_research(wait_seconds=…)` to the job — it holds the single
-> browser for the whole wait.
-
-#### The completion marker, and the one that looks right and isn't
-
-Established by sampling two conversations side by side, one whose chat turn
-read *"I'm on it. I'll let you know when your research is done"* and one whose
-read *"I've completed your research"*, then keeping only what differed:
-
-| | running | complete |
-|---|---|---|
-| `#extended-response-markdown-content` | absent | present, `aria-busy="false"` |
-| `mat-progress-spinner` | 1 | 0 |
-| `toc-menu` | 0 | 1 |
-| `thinking-panel-skeleton-loader` | 1 | **1** |
-
-The skeleton loader is the trap. It is still mounted, still visible and still
-200px tall on a finished report, so "is anything still loading?" reports every
-completed report as running, forever. The marker used instead is the report
-body's own presence — no report element, no report. Both panels are captured in
-`test/fixtures/`, and a test asserts the skeleton loader appears in the
-*completed* one so nobody reintroduces the check.
-
-One more shape to know: the panel mounts several seconds **after** the chat
-turns beside it (~4.7s measured). Reading state the instant the page settles
-calls a running report `absent`, which reads like a terminal answer. Hence the
-15s grace before concluding a conversation has no research in it at all.
-
 ### One browser, one profile, one call at a time
 
 Every tool here refuses when another is running. On the sibling servers that
@@ -684,7 +629,7 @@ same user-data-dir twice, and the alternative to refusing is a corrupted profile
 A browser run prints **nothing** between launch and the final answer. An empty
 log tail in `check_run` means "still working", not "stuck" — judge it by elapsed
 time. This is also why `GEMINI_WEB_MCP_IDLE_TIMEOUT` defaults to off: every
-healthy Deep Research run looks idle for its entire duration.
+healthy run looks idle for its entire duration.
 
 ### When Google reshuffles the DOM
 
@@ -992,12 +937,9 @@ reopening settled questions or rediscovering the same platform gotcha.
 | gemini-web: `Failed to create a ProcessSingleton` | Chrome will not share a user-data-dir between instances, and a crash leaves a stale lock | quit the other Chrome on that profile; if none is running, delete `SingletonLock` in the profile dir |
 | gemini-web: prompt lands in the box and never sends, headless only | Angular ignores a synthetic Enter in headless Chrome | already handled: the send button is clicked, with Enter only as fallback |
 | gemini-web: `selector 'file_input' never appeared` | Gemini's file inputs are `class="hidden-file-input"` and Playwright waits for *visible* by default | already handled: that wait uses `state="attached"` |
-| gemini-web: deep-research returns 169 chars after a full timeout | the chat turn for a deep-research prompt is a permanent stub with no `message-actions`, so the usual completion check never fires; the report goes to a separate immersive panel | already handled: the mode is a kick-off that returns once the plan is confirmed, and `gemini_research` harvests the report from the panel later |
-| gemini-web: a finished report reports `running` forever | the check was "is a loading skeleton still mounted?", and `thinking-panel-skeleton-loader` stays mounted and visible on a completed report | already handled: completion is the report body's presence, not the absence of a loader. See [the completion marker](#the-completion-marker-and-the-one-that-looks-right-and-isnt) |
-| gemini-web: `gemini_research` says a running conversation has no research in it | the immersive panel mounts ~5s after the chat turns beside it | already handled: 15s grace before `absent` is concluded |
+| gemini-web: "no tool labelled 'canvas'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
 | gemini-web: a link in an answer goes to a Google redirect, not the page | Gemini rewrites outbound hrefs through `google.com/search?q=<real url>&utm_source=gemini` while the anchor text shows the real destination | already handled: the real URL is taken back out of the `q` parameter during extraction |
 | gemini-web: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | ask for a URL per claim instead of a quote, and retry |
-| gemini-web: "no tool labelled 'deep research'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
 | gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
@@ -1026,6 +968,32 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.3.0 (2026-09-18)
+
+**Removed: Deep Research.** `gemini_research`, `dispatch_research`,
+`mode="deep-research"` and the `research` worker subcommand are all gone.
+
+It was built and verified end to end against a genuinely completed report, and
+then two of three kick-offs wedged — panel frozen for hours, no error, no
+recovery. A two-thirds failure rate on a capability a CLI agent rarely needs is
+not worth carrying: known-brittle machinery is worse than none, because it
+invites a plan that depends on it.
+
+What replaces it is not a fallback. One long `gemini_ask` plus follow-ups into
+the same `conversation_id` covers most of what Deep Research is for, and beat it
+head to head on the same question: 37 seconds against a run that never finished.
+The MCP instructions say this outright, and tell a session that if a job truly
+needs Deep Research it should **ask the human to run it in the browser** and hand
+back a conversation id, which `gemini_read_conversation` can then read.
+
+Nothing else changed. `gemini_ask`, `dispatch_gemini`, `gemini_conversations`,
+`gemini_read_conversation` and the shared run-store tools are untouched, and
+markdown extraction still strips reasoning traces and browse chips — so reading
+back a Deep Research thread you started by hand still works.
+
+Removed code is at tag `agent-delegation--v1.2.2` if it is ever worth another
+attempt. ADM-4 records the one non-obvious thing in it.
 
 ### 1.2.2 (2026-09-18)
 
