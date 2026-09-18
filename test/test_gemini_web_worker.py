@@ -192,6 +192,27 @@ class LinkUnwrappingTests(unittest.TestCase):
         self.assertEqual(gw._unwrap_google_redirect(url), url)
 
 
+class SidebarTests(unittest.TestCase):
+    """The history list is behind a collapsed sidebar.
+
+    This cost a real debugging detour: Gemini began shipping the sidebar
+    collapsed, Angular does not render the conversation list until it opens,
+    and the failure surfaced as `selector 'conversation_link' never appeared` --
+    which reads like Google moved the markup. Nothing had moved. The selector
+    was right the whole time; the panel holding it did not exist yet.
+    """
+
+    def test_the_sidebar_toggle_is_a_named_selector(self):
+        self.assertIn("open_sidebar", gw.SELECTORS)
+
+    def test_listing_conversations_opens_the_sidebar_first(self):
+        """Without this call the list is empty on a collapsed sidebar, and the
+        error blames the wrong selector."""
+        import inspect
+        src = inspect.getsource(gw.Session.conversations)
+        self.assertIn("open_sidebar", src)
+
+
 class MetaLineTests(unittest.TestCase):
     """The MCP server only ever sees the worker's stdout as a file, so this
     line is the whole channel for the conversation id."""

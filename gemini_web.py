@@ -74,6 +74,10 @@ SELECTORS = {
     # the text lands in the editor and simply never sends.
     "send_button": 'button[aria-label="Send message"]',
     "conversation_link": 'conversations-list a[href^="/app/"]',
+    # The sidebar now ships collapsed, and Angular does not render the history
+    # list until it is opened -- so conversation_link never appears and the
+    # failure reads like a DOM change when nothing moved. See open_sidebar().
+    "open_sidebar": 'button[aria-label="Open sidebar"]',
     "tools_button": 'input-container button[aria-label="Upload & tools"]',
     "tool_toggle": 'toolbox-drawer-item button[role="menuitemcheckbox"]',
     # The drawer shows a few tools and hides the rest behind this. Which ones
@@ -82,6 +86,10 @@ SELECTORS = {
     "more_tools": 'button:has-text("More tools")',
     "file_input": 'input[type="file"]',
     "mode_switcher": "bard-mode-switcher",
+    # The switcher renders its label lazily, so inner_text is often empty even
+    # though the element is there. This button always carries it, as
+    # "Open mode picker, currently Flash".
+    "mode_picker": '[aria-label^="Open mode picker"]',
     # Signed-out marker. Gemini serves a fully working composer to anonymous
     # visitors, so the editor appearing proves nothing -- the only honest
     # signal is whether the app is still offering to sign you in.
@@ -608,7 +616,10 @@ class Session:
             return False
 
     def account(self) -> str:
+        """Who the profile is signed in as. Needs the sidebar open -- the
+        footer is inside it, and reading it collapsed returns ""."""
         try:
+            self.open_sidebar()
             el = self.page.locator(SELECTORS["account_footer"])
             return " ".join((el.first.inner_text() or "").split()) if el.count() else ""
         except Exception:
@@ -783,7 +794,24 @@ class Session:
         return [{"role": t["role"], "markdown": html_to_markdown(t["html"])}
                 for t in turns]
 
+    def open_sidebar(self) -> None:
+        """Expand the sidebar if it is collapsed, and wait for the list.
+
+        Gemini collapsed the sidebar by default at some point, and Angular does
+        not render the history until it is open. Nothing about the markup
+        changed, so the symptom was a selector error naming
+        `conversations-list a[href^="/app/"]` -- which is still exactly right
+        once the panel exists. Clicking is idempotent enough: when the sidebar
+        is already open the button is absent and this is a no-op.
+        """
+        try:
+            self.page.click(SELECTORS["open_sidebar"], timeout=5_000)
+            self.page.wait_for_timeout(1_200)
+        except Exception:
+            pass  # already open, or Google renamed the control -- the wait below decides
+
     def conversations(self, limit: int = 20, query: str = "") -> list[dict]:
+        self.open_sidebar()
         self._require("conversation_link", HYDRATE_MS)
         rows = self.page.evaluate(
             """(sel) => [...document.querySelectorAll(sel)].map(a => ({
@@ -797,8 +825,22 @@ class Session:
         return rows[:limit]
 
     def current_model(self) -> str:
-        el = self.page.locator(SELECTORS["mode_switcher"])
+        """The model in the picker, e.g. "Flash".
+
+        Read from the picker button's aria-label first: bard-mode-switcher is
+        present but frequently renders no text, so the obvious inner_text call
+        returns "" on a perfectly healthy page.
+        """
         try:
+            label = self.page.get_attribute(SELECTORS["mode_picker"], "aria-label",
+                                            timeout=3_000) or ""
+            _, _, model = label.partition("currently")
+            if model.strip():
+                return model.strip()
+        except Exception:
+            pass
+        try:
+            el = self.page.locator(SELECTORS["mode_switcher"])
             return (el.first.inner_text() or "").strip() if el.count() else ""
         except Exception:
             return ""

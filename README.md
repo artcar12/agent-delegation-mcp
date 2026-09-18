@@ -939,6 +939,7 @@ reopening settled questions or rediscovering the same platform gotcha.
 | gemini-web: `selector 'file_input' never appeared` | Gemini's file inputs are `class="hidden-file-input"` and Playwright waits for *visible* by default | already handled: that wait uses `state="attached"` |
 | gemini-web: "no tool labelled 'canvas'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
 | gemini-web: a link in an answer goes to a Google redirect, not the page | Gemini rewrites outbound hrefs through `google.com/search?q=<real url>&utm_source=gemini` while the anchor text shows the real destination | already handled: the real URL is taken back out of the `q` parameter during extraction |
+| gemini-web: `selector 'conversation_link' never appeared` | nothing moved — Gemini ships the sidebar collapsed, and Angular does not render the history list until it is opened | already handled: the sidebar is expanded before the list is read |
 | gemini-web: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | ask for a URL per claim instead of a quote, and retry |
 | gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
@@ -968,6 +969,22 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.3.1 (2026-09-18)
+
+**Fix: `gemini_conversations` was broken, and `delegation_status` was quietly
+wrong.** Gemini now ships the sidebar collapsed, and Angular does not render the
+history list until it is opened. The symptom was
+`selector 'conversation_link' never appeared`, which reads like Google moved the
+markup — nothing had moved. The same collapse emptied two `status` fields:
+`account` came back blank (hence *"signed in as (unknown)"*) because the account
+footer lives in the sidebar, and `model` came back blank because
+`bard-mode-switcher` renders no text even when present. The model is now read
+from the picker button's `aria-label`, which always carries it.
+
+Worth knowing generally: a selector error from this worker names the selector
+that timed out, which is not always the thing that changed. Check whether the
+panel containing it is even open first.
 
 ### 1.3.0 (2026-09-18)
 
