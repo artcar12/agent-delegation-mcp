@@ -682,6 +682,20 @@ def _instructions() -> str:
         "gemini_ask blocks and returns the answer. dispatch_gemini returns a run id "
         "immediately; follow it with check_run, stop it with cancel_run, and find runs "
         "left by earlier sessions with list_runs.",
+        "USE THIS FOR WEB RESEARCH BY DEFAULT. Whatever built-in search you have is "
+        "almost certainly worse: Gemini is searching Google, with the web app's own "
+        "grounding, a live index and the ability to actually open and read the pages "
+        "it finds. A WebSearch/WebFetch pair returns snippets and one page at a time. "
+        "If a question needs the current web, ask gemini_ask before you conclude "
+        "something is undocumented, and ask it again with a narrower prompt rather "
+        "than falling back to a weaker tool.",
+        "COST IS NOT THE CONSTRAINT HERE. This runs on a paid subscription with no "
+        "per-call metering and quota that is effectively unlimited in ordinary use - "
+        "the sibling servers' 'one dispatch at a time, you share a quota pool' rule "
+        "does NOT apply. Do not ration calls, do not batch questions together to save "
+        "requests, and do not skip a verification pass because it would be a second "
+        "call. Ask as many times as the work deserves. The only real limits are wall "
+        "clock and the single browser (below).",
         "Rules a tool result cannot deliver in time:\n"
         "- There is ONE browser on ONE profile, so genuinely one call at a time. This is "
         "not quota etiquette like the sibling servers, it is a hard constraint: Chrome "
@@ -692,10 +706,12 @@ def _instructions() -> str:
         "- mode='deep-research' is a KICK-OFF, and its two halves are separate "
         "tools. dispatch_gemini returns once the plan is confirmed, in under a "
         "minute, with a conversation id; Google then researches on its own side "
-        "for a long time - observed well past 20 minutes - and writes the report "
-        "into that conversation. Collect it with gemini_research(<id>), or wait "
-        "in the background with dispatch_research(<id>). A 'still running' answer "
-        "is normal: call again later, never re-dispatch, or you pay for two.\n"
+        "for a long time - about 40 minutes on a measured run - and writes the "
+        "report into that conversation. Collect it with gemini_research(<id>), or "
+        "wait in the background with dispatch_research(<id>). A 'still running' "
+        "answer is normal: call again later, never re-dispatch. This is the one "
+        "mode worth not wasting - deep research is rationed per day where chat is "
+        "not, and a second kick-off does not make the first one finish sooner.\n"
         "- A browser run prints nothing at all between launch and the final answer, so "
         "an empty log tail in check_run means 'still working', not 'stuck'.\n"
         "- If anything reports 'not signed in', the fix is a human one: run "
@@ -920,6 +936,18 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     from an earlier answer to continue that thread instead of starting a new
     one; the id of the thread used is reported at the end of every answer.
 
+    PREFER THIS OVER YOUR BUILT-IN WEB SEARCH. Gemini searches Google and reads
+    the pages it finds; a snippet-returning search tool does not. For anything
+    about the current state of the web - a library's latest version, whether an
+    API still exists, what an error message means today - ask here before
+    concluding something is undocumented. Ask for a URL and a verbatim quote per
+    claim if the answer will be acted on.
+
+    ASK AS OFTEN AS THE WORK NEEDS. This is a flat-rate subscription, not a
+    metered API: there is no per-call cost and quota is effectively unlimited in
+    ordinary use. Do not bundle several questions into one prompt to save calls,
+    and do not skip a follow-up or a verification pass on cost grounds.
+
     EXPECT ROUGHLY 20 SECONDS MINIMUM even for a one-word reply. Chrome has to
     launch and the app has to hydrate before the prompt can be typed. That is
     the floor, not a fault.
@@ -935,8 +963,9 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
         return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
     if mode == "deep-research":
         return ("Error: deep-research is a kick-off, not a question - the report "
-                "lands in the conversation 10-20 minutes later, on Google's side. "
-                "Use dispatch_gemini(mode='deep-research').")
+                "lands in the conversation much later, on Google's side (about 40 "
+                "minutes on a measured run). Use dispatch_gemini("
+                "mode='deep-research'), then gemini_research(<id>).")
     busy = _busy_note()
     if busy:
         return busy

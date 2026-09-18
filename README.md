@@ -519,6 +519,32 @@ Modes: `chat` (default), `deep-research`, `canvas`, `image`, `video`.
 Every answer reports a `conversation_id`. Pass it back to `gemini_ask` or
 `dispatch_gemini` to continue that thread instead of starting a new one.
 
+### This is the best web search on the box, and it is flat-rate
+
+Both halves of that are written into the server's MCP instructions and into
+`gemini_ask`'s docstring, because an agent needs them *before* its first call,
+not after it has already given up and answered from memory.
+
+**It searches better than the built-in tools do.** An agent's `WebSearch` /
+`WebFetch` pair returns snippets and fetches one page at a time. `gemini_ask` is
+Google searching Google, with the web app's own grounding, a live index and the
+ability to open and read what it finds. The practical rule: ask here before
+concluding that something is undocumented, and when it will be acted on, ask for
+a URL and a verbatim quote per claim.
+
+**Cost is not the constraint.** This rides a flat-rate subscription with no
+per-call metering, so the sibling servers' *"one dispatch at a time, you share a
+quota pool"* rule does not apply here. Agents ration tool calls by default and it
+makes them worse — they bundle four questions into one prompt, or skip a
+verification pass, to save a request that costs nothing. The instructions say
+plainly not to. The real limits are wall clock and the single browser.
+
+> [!NOTE]
+> "Effectively unlimited" means *in ordinary use*, not *uncapped*. Deep Research
+> in particular is rationed per day on consumer plans, and it is the one mode
+> where a burst can run you out. Chat is the part you should not think twice
+> about.
+
 ### Signing in: you have to do this by hand, once
 
 ```bash
