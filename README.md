@@ -312,7 +312,7 @@ Code itself inherits. All are optional.
 | `GEMINI_WEB_BIN` | gemini-web | — | Skip uv entirely and run this executable as the worker. Mostly an escape hatch for tests. |
 | `GEMINI_WEB_MCP_MODE` | gemini-web | `chat` | Default surface for `dispatch_gemini`. |
 | `GEMINI_WEB_MCP_WORKER_TIMEOUT` | gemini-web | `1500` | The worker's own deadline, in seconds. Keep it below the wall clock so the worker's limit is the one that hits: it exits with whatever the page had rendered, where the outer kill leaves nothing to show. |
-| `GEMINI_WEB_MCP_TIMEOUT` | gemini-web | `1800` | Outer subprocess cap, in seconds. Deep Research genuinely runs 10-20 minutes. |
+| `GEMINI_WEB_MCP_TIMEOUT` | gemini-web | `1800` | Outer subprocess cap, in seconds. A measured Deep Research run took about 40 minutes, so a `dispatch_research` wait can outlast this default. |
 | `GEMINI_WEB_MCP_IDLE_TIMEOUT` | gemini-web | `0` (off) | Same knob as the others, and here it is close to a correctness requirement rather than a preference: a browser run prints nothing between launch and the final answer, so every healthy Deep Research run looks idle for its entire duration. |
 | `GEMINI_WEB_MCP_FATAL_PATTERNS` | gemini-web | — | Extra comma-separated stderr strings, as above. |
 
@@ -507,6 +507,8 @@ same code as the other two servers, duplicated rather than imported (see
 |---|---|---|
 | `gemini_ask` | yes | The common case. ~20s floor: Chrome has to launch and the Angular app has to hydrate before a prompt can be typed. |
 | `dispatch_gemini` | no | Returns a run id. The only path for `mode="deep-research"`, which is a kick-off — see below. |
+| `gemini_research` | yes | Fetch a finished report by conversation id, or report how far along it is. |
+| `dispatch_research` | no | Wait for a report in the background, recorded as a run. |
 | `gemini_conversations` | yes | Sidebar history as `id  title`. |
 | `gemini_read_conversation` | yes | Dump a thread as markdown without adding to it — including one you started by hand in the browser. |
 | `check_run` / `cancel_run` / `list_runs` | — | Identical to the other servers; they share one store. |
@@ -544,29 +546,65 @@ Two traps worth naming:
   on the account chooser rather than on Gemini for exactly this reason, and checks
   the profile's cookies before it claims success.
 
-### Deep Research is a kick-off, not a question
+### Deep Research is two halves
 
 A deep-research prompt does not come back with a report. It comes back with a
 **plan** and a "Start research" button. Clicking that hands the job to Google,
 which runs it server-side — the chat turn says so outright: *"I'll let you know
 when your research is done. In the meantime, you can leave this chat."*
 
-So `dispatch_gemini(mode="deep-research")` sends the prompt, confirms the plan,
-and returns the conversation id in under a minute. The report lands in that
-conversation 10-20 minutes later.
+```
+dispatch_gemini(mode="deep-research")   ->  conversation id, in ~45s
+   ... Google researches, server-side, for a long time ...
+gemini_research(conversation_id)        ->  the report, or how far along it is
+dispatch_research(conversation_id)      ->  same, waited for in the background
+```
 
-> [!NOTE]
-> **Bringing the report back is not implemented yet** (ADM-3). Open the
-> conversation in a browser to read it. Everything else about the mode works:
-> the prompt is sent, the plan is confirmed, and the research runs.
+Three things make this mode unlike the others, and each cost real time to find:
 
-Two things make this mode unlike the others, and both cost an afternoon to find:
-
-- The chat turn stays a **permanent stub**. It never gets the `message-actions`
+- The chat turn is a **permanent stub**. It never gets the `message-actions`
   row that every other mode completes with, so the usual completion check waits
   forever — a 1500s timeout returning 169 characters.
-- The report is written into a `deep-research-immersive-panel`, not into the
-  chat turn, so it has to be read from somewhere else entirely.
+- The report is written into a `deep-research-immersive-panel`, not the chat
+  turn, so state has to be read off the panel — and the marker is not the
+  obvious one. See below.
+- The panel also holds the **reasoning trace** and the browse chips, which
+  dwarf the report: on a measured run, 32KB of report inside 692KB of panel.
+  Extraction is scoped to the report body for that reason.
+
+**"Still running" is a normal answer, not a failure.** Never re-dispatch on it
+— the research is already in flight and starting another buys a second one for
+nothing. Call `gemini_research` again later.
+
+> [!WARNING]
+> These take a long time. A measured run took about 40 minutes end to end.
+> Size `dispatch_research(wait_seconds=…)` to the job — it holds the single
+> browser for the whole wait.
+
+#### The completion marker, and the one that looks right and isn't
+
+Established by sampling two conversations side by side, one whose chat turn
+read *"I'm on it. I'll let you know when your research is done"* and one whose
+read *"I've completed your research"*, then keeping only what differed:
+
+| | running | complete |
+|---|---|---|
+| `#extended-response-markdown-content` | absent | present, `aria-busy="false"` |
+| `mat-progress-spinner` | 1 | 0 |
+| `toc-menu` | 0 | 1 |
+| `thinking-panel-skeleton-loader` | 1 | **1** |
+
+The skeleton loader is the trap. It is still mounted, still visible and still
+200px tall on a finished report, so "is anything still loading?" reports every
+completed report as running, forever. The marker used instead is the report
+body's own presence — no report element, no report. Both panels are captured in
+`test/fixtures/`, and a test asserts the skeleton loader appears in the
+*completed* one so nobody reintroduces the check.
+
+One more shape to know: the panel mounts several seconds **after** the chat
+turns beside it (~4.7s measured). Reading state the instant the page settles
+calls a running report `absent`, which reads like a terminal answer. Hence the
+15s grace before concluding a conversation has no research in it at all.
 
 ### One browser, one profile, one call at a time
 
@@ -887,7 +925,9 @@ reopening settled questions or rediscovering the same platform gotcha.
 | gemini-web: `Failed to create a ProcessSingleton` | Chrome will not share a user-data-dir between instances, and a crash leaves a stale lock | quit the other Chrome on that profile; if none is running, delete `SingletonLock` in the profile dir |
 | gemini-web: prompt lands in the box and never sends, headless only | Angular ignores a synthetic Enter in headless Chrome | already handled: the send button is clicked, with Enter only as fallback |
 | gemini-web: `selector 'file_input' never appeared` | Gemini's file inputs are `class="hidden-file-input"` and Playwright waits for *visible* by default | already handled: that wait uses `state="attached"` |
-| gemini-web: deep-research returns 169 chars after a full timeout | the chat turn for a deep-research prompt is a permanent stub with no `message-actions`, so the usual completion check never fires; the report goes to a separate immersive panel | already handled: the mode is now a kick-off that returns once the plan is confirmed. Harvesting the report is ADM-3 |
+| gemini-web: deep-research returns 169 chars after a full timeout | the chat turn for a deep-research prompt is a permanent stub with no `message-actions`, so the usual completion check never fires; the report goes to a separate immersive panel | already handled: the mode is a kick-off that returns once the plan is confirmed, and `gemini_research` harvests the report from the panel later |
+| gemini-web: a finished report reports `running` forever | the check was "is a loading skeleton still mounted?", and `thinking-panel-skeleton-loader` stays mounted and visible on a completed report | already handled: completion is the report body's presence, not the absence of a loader. See [the completion marker](#the-completion-marker-and-the-one-that-looks-right-and-isnt) |
+| gemini-web: `gemini_research` says a running conversation has no research in it | the immersive panel mounts ~5s after the chat turns beside it | already handled: 15s grace before `absent` is concluded |
 | gemini-web: "no tool labelled 'deep research'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
 | gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |

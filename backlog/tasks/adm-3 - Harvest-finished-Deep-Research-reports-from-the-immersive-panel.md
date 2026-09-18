@@ -1,9 +1,11 @@
 ---
 id: ADM-3
 title: Harvest finished Deep Research reports from the immersive panel
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@arthurcarroll'
 created_date: '2026-09-18 17:30'
+updated_date: '2026-09-18 17:59'
 labels: []
 dependencies:
   - ADM-2
@@ -29,9 +31,23 @@ Note that conversation 100bc647b567907f is wedged at 'Starting research...' and 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A finished Deep Research report can be retrieved as markdown from its conversation id
-- [ ] #2 An unfinished report reports progress instead of returning the plan or an empty string
-- [ ] #3 The completion marker is established against a genuinely completed run, not inferred
-- [ ] #4 The browser is not held open for the duration of the research
-- [ ] #5 Extraction is covered offline by a captured fixture of a completed panel
+- [x] #1 A finished Deep Research report can be retrieved as markdown from its conversation id
+- [x] #2 An unfinished report reports progress instead of returning the plan or an empty string
+- [x] #3 The completion marker is established against a genuinely completed run, not inferred
+- [x] #4 The browser is not held open for the duration of the research
+- [x] #5 Extraction is covered offline by a captured fixture of a completed panel
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Completion marker established live on 2026-09-18 by sampling two conversations side by side: 5005a96d83884070 (chat turn: "I've completed your research") against 8350e51595585fd2 ("I'm on it... you can leave this chat"), keeping only what differed.
+
+The obvious marker is wrong. thinking-panel-skeleton-loader is present, visible and 200px tall in BOTH states, so the absence-of-a-loader check reports every finished report as running forever. What actually differs: #extended-response-markdown-content (absent vs present with aria-busy=false), mat-progress-spinner (1 vs 0), toc-menu (0 vs 1). The report body's own presence is now the marker.
+
+Two further live findings:
+- The immersive panel mounts ~4.7s AFTER the chat turns beside it, so reading state immediately returned 'absent' for a running report. 15s grace added.
+- Extraction is scoped to the report body, not the panel: 32KB of report inside 692KB of panel on the measured run. Sources get their own renderer because the generic walk flattens each citation's domain and title into one link label.
+
+Verified end to end with the real subcommand: complete (42409 chars in 11.4s), running (progress text), absent (ordinary chat). Both panels captured to test/fixtures/; a test asserts the skeleton loader appears in the COMPLETED fixture so the bad check cannot come back.
+<!-- SECTION:NOTES:END -->
