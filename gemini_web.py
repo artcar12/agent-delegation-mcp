@@ -961,9 +961,59 @@ class Session:
             SELECTORS["file_input"], [os.path.expanduser(p) for p in paths]
         )
         self.page.keyboard.press("Escape")
-        # Gemini refuses to send while an upload is in flight; the send key is
-        # simply swallowed. Give the chips time to settle.
-        self.page.wait_for_timeout(1500 + _ms(READ_PAUSE_MS))
+        self._await_uploads(paths)
+
+    # Uploads of even a 31-byte file take far longer than the 1.5s this code
+    # used to sleep. 60s is slack for a real document, not an expectation.
+    UPLOAD_SETTLE_MS = 60_000
+
+    def _await_uploads(self, paths: list[str]) -> None:
+        """Block until every attachment has finished uploading.
+
+        This replaced a flat 1.5s sleep followed by sending regardless, which
+        is how a still-in-flight attachment reached the model as an EMPTY file:
+        Gemini answered "the attached file is empty" and the worker exited 0,
+        so a total failure looked like a correct answer.
+
+        Two things make the check less obvious than it looks:
+
+        - Scope to <input-container>, not document.body. The body includes the
+          conversation sidebar, so a previous chat's TITLE can satisfy a naive
+          filename search and pass this check for the wrong reason.
+        - Match the basename STEM, not the filename. The chip renders the type
+          and the stem as separate lines ("CSV" then "parts"), so the string
+          "parts.csv" never appears anywhere in the composer.
+
+        Locale note: the busy test reads the app's own "Uploading" string, so a
+        non-English UI falls through to the timeout and refuses to send. Safe
+        direction, and loud rather than silent.
+        """
+        stems = [os.path.splitext(os.path.basename(os.path.expanduser(p)))[0]
+                 for p in paths]
+        deadline = time.monotonic() + self.UPLOAD_SETTLE_MS / 1000
+        while True:
+            state = self.page.evaluate(
+                """(stems) => {
+                    const c = document.querySelector('input-container');
+                    const t = (c ? c.innerText : '') || '';
+                    const low = t.toLowerCase();
+                    return {busy: /uploading/i.test(t),
+                            missing: stems.filter(x => !low.includes(x.toLowerCase()))};
+                }""", stems)
+            if not state["busy"] and not state["missing"]:
+                self._pause(READ_PAUSE_MS)   # a person would glance at the chip
+                return
+            if time.monotonic() > deadline:
+                why = ("still uploading" if state["busy"]
+                       else f"no chip for {', '.join(state['missing'])}")
+                raise GeminiWebError(
+                    f"attachment never finished uploading after "
+                    f"{self.UPLOAD_SETTLE_MS // 1000}s ({why}). NOTHING WAS "
+                    f"SENT - asking about a file that did not arrive is how "
+                    f"this failed silently before. Note that attachments do "
+                    f"not currently survive --mode canvas; use chat.",
+                    EXIT_TIMEOUT)
+            self.page.wait_for_timeout(500 + _ms((0, 300)))
 
     def send(self, prompt: str) -> int:
         """Type the prompt and submit. Returns the model-response count before

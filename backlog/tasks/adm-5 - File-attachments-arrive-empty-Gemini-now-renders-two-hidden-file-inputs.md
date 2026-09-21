@@ -1,9 +1,10 @@
 ---
 id: ADM-5
 title: 'File attachments arrive empty: Gemini now renders two hidden file inputs'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-09-21 18:33'
+updated_date: '2026-09-21 18:46'
 labels: []
 dependencies: []
 ordinal: 5000
@@ -30,7 +31,27 @@ An attempted fix (correct input + a real settle-wait) was written and REVERTED i
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 ask --file delivers the file's real contents, proven by Gemini quoting a line from it
-- [ ] #2 A stalled or failed upload raises rather than sending a prompt about a file that never arrived
-- [ ] #3 The working input is selected structurally, not by DOM order
+- [x] #1 ask --file delivers the file's real contents, proven by Gemini quoting a line from it
+- [x] #2 A stalled or failed upload raises rather than sending a prompt about a file that never arrived
+- [x] #3 The working input is selected structurally, not by DOM order
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CORRECTION: the two-hidden-file-inputs theory in the description was a RED HERRING. Input 0 (under <images-files-uploader>) was always the right one. I had read 'the chip settled in 2s' on input 1 as 'the bytes arrived', which it does not mean, and wrote a fix around the wrong cause.
+
+Actual cause: attach() slept a flat 1500ms and then sent unconditionally. Uploads take far longer than that - 10-30s even for a 31-byte CSV - so the prompt was sent while the file was still in flight and Gemini received an empty attachment. The worker exited 0, so a total failure looked like a correct answer.
+
+Fix: _await_uploads() blocks until the upload finishes and raises EXIT_TIMEOUT if it does not, so a stalled upload can never again become a confident answer about a file that never arrived. Two non-obvious details:
+- Scoped to <input-container>, NOT document.body. The body contains the conversation sidebar, so a previous chat's title can satisfy a naive filename search and pass the check for the wrong reason.
+- Matches the basename STEM, not the filename. The chip renders type and stem on separate lines ('CSV' then 'parts'), so the string 'parts.csv' never appears in the composer at all. This is why the first attempt reported 'no chip' and refused to send.
+
+Verified live 2026-09-21: 'Quote the first line' returned 'name,qty' plus the full parsed table; a follow-up returned 3 data rows and total qty 15, both correct. Canvas + attachment still fails and is split to ADM-6.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Attachments were arriving empty because attach() slept 1500ms and sent regardless while the upload was still in flight. Replaced with _await_uploads(), which blocks on the composer's own upload state and makes a stall fatal rather than silent. Verified live: Gemini now quotes the file's real contents and computes over them correctly. The two-file-inputs theory in the description was wrong and is corrected in the notes.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -671,6 +671,29 @@ do not want to wait. The launch flags stay either way; they cost nothing.
 > rather than Playwright's chromium, a persistent profile with real history,
 > and headed by default.
 
+### Attachments are waited for, not slept on
+
+`attach()` used to sleep a flat 1.5s and then send regardless. Uploads take far
+longer than that — 10–30s even for a 31-byte CSV — so the prompt went out while
+the file was still in flight, Gemini received an **empty** attachment, and the
+worker exited 0. A total failure looked exactly like a correct answer.
+
+It now blocks on the composer's own upload state and makes a stall fatal. Two
+details that are not obvious and cost real debugging time:
+
+- **Scope to `<input-container>`, never `document.body`.** The body contains the
+  conversation sidebar, so a previous chat's *title* can satisfy a naive
+  filename search and pass the check for entirely the wrong reason.
+- **Match the basename stem, not the filename.** The chip renders the type and
+  the stem on separate lines — `CSV`, then `parts` — so the string `parts.csv`
+  never appears in the composer at all.
+
+> [!WARNING]
+> Attachments do not survive `--mode canvas` (ADM-6). In canvas mode no chip and
+> no upload indicator appear, so the upload seems never to start. The worker
+> refuses to send rather than asking about a file that is not there, so the cost
+> is a slow failure, never a wrong answer. Use chat mode with attachments.
+
 ### The model is a profile setting, and it is checked before every prompt
 
 Whatever model the picker shows is stored **in the profile, not the tab**.
@@ -1121,6 +1144,22 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.6.1 (2026-09-21)
+
+**File attachments were arriving empty.** `attach()` slept 1.5s and sent
+regardless, while uploads actually take 10–30s; the prompt went out mid-flight,
+Gemini got an empty file, and the worker exited 0 — so the failure was
+indistinguishable from a good answer. It now waits on the composer's real upload
+state and treats a stall as fatal.
+
+Found during pre-review verification, not by a user. The first diagnosis was
+wrong: Gemini renders two hidden file inputs and I assumed the wrong one was
+being used. It wasn't — the original selector was always correct, and the fix
+built around that theory was reverted.
+
+Attachments still do not work with `--mode canvas` (ADM-6); that combination now
+fails loudly instead of returning a confident answer about an absent file.
 
 ### 1.6.0 (2026-09-21)
 
