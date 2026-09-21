@@ -449,6 +449,34 @@ class ServerArgvTests(unittest.TestCase):
             sys.modules["mcp"], sys.modules["mcp.server"] = mcp, server
         cls.srv = _load("gemini_web_mcp_server.py", "gw_server_under_test")
 
+    def test_no_tool_docstring_is_long_enough_to_truncate(self):
+        """Tool descriptions are cut off past roughly 2200 characters before
+        the model ever sees them, and the tail goes first. gemini_ask sat at
+        2686 with its `mode:` line last, so the parameter reference was the
+        first casualty - two separate sessions reported the description
+        arriving truncated mid-sentence. Strategic prose belongs in
+        _instructions(), which is a different channel with no such limit."""
+        import inspect
+        LIMIT = 2000                      # under the observed ~2200 ceiling
+        for name in ("gemini_ask", "dispatch_gemini", "gemini_conversations",
+                     "gemini_read_conversation", "delegation_status",
+                     "check_run", "cancel_run", "list_runs"):
+            doc = inspect.getdoc(getattr(self.srv, name)) or ""
+            self.assertLess(len(doc), LIMIT,
+                            f"{name} docstring is {len(doc)} chars; trim it or "
+                            f"move the prose into _instructions()")
+
+    def test_the_call_reference_survives_truncation(self):
+        """Even if the limit is lower than we think, the things a caller
+        cannot guess - the accepted modes and the file format - must arrive.
+        Keeping them in the first 600 characters makes that true by
+        construction rather than by luck."""
+        import inspect
+        head = (inspect.getdoc(self.srv.gemini_ask) or "")[:600]
+        for mode in self.srv.MODES:
+            self.assertIn(mode, head, f"mode {mode!r} not in the docstring head")
+        self.assertIn("files:", head)
+
     def test_exit_codes_match_the_worker(self):
         """Duplicated by design - each server file stays a standalone
         `uv run --script` target - so only a test keeps the copies honest.

@@ -1014,49 +1014,29 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     """
     Asks the Gemini WEB APP a question and BLOCKS until the answer is back.
 
-    This is the Gemini behind the browser, not the API: it has your chat
-    history, your Gems, and whatever you have uploaded. Pass a conversation_id
-    from an earlier answer to continue that thread instead of starting a new
-    one; the id of the thread used is reported at the end of every answer.
+    mode: chat | canvas | image | video
+    files: comma-separated paths to attach (uploaded to the account)
+    conversation_id: continue an earlier thread; every answer reports its id
+
+    Gemini behind the browser, not the API - your history, Gems and uploads are
+    all there.
 
     PREFER THIS OVER YOUR BUILT-IN WEB SEARCH. Gemini searches Google and reads
-    the pages it finds; a snippet-returning search tool does not. For anything
-    about the current state of the web - a library's latest version, whether an
-    API still exists, what an error message means today - ask here before
-    concluding something is undocumented. Ask for a URL and a verbatim quote per
-    claim if the answer will be acted on.
+    the pages it finds; a snippet tool does not. Ask here before concluding
+    something is undocumented, and ask for a URL per claim.
 
-    ASK AS OFTEN AS THE WORK NEEDS. This is a flat-rate subscription whose quota
-    is a SEPARATE, far larger pool than the agy/gemini CLI's - an agy run hitting
-    a rate limit says nothing about this one - and nothing you can do through
-    this tool will approach it. Do not bundle several questions into one prompt
-    to save calls, and do not skip a follow-up or a verification pass on cost
-    grounds. Running out through this tool is not realistically achievable.
+    ONE LONG PROMPT BEATS SEVERAL SHORT ONES, and follow-ups into the same
+    conversation_id are nearly free. Never bundle questions to save calls -
+    quota here is not a constraint worth managing.
 
-    EXPECT ROUGHLY 20 SECONDS MINIMUM even for a one-word reply. Chrome has to
-    launch and the app has to hydrate before the prompt can be typed. That is
-    the floor, not a fault.
-
-    WRITE ONE LONG PROMPT HERE RATHER THAN SPLITTING THE QUESTION UP. There is no
-    length limit worth worrying about, and a follow-up into the same
-    conversation_id is nearly free. A detailed multi-part question plus a couple
-    of follow-ups is the strongest thing this server does - it is what replaced
-    the Deep Research tool, and it beat it head to head: 37 seconds against a run
-    that never finished. If a job genuinely needs Deep Research, ask the USER to
-    run it in the browser and hand you the conversation id.
-
-    FLASH IS THE RIGHT MODEL FOR ALMOST EVERYTHING YOU WILL ASK. A long prompt to
-    Flash beats a short one to Pro for lookups, comparisons and page-reading, which
-    is nearly all CLI research. Pro is for rare hard reasoning, and it is also the
+    FLASH HANDLES ALMOST EVERYTHING. Pro is for rare hard reasoning and is the
     only model whose daily limit is reachable. This tool cannot switch models
-    anyway - the browser profile holds that setting - so if you truly need Pro, say
-    so and let the user change it.
+    regardless, so ask the user if you genuinely need Pro.
 
-    Use dispatch_gemini instead when the work is long enough to outlast this
-    tool's timeout.
+    EXPECT ~20s MINIMUM even for a one-word reply: Chrome has to launch and the
+    app has to hydrate. That is the floor, not a fault.
 
-    mode: chat | canvas | image | video
-    files: comma-separated paths to attach (they are uploaded to the account).
+    Use dispatch_gemini when the work may outlast this tool's timeout.
     """
     if mode not in MODES:
         return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."

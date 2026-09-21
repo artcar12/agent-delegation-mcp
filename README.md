@@ -1085,6 +1085,26 @@ claude mcp add opencode-wrapper -s user \
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
 
+### 1.5.2 (2026-09-21)
+
+**`gemini_ask`'s description was being truncated before the model saw the end
+of it.** Tool descriptions are cut off past roughly 2200 characters; that
+docstring had grown to 2686 with its `mode:` line last, so the accepted modes -
+the one thing a caller cannot guess - were the first casualty. Two separate
+sessions independently reported it arriving cut mid-sentence.
+
+It is now 1210 characters with the parameter reference at the top, where
+truncation cannot reach it. Nothing was lost: the quota, Deep Research and
+prompting-caveat paragraphs were duplicates of `_instructions()`, which is a
+separate channel with no such limit. Two tests now guard both the length and
+the position.
+
+Worth knowing generally: plugin text only reaches a NEW session. Both the tool
+schemas and the server instructions are stale in long-lived sessions - measured
+across three sessions, a session from three days earlier was still being served
+1.2.x descriptions after six updates and several restarts. Restarting is not
+enough.
+
 ### 1.5.1 (2026-09-21)
 
 Docs and caller guidance only, no behaviour change. Callers are told not to
