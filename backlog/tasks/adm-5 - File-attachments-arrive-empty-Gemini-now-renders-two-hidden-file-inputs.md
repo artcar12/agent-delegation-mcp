@@ -4,7 +4,7 @@ title: 'File attachments arrive empty: Gemini now renders two hidden file inputs
 status: Done
 assignee: []
 created_date: '2026-09-21 18:33'
-updated_date: '2026-09-21 18:46'
+updated_date: '2026-09-21 19:38'
 labels: []
 dependencies: []
 ordinal: 5000
@@ -48,6 +48,8 @@ Fix: _await_uploads() blocks until the upload finishes and raises EXIT_TIMEOUT i
 - Matches the basename STEM, not the filename. The chip renders type and stem on separate lines ('CSV' then 'parts'), so the string 'parts.csv' never appears in the composer at all. This is why the first attempt reported 'no chip' and refused to send.
 
 Verified live 2026-09-21: 'Quote the first line' returned 'name,qty' plus the full parsed table; a follow-up returned 3 data rows and total qty 15, both correct. Canvas + attachment still fails and is split to ADM-6.
+
+Live re-verification 2026-09-21 after 1.6.2's fail-closed rewrite of _await_uploads: chat-mode ask --file parts.csv (4 lines) returned the verbatim first line 'name,qty' and total qty 15, both correct, in 30.5s end to end on Flash. So the busy signal (Uploading text or a progress indicator inside <input-container>) is being observed in practice; the seen-in-progress requirement did not block a real upload.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
