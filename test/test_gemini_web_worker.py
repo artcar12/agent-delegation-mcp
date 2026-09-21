@@ -387,6 +387,53 @@ class ThrottleTests(unittest.TestCase):
         self.assertNotIn(gw.EXIT_TRANSIENT, taken)
 
 
+class ModelPickerTests(unittest.TestCase):
+    """The picker's choice lives in the PROFILE, not the tab - verified by
+    hand: switch model, close the tab, open a new one, still switched. So one
+    stray change silently re-prices every later run, which is what happened
+    before this existed: the picker sat on Pro for a whole session of calls."""
+
+    def test_the_version_and_tagline_are_stripped(self):
+        # Rows read "3.8 Flash\nAll-around help"; Google bumps the number.
+        self.assertEqual(gw.normalize_model_label("3.8 Flash\nAll-around help"),
+                         "flash")
+        self.assertEqual(gw.normalize_model_label("3.5 Flash-Lite\nFastest"),
+                         "flash-lite")
+        self.assertEqual(gw.normalize_model_label("3.1 Pro\nAdvanced reasoning"),
+                         "pro")
+        self.assertEqual(
+            gw.normalize_model_label("Extended thinking\nComplex problems"),
+            "extended thinking")
+        self.assertEqual(gw.normalize_model_label(""), "")
+
+    def test_flash_does_not_match_flash_lite(self):
+        """The trap this whole design exists to avoid. A substring match on
+        'flash' selects Flash-Lite - it is listed first - and every later
+        answer quietly comes from a weaker model with nothing to show for it."""
+        self.assertNotEqual(gw.normalize_model_label("3.5 Flash-Lite\nx"),
+                            gw.resolve_model("flash"))
+        self.assertEqual(gw.normalize_model_label("3.8 Flash\nx"),
+                         gw.resolve_model("flash"))
+        self.assertEqual(gw.normalize_model_label("3.5 Flash-Lite\nx"),
+                         gw.resolve_model("flash-lite"))
+
+    def test_aliases_resolve(self):
+        self.assertEqual(gw.resolve_model("lite"), "flash-lite")
+        self.assertEqual(gw.resolve_model("PRO"), "pro")
+        self.assertEqual(gw.resolve_model("thinking"), "extended thinking")
+
+    def test_an_unknown_model_is_a_usage_error_not_a_guess(self):
+        with self.assertRaises(gw.GeminiWebError) as cm:
+            gw.resolve_model("turbo")
+        self.assertEqual(cm.exception.code, gw.EXIT_USAGE)
+
+    def test_the_wrong_model_code_is_distinct(self):
+        taken = (gw.EXIT_OK, gw.EXIT_USAGE, gw.EXIT_NOT_LOGGED_IN,
+                 gw.EXIT_SELECTOR, gw.EXIT_TIMEOUT, gw.EXIT_THROTTLED,
+                 gw.EXIT_TRANSIENT)
+        self.assertNotIn(gw.EXIT_WRONG_MODEL, taken)
+
+
 class MetaLineTests(unittest.TestCase):
     """The MCP server only ever sees the worker's stdout as a file, so this
     line is the whole channel for the conversation id."""
@@ -426,6 +473,13 @@ class ConversationIdTests(unittest.TestCase):
 class WorkerCliTests(unittest.TestCase):
     def parse(self, argv):
         return gw.build_parser().parse_args(argv)
+
+    def test_ask_defaults_to_expecting_flash(self):
+        """Flash by default is the point: Pro is the only model whose daily
+        limit is reachable, so drifting onto it should cost a clear error
+        rather than a quietly more expensive run."""
+        a = gw.build_parser().parse_args(["ask", "--prompt", "x"])
+        self.assertEqual(a.expect_model, "flash")
 
     def test_ask_defaults_to_chat(self):
         args = self.parse(["ask", "--prompt", "hi"])

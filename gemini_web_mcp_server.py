@@ -111,6 +111,7 @@ MODES = ("chat", "canvas", "image", "video")
 EXIT_NOT_LOGGED_IN = 3
 EXIT_THROTTLED = 6
 EXIT_TRANSIENT = 7
+EXIT_WRONG_MODEL = 8
 
 # MUST stay below TIMEOUT_SECONDS: the worker's own deadline is the one that
 # should hit, because it exits cleanly with whatever the page had rendered
@@ -606,6 +607,13 @@ def _verdict_note(record: dict) -> str:
                 f"retry in a loop, and do not route around it by calling the tool "
                 f"harder. Tell the user; the live numbers are in the web app under "
                 f"Settings -> Usage limits. The message itself is in stderr below.")
+    if code == EXIT_WRONG_MODEL:
+        return (f"Refused before sending: the browser's model picker was not on "
+                f"the expected model, so nothing was asked and no quota was "
+                f"spent. The picker is a PROFILE setting that persists across "
+                f"tabs and runs, so someone changed it and it stayed changed. "
+                f"This needs a human at the browser, or "
+                f"`uv run --script gemini_web.py model --set flash`.")
     if code == EXIT_TRANSIENT:
         return (f"Gemini glitched rather than answering, after {elapsed}s - not a "
                 f"limit. ONE retry is reasonable; if a second fails, stop and say "
@@ -779,6 +787,14 @@ def _instructions() -> str:
         "as though it were the answer. If a short, odd, system-sounding reply ever "
         "does reach you as content, treat it as a limit notice rather than a "
         "finding - the pattern list is good, not exhaustive.",
+        "THE MODEL IS CHECKED BEFORE EVERY PROMPT, and a mismatch refuses the "
+        "call (exit 8) without sending anything. The picker is a PROFILE "
+        "setting - switch it once in the browser and it persists across tabs, "
+        "sessions and days - so a change made long ago silently applies to "
+        "every call until someone notices. It sat on Pro for an entire session "
+        "of calls before this check existed, which is exactly the quiet, "
+        "expensive drift it now prevents. Flash is expected by default. If you "
+        "get exit 8, say so and let the user choose; do not route around it.",
         "DO NOT TEST THIS TOOL WITH A FIXED CANARY STRING. Checking that the "
         "browser still works is reasonable; sending 'reply with exactly: pong' "
         "fifty times is not. An identical one-word prompt repeated against one "
@@ -1071,6 +1087,13 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
                     "soft limit becomes a hard one. Say so plainly and let the user "
                     "decide; Settings -> Usage limits in the web app has the real "
                     "numbers.")
+        elif rc == EXIT_WRONG_MODEL:
+            hint = ("\n\nNothing was sent and no quota was spent - this is a "
+                    "guard, not a failure. The model picker is a profile "
+                    "setting that persists across runs, so it will keep "
+                    "refusing until someone changes it back. Tell the user and "
+                    "let them decide; do NOT retry, and do NOT work around it "
+                    "by accepting whatever model happens to be selected.")
         elif rc == EXIT_TRANSIENT:
             hint = ("\n\nGemini glitched rather than hitting a limit. ONE retry is "
                     "reasonable here. If a second fails, stop and report it instead "

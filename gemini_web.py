@@ -59,6 +59,9 @@ EXIT_TIMEOUT = 5
 # throttle is how a soft limit becomes a hard one.
 EXIT_THROTTLED = 6
 EXIT_TRANSIENT = 7
+# The picker was not on the model the caller expected. Raised BEFORE the prompt
+# is typed, so a surprise Pro run costs nothing rather than a Pro request.
+EXIT_WRONG_MODEL = 8
 
 # The SPA takes ~8s to hydrate a deep-linked conversation on a cold load; 30s
 # is slack for a slow morning, not an expectation.
@@ -97,6 +100,7 @@ SELECTORS = {
     # though the element is there. This button always carries it, as
     # "Open mode picker, currently Flash".
     "mode_picker": '[aria-label^="Open mode picker"]',
+    "mode_item": '[role="menuitem"]',
     # Signed-out marker. Gemini serves a fully working composer to anonymous
     # visitors, so the editor appearing proves nothing -- the only honest
     # signal is whether the app is still offering to sign you in.
@@ -112,6 +116,38 @@ TOOL_LABELS = {
 }
 
 CONVERSATION_ID_RE = re.compile(r"/app/([0-9a-f]{6,})")
+
+# Picker rows read "3.8 Flash\nAll-around help" - a version, a name, then a
+# tagline. Only the name is stable; Google bumps the number whenever it likes.
+_MODEL_VERSION_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
+
+# Matching is EXACT on the normalised name, never substring: "Flash-Lite"
+# contains "Flash", so `"flash" in label` silently selects the wrong, weaker
+# model and nothing downstream would notice.
+MODEL_ALIASES = {
+    "flash": "flash",
+    "flash-lite": "flash-lite",
+    "lite": "flash-lite",
+    "pro": "pro",
+    "thinking": "extended thinking",
+    "extended": "extended thinking",
+}
+
+
+def normalize_model_label(text: str) -> str:
+    """"3.8 Flash\nAll-around help" -> "flash". Version and tagline dropped."""
+    first = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return _MODEL_VERSION_RE.sub("", first).strip().lower()
+
+
+def resolve_model(name: str) -> str:
+    """A user-facing name -> the normalised label to match in the picker."""
+    key = (name or "").strip().lower()
+    if key not in MODEL_ALIASES:
+        raise GeminiWebError(
+            f"unknown model {name!r}; choose from "
+            f"{', '.join(sorted(MODEL_ALIASES))}", EXIT_USAGE)
+    return MODEL_ALIASES[key]
 
 # Gemini reports being over quota, or having glitched, as an ORDINARY response
 # turn: it gets an action row, its text stops growing, and every completion
@@ -1098,6 +1134,43 @@ class Session:
         except Exception:
             return ""
 
+    def select_model(self, name: str) -> str:
+        """Switch the picker to `name`. Returns the label now showing.
+
+        The choice lives in the profile, not the tab: switching once persists
+        across new tabs and later runs. That is convenient and it is also the
+        hazard -- a stray change silently re-prices every future call, which is
+        why ask() checks the picker rather than trusting it.
+        """
+        want = resolve_model(name)
+        if normalize_model_label(self.current_model()) == want:
+            return self.current_model()
+
+        self._tap(SELECTORS["mode_picker"], timeout=8_000)
+        self.page.wait_for_timeout(900 + _ms(CLICK_PAUSE_MS))
+        items = self.page.locator(SELECTORS["mode_item"])
+        seen = []
+        for i in range(items.count()):
+            row = items.nth(i)
+            label = normalize_model_label(row.inner_text())
+            seen.append(label)
+            if label == want:            # exact: "flash" must not take "flash-lite"
+                self._tap(row)
+                self.page.wait_for_timeout(1_200 + _ms(CLICK_PAUSE_MS))
+                now = self.current_model()
+                if normalize_model_label(now) != want:
+                    raise GeminiWebError(
+                        f"clicked {want!r} but the picker still reads {now!r}",
+                        EXIT_SELECTOR)
+                return now
+        try:
+            self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        raise GeminiWebError(
+            f"no model {want!r} in the picker. Available: "
+            f"{', '.join(x for x in seen if x)}", EXIT_SELECTOR)
+
 
 # --------------------------------------------------------------------------
 # Commands
@@ -1209,11 +1282,26 @@ def cmd_ask(args) -> int:
             s.select_tool(args.mode)
         if args.file:
             s.attach(args.file)
+
+        # Read the picker BEFORE typing. The setting persists in the profile,
+        # so a change made in the browser days ago still applies here, and the
+        # only symptom is a quietly more expensive run.
+        model = s.current_model()
+        if args.expect_model != "any":
+            want = resolve_model(args.expect_model)
+            if normalize_model_label(model) != want:
+                raise GeminiWebError(
+                    f"picker is on {model or '(unreadable)'!r}, expected "
+                    f"{want!r}. Nothing was sent. Switch it with "
+                    f"`gemini_web.py model --set {args.expect_model}`, or pass "
+                    f"--expect-model {normalize_model_label(model) or 'any'} "
+                    f"to accept it.",
+                    EXIT_WRONG_MODEL,
+                )
         prior = s.send(args.prompt)
         s.wait_for_response(prior, args.timeout)
         markdown, how = s.last_response()
         cid = conversation_id_from_url(s.page.url)
-        model = s.current_model()
 
     # Raised outside the `with` so Chrome has already shut down cleanly.
     kind, pat = classify_response(markdown, args.prompt)
@@ -1244,6 +1332,15 @@ def cmd_ask(args) -> int:
     _emit_meta(conversation_id=cid, mode=args.mode, extraction=how, model=model,
                elapsed_seconds=round(time.monotonic() - started, 1),
                chars=len(markdown), out=args.out or "")
+    return EXIT_OK
+
+
+def cmd_model(args) -> int:
+    with Session() as s:
+        s.open()
+        now = s.select_model(args.set) if args.set else s.current_model()
+    print(now or "(unreadable)")
+    _emit_meta(model=now, changed=bool(args.set))
     return EXIT_OK
 
 
@@ -1292,7 +1389,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="attach a file; repeatable")
     ak.add_argument("--out", default="", help="also write the markdown here")
     ak.add_argument("--timeout", type=float, default=300.0)
+    ak.add_argument("--expect-model",
+                    default=os.environ.get("GEMINI_WEB_EXPECT_MODEL", "flash"),
+                    help="refuse to send unless the picker is on this model "
+                         "('any' to skip the check). Default flash.")
     ak.set_defaults(func=cmd_ask)
+
+    md = sub.add_parser("model", help="show the picker's model, or switch it")
+    md.add_argument("--set", default="",
+                    help=f"switch to one of: {', '.join(sorted(MODEL_ALIASES))}")
+    md.set_defaults(func=cmd_model)
 
     rd = sub.add_parser("read", help="dump a conversation as markdown")
     rd.add_argument("--conversation", required=True)

@@ -139,7 +139,7 @@ which is why the tools take a `model` argument rather than hard-coding one.
    single dependency, and there is no venv to build or maintain because of it.
 
    Check with `command -v uv`, and check it again after upgrading uv, because
-   this failure is silent in the worst way. `.mcp.json` invokes `uv` by name; if
+   this failure is silent in the worst way. The plugin invokes `uv` by name; if
    the name does not resolve, the server never starts and **the tools simply do
    not appear in Claude** — no error in the session, nothing to notice. A
    `brew upgrade uv` that leaves the keg unlinked produces exactly this (fix:
@@ -200,10 +200,15 @@ out as `.`, and both servers die instantly with `Connection closed` because the
 path is resolved against whatever project is open. Version 1.1.0 shipped with
 that form and was broken for every plugin install; see the release notes.
 
-The root `.mcp.json` is a separate thing: it exists so that opening *this* repo
-as a project also loads the servers, and it uses plain `./` paths. When
-`plugin.json` declares `mcpServers` inline, the root `.mcp.json` is not loaded
-by the plugin, so the two files no longer have to serve both purposes.
+`.claude-plugin/plugin.json` is the only place the servers are registered. This
+repo used to carry a root `.mcp.json` with plain `./` paths so that opening it as
+a project loaded the working-tree servers too; that file is gone, and with the
+plugin installed the servers always run from the installed copy. To exercise
+uncommitted changes, point Claude at the working tree by hand:
+
+```bash
+claude mcp add agy-dev -- uv run --script ./agy_mcp_server.py
+```
 
 That PEP 723 block replaces a venv this project used to build and pin by hand,
 and the reason it was pinned is worth keeping in mind if you register these
@@ -282,9 +287,9 @@ claude plugin tag . --push        # creates agent-delegation--v<version>
 
 ## 3. Configuration
 
-Everything is an environment variable. Set it in the `env` block of an
-`.mcp.json` entry, with `-e` on `claude mcp add`, or in the environment Claude
-Code itself inherits. All are optional.
+Everything is an environment variable. Set it with `-e` on `claude mcp add`, in
+the `env` block of a server entry if you register these some other way, or in the
+environment Claude Code itself inherits. All are optional.
 
 | Variable | Applies to | Default | Why you would change it |
 |---|---|---|---|
@@ -306,6 +311,7 @@ Code itself inherits. All are optional.
 | `AGENT_MCP_RUN_RETENTION_DAYS` | all three | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
 | `GEMINI_WEB_PROFILE` | gemini-web | `~/.agent-delegation-mcp/gemini-profile` | The Chrome user-data-dir the worker drives. Never point this at your daily profile: Chrome refuses to share one with a running instance. |
 | `GEMINI_WEB_CHROME` | gemini-web | the system Chrome | Only used by `login`, which needs a Chrome that Playwright is *not* driving. |
+| `GEMINI_WEB_EXPECT_MODEL` | gemini-web | `flash` | The model `ask` requires before it will send anything; a mismatch exits 8 having sent nothing. `any` skips the check. The picker is a profile setting that persists across runs, so this is what stops a change made days ago from quietly re-pricing every call. |
 | `GEMINI_WEB_NO_PACING` | gemini-web | unset | Set to `1` to drop the interaction delays while debugging. The anti-automation launch flags stay on regardless. |
 | `GEMINI_WEB_HEADLESS` | gemini-web | off | `1` runs the automation without a window. Off by default: headless is likelier to trip Google's bot heuristics, and the clipboard extraction path needs a focused window. |
 | `GEMINI_WEB_WORKER` | gemini-web | `gemini_web.py` beside the server | Point the server at a worker somewhere else. |
@@ -664,6 +670,37 @@ do not want to wait. The launch flags stay either way; they cost nothing.
 > protections were already in place before any of this: a stock Chrome build
 > rather than Playwright's chromium, a persistent profile with real history,
 > and headed by default.
+
+### The model is a profile setting, and it is checked before every prompt
+
+Whatever model the picker shows is stored **in the profile, not the tab**.
+Switch it once and it persists across new tabs, later runs and later days. That
+is convenient and it is the hazard: a change made at any point silently applies
+to every call afterwards, and the only symptom is a quietly more expensive run.
+
+This is not hypothetical. The picker sat on Pro for a whole session of calls
+before anyone noticed, and Pro is the one model whose daily limit is reachable.
+
+So `ask` reads the picker **before typing** and refuses on a mismatch:
+
+```bash
+uv run --script gemini_web.py model                 # what is it on?
+uv run --script gemini_web.py model --set flash     # switch it
+uv run --script gemini_web.py ask --expect-model any --prompt '...'   # opt out
+```
+
+A refusal exits **8**, having sent nothing and spent no quota. The default
+expectation is Flash; `GEMINI_WEB_EXPECT_MODEL` changes it.
+
+> [!NOTE]
+> Matching is exact on the normalised name, never a substring. The picker lists
+> `3.5 Flash-Lite` *above* `3.8 Flash`, so `"flash" in label` selects Flash-Lite
+> — a weaker model, chosen silently, with nothing downstream to reveal it. The
+> version prefix is stripped because Google bumps it at will.
+
+The MCP tools deliberately expose no way to switch models. An agent that could
+escalate itself to Pro would defeat the point of the check; changing the model
+stays a human decision, made either in the browser or with the CLI above.
 
 ### Do not smoke-test it with the same string every time
 
@@ -1036,7 +1073,7 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Returns a plan, edits nothing | `"default_agent": "plan"` is read-only | `--agent build` |
 | `timeout waiting for response` after ~5 minutes | agy's print-mode default wait, not the subprocess timeout | `--print-timeout 60m`; check `git log` before believing the error |
 | Tools missing from Claude entirely | a hand-built venv's `python` symlink followed a system Python upgrade | let `uv run --script` resolve the interpreter, as the plugin does |
-| Tools missing, both servers `Connection closed` on every install | `${CLAUDE_PLUGIN_ROOT:-.}` in the plugin config; Claude Code only substitutes the exact `${CLAUDE_PLUGIN_ROOT}` token, so the path became `./…py` relative to the open project | plain `${CLAUDE_PLUGIN_ROOT}` in `plugin.json`; the root `.mcp.json` uses `./` and serves in-repo use only |
+| Tools missing, both servers `Connection closed` on every install | `${CLAUDE_PLUGIN_ROOT:-.}` in the plugin config; Claude Code only substitutes the exact `${CLAUDE_PLUGIN_ROOT}` token, so the path became `./…py` relative to the open project | plain `${CLAUDE_PLUGIN_ROOT}` in `plugin.json` |
 | Tool reports "CLI not found" after a node upgrade | nvm path carries the node version | set `OPENCODE_BIN` to a stable symlink |
 | Edits to a `.py` have no effect | the server process holds the old code | `/reload-plugins`, or `/mcp reconnect` |
 | Model id rejected | defaults go stale, or the model is region-gated | `agy models` / `opencode models` |
@@ -1084,6 +1121,25 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.6.0 (2026-09-21)
+
+**The model picker is now checked before every prompt, and can be set from the
+CLI.** The picker's choice lives in the profile, not the tab, so it persists
+across tabs, runs and days — and it had been sitting on Pro for a whole session
+of calls, unnoticed, which is the expensive drift this closes. Pro is the only
+model whose daily limit is reachable.
+
+`ask` now reads the picker before typing and exits **8** on a mismatch, having
+sent nothing. Default expectation is Flash; `--expect-model any` or
+`GEMINI_WEB_EXPECT_MODEL` overrides it. New `model` subcommand reads or sets it.
+
+Matching is exact on the normalised name: the picker lists `3.5 Flash-Lite`
+above `3.8 Flash`, so a substring match would silently select the weaker model.
+The version prefix is stripped, since Google bumps it freely.
+
+The MCP tools still cannot switch models, on purpose — an agent able to escalate
+itself to Pro would defeat the check.
 
 ### 1.5.3 (2026-09-21)
 
