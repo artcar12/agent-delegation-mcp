@@ -978,6 +978,17 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
 _browser_lock = threading.Lock()
 
 
+def _refuse_canvas_files(mode: str, files: str) -> str:
+    """Attachments never upload in canvas mode (worker ADM-6): no chip, no
+    progress, and Gemini answers about an empty file. The worker refuses the
+    pair too; refusing here as well saves the Chrome launch."""
+    if mode == "canvas" and files.strip():
+        return ("Error: attachments do not survive mode=canvas - the upload "
+                "never starts and Gemini answers about an empty file. Nothing "
+                "was sent. Use mode=chat for the file.")
+    return ""
+
+
 def _busy_note() -> str:
     """Non-empty when something already holds the browser."""
     live = _live_runs(CLI_LABEL)
@@ -1056,6 +1067,8 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     """
     if mode not in MODES:
         return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
+    if refused := _refuse_canvas_files(mode, files):
+        return refused
     busy = _busy_note()
     if busy:
         return busy
@@ -1192,6 +1205,8 @@ def dispatch_gemini(prompt: str, conversation_id: str = "", mode: str = DEFAULT_
     """
     if mode not in MODES:
         return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
+    if refused := _refuse_canvas_files(mode, files):
+        return refused
 
     args = ["ask", "--prompt", prompt, "--timeout", str(WORKER_TIMEOUT)]
     if conversation_id:

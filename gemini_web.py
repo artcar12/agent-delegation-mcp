@@ -392,11 +392,36 @@ def _upload_progress(snapshot: dict, baseline: dict,
         return {l.strip().lower() for l in snap.get("text", "").splitlines() if l.strip()}
 
     fresh = lines(snapshot) - lines(baseline)
-    busy = (re.search(r"uploading", snapshot.get("text", ""), re.I) is not None
+    # A whole word, so a file called uploading_errors.log does not read as an
+    # upload that never ends.
+    busy = (re.search(r"\buploading\b", snapshot.get("text", ""), re.I) is not None
             or snapshot.get("bars", 0) > baseline.get("bars", 0))
     missing = [stem for stem, filename in names
-               if not any(stem.lower() in l or filename.lower() in l for l in fresh)]
+               if not any(_chip_names(l, stem, filename) for l in fresh)]
     return busy, missing
+
+
+_ELLIPSIS_RE = re.compile(r"\u2026|\.\.\.")
+
+
+def _chip_names(line: str, stem: str, filename: str) -> bool:
+    """Does one composer line name this attachment?
+
+    Directly, or as an ellipsized rendering of it: the chip truncates long
+    names ("quarterly_revenue_breakd…" or "quarterly_re…_v3"), so the visible
+    head, and tail if any, are matched against the ends of the stem instead.
+    A head under three characters is not evidence of anything.
+    """
+    line, stem, filename = line.lower(), stem.lower(), filename.lower()
+    if stem in line or filename in line:
+        return True
+    if not _ELLIPSIS_RE.search(line):
+        return False
+    head, tail = (part.strip() for part in _ELLIPSIS_RE.split(line, 1))
+    for name in (stem, filename):
+        if len(head) >= 3 and name.startswith(head) and name.endswith(tail):
+            return True
+    return False
 
 
 class GeminiWebError(Exception):
@@ -1060,8 +1085,7 @@ class Session:
                     f"attachment never finished uploading after "
                     f"{self.UPLOAD_SETTLE_MS // 1000}s ({why}). NOTHING WAS "
                     f"SENT - asking about a file that did not arrive is how "
-                    f"this failed silently before. Note that attachments do "
-                    f"not currently survive --mode canvas; use chat.",
+                    f"this failed silently before.",
                     EXIT_TIMEOUT)
             # Short ticks: the busy signal has to be caught while it is up.
             self.page.wait_for_timeout(250 + _ms((0, 150)))
@@ -1377,6 +1401,16 @@ def cmd_status(args) -> int:
 
 def cmd_ask(args) -> int:
     started = time.monotonic()
+    if args.file and args.mode == "canvas":
+        # Verified 2026-09-21 (ADM-6): in canvas mode no chip and no upload
+        # indicator ever appear, whichever order the tool and the file are
+        # chosen in, and Gemini answers about an empty file. Refusing here
+        # costs nothing; finding out via the 60s upload timeout cost a Chrome
+        # launch and a minute per attempt.
+        raise GeminiWebError(
+            "attachments do not survive --mode canvas: the upload never "
+            "starts and Gemini answers about an empty file. Nothing was sent. "
+            "Use --mode chat for the file.", EXIT_USAGE)
     with Session() as s:
         s.open(args.conversation, expect_history=bool(args.conversation))
         if args.mode != "chat":

@@ -707,9 +707,9 @@ eats most of a minute.
 
 > [!WARNING]
 > Attachments do not survive `--mode canvas` (ADM-6). In canvas mode no chip and
-> no upload indicator appear, so the upload seems never to start. The worker
-> refuses to send rather than asking about a file that is not there, so the cost
-> is a slow failure, never a wrong answer. Use chat mode with attachments.
+> no upload indicator appear, so the upload never starts. The combination is
+> refused up front, by the worker and by both server tools, before a browser
+> opens. Use chat mode with attachments.
 
 ### The model is a profile setting, and it is checked before every prompt
 
@@ -1161,6 +1161,34 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.6.2 (2026-09-21)
+
+**The upload wait now fails closed.** 1.6.1's check held the send back only
+while the literal `Uploading` string was on screen, and the chip appears ~2s
+before the bytes land. A UI in another language, or a renamed indicator, would
+have sent an empty attachment again with exit 0. The wait now requires the
+upload to have been *seen in progress* before "chip present" counts as done,
+reads progress indicators as well as the text, and refuses to send if it never
+saw either. A chip also only counts in text that was not already in the
+composer, so a file called `gemini.md` cannot pass against the placeholder.
+
+**Two things you may notice:**
+
+- `--timeout` is now a budget for the whole ask, launch and uploads included,
+  not just the answer. The MCP server's kill deadline sits a fixed 20s above
+  it, and an upload can take a minute, so this is what keeps the worker's own
+  deadline firing first. Long uploads plus long answers may need a bigger
+  `--timeout` or `timeout_seconds` than before.
+- `--mode canvas` with `--file` is refused immediately with a clear message,
+  in the worker and in both server tools. It used to time out after 60s.
+  (ADM-6, closed.)
+
+Also: long filenames truncated in the chip no longer time out, and a filename
+containing the word "uploading" no longer reads as an upload that never ends.
+Not re-verified against the live UI; if Gemini ever finishes an upload without
+showing either an `Uploading` label or a progress bar, attachments will fail
+loudly after 60s rather than send. That is the intended direction.
 
 ### 1.6.1 (2026-09-21)
 

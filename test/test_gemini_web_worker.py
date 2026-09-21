@@ -312,6 +312,30 @@ class AttachmentWaitTests(unittest.TestCase):
         self.assertFalse(busy)
         self.assertEqual(missing, [])
 
+    def test_a_truncated_chip_still_names_the_file(self):
+        """Long names are ellipsized in the chip, at the end or in the
+        middle; a full-stem match would time out on a finished upload."""
+        stem = "quarterly_revenue_breakdown_by_region_2026_final_v3"
+        names = [gw._attachment_names(stem + ".csv")]
+        for shown in ("quarterly_revenue_breakd\u2026", "quarterly_re\u2026_v3",
+                      "quarterly_revenue...", stem):
+            with self.subTest(shown=shown):
+                _, missing = gw._upload_progress(
+                    self.snap("CSV", shown), self.AT_REST, names)
+                self.assertEqual(missing, [])
+        for shown in ("qu\u2026", "annual_re\u2026_v3", "\u2026"):
+            with self.subTest(shown=shown):
+                _, missing = gw._upload_progress(
+                    self.snap("CSV", shown), self.AT_REST, names)
+                self.assertEqual(missing, [stem])
+
+    def test_a_stem_containing_uploading_is_not_a_busy_signal(self):
+        busy, missing = gw._upload_progress(
+            self.snap("LOG", "uploading_errors"), self.AT_REST,
+            [gw._attachment_names("uploading_errors.log")])
+        self.assertFalse(busy)
+        self.assertEqual(missing, [])
+
     def test_busy_is_read_from_text_or_a_new_progress_indicator(self):
         names = [gw._attachment_names("parts.csv")]
         self.assertTrue(gw._upload_progress(
@@ -582,6 +606,16 @@ class WorkerCliTests(unittest.TestCase):
                 self.assertEqual(self.parse(["ask", "--prompt", "x",
                                              "--mode", mode]).mode, mode)
 
+    def test_canvas_with_a_file_is_refused_before_a_browser_opens(self):
+        """ADM-6: the upload never starts in canvas mode. Finding that out
+        through the 60s upload timeout cost a Chrome launch per attempt."""
+        args = self.parse(["ask", "--prompt", "x", "--mode", "canvas",
+                           "--file", "parts.csv"])
+        with self.assertRaises(gw.GeminiWebError) as cm:
+            gw.cmd_ask(args)
+        self.assertEqual(cm.exception.code, gw.EXIT_USAGE)
+        self.assertIn("canvas", str(cm.exception))
+
     def test_files_are_repeatable(self):
         args = self.parse(["ask", "--prompt", "x", "--file", "a", "--file", "b"])
         self.assertEqual(args.file, ["a", "b"])
@@ -676,6 +710,13 @@ class ServerArgvTests(unittest.TestCase):
         self.assertEqual(self.srv._meta_of(out),
                          gw.parse_meta_line(out))
         self.assertEqual(self.srv._strip_meta(out), "answer")
+
+    def test_canvas_with_files_is_refused_before_a_browser_opens(self):
+        for fn in (self.srv.gemini_ask, self.srv.dispatch_gemini):
+            with self.subTest(tool=fn.__name__):
+                out = fn("x", mode="canvas", files="parts.csv")
+                self.assertIn("mode=canvas", out)
+                self.assertIn("Nothing was sent", out)
 
     def test_an_unknown_mode_is_refused_before_a_browser_opens(self):
         self.assertIn("mode must be one of",
