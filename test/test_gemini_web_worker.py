@@ -280,6 +280,89 @@ class PacingTests(unittest.TestCase):
         self.assertIn("STEALTH_IGNORE", src)
 
 
+class AttachmentWaitTests(unittest.TestCase):
+    """The upload wait is the fix for attachments arriving EMPTY with exit 0.
+    Its two rules - the upload must be seen in progress, and a chip counts only
+    if it is new text - are exactly the ones a live-verified rewrite lost once,
+    so they are pinned here against a scripted composer."""
+
+    AT_REST = {"text": "Ask Gemini\nUpload & tools\n3.8 Flash", "bars": 0}
+
+    def snap(self, *lines, bars=0):
+        return {"text": "\n".join((*self.AT_REST["text"].split("\n"), *lines)),
+                "bars": bars}
+
+    def test_names_are_stem_and_filename(self):
+        self.assertEqual(gw._attachment_names("~/data/parts.csv"),
+                         ("parts", "parts.csv"))
+        self.assertEqual(gw._attachment_names(".env"), (".env", ".env"))
+
+    def test_static_composer_text_cannot_stand_in_for_a_chip(self):
+        """A file called gemini.md must not pass against the 'Ask Gemini'
+        placeholder before its chip exists."""
+        busy, missing = gw._upload_progress(
+            self.AT_REST, self.AT_REST, [gw._attachment_names("gemini.md")])
+        self.assertFalse(busy)
+        self.assertEqual(missing, ["gemini"])
+
+    def test_a_new_chip_line_satisfies_the_stem(self):
+        busy, missing = gw._upload_progress(
+            self.snap("CSV", "parts"), self.AT_REST,
+            [gw._attachment_names("/tmp/parts.csv")])
+        self.assertFalse(busy)
+        self.assertEqual(missing, [])
+
+    def test_busy_is_read_from_text_or_a_new_progress_indicator(self):
+        names = [gw._attachment_names("parts.csv")]
+        self.assertTrue(gw._upload_progress(
+            self.snap("Uploading…", "parts"), self.AT_REST, names)[0])
+        self.assertTrue(gw._upload_progress(
+            self.snap("parts", bars=1), self.AT_REST, names)[0])
+        self.assertFalse(gw._upload_progress(
+            self.snap("parts"), self.AT_REST, names)[0])
+
+    def _run(self, states):
+        """Drive _await_uploads over a scripted sequence of composer snapshots;
+        the last one repeats until the (very short) deadline."""
+        class FakeKeyboard:
+            def press(self, key): pass
+
+        class FakePage:
+            def __init__(self):
+                self.keyboard = FakeKeyboard()
+                self.i = 0
+            def evaluate(self, js, *args):
+                st = states[min(self.i, len(states) - 1)]
+                self.i += 1
+                return st
+            def wait_for_timeout(self, ms): pass
+
+        session = gw.Session.__new__(gw.Session)
+        session.page = FakePage()
+        session.UPLOAD_SETTLE_MS = 200
+        try:
+            gw.PACING = False
+            session._await_uploads(["parts.csv"], self.AT_REST)
+        finally:
+            gw.PACING = True
+
+    def test_seen_busy_then_settled_returns(self):
+        self._run([self.snap("Uploading", "parts"), self.snap("CSV", "parts")])
+
+    def test_a_chip_with_no_busy_signal_ever_refuses_to_send(self):
+        """The fail-closed rule: chip present, upload never observed. Sending
+        here is the original empty-attachment bug on a non-English UI."""
+        with self.assertRaises(gw.GeminiWebError) as cm:
+            self._run([self.snap("CSV", "parts")])
+        self.assertEqual(cm.exception.code, gw.EXIT_TIMEOUT)
+        self.assertIn("no upload indicator was ever seen", str(cm.exception))
+
+    def test_still_uploading_at_the_deadline_refuses_to_send(self):
+        with self.assertRaises(gw.GeminiWebError) as cm:
+            self._run([self.snap("Uploading", "parts")])
+        self.assertIn("still uploading", str(cm.exception))
+
+
 class SidebarTests(unittest.TestCase):
     """The history list is behind a collapsed sidebar.
 

@@ -372,6 +372,33 @@ def google_cookie_count(profile_dir: str = "") -> int:
             pass
 
 
+def _attachment_names(path: str) -> tuple[str, str]:
+    """(stem, filename) as the composer might render them for one attachment."""
+    name = os.path.basename(os.path.expanduser(path))
+    return os.path.splitext(name)[0], name
+
+
+def _upload_progress(snapshot: dict, baseline: dict,
+                     names: list[tuple[str, str]]) -> tuple[bool, list[str]]:
+    """Read one composer snapshot against the pre-upload baseline.
+
+    Returns (busy, missing). `busy` is true while the app shows an upload in
+    progress, by either its "Uploading" text or a progress indicator that was
+    not there before the upload. `missing` lists the attachments with no chip
+    yet, judged only on lines that did not exist in the baseline, so static
+    composer text cannot stand in for a chip.
+    """
+    def lines(snap):
+        return {l.strip().lower() for l in snap.get("text", "").splitlines() if l.strip()}
+
+    fresh = lines(snapshot) - lines(baseline)
+    busy = (re.search(r"uploading", snapshot.get("text", ""), re.I) is not None
+            or snapshot.get("bars", 0) > baseline.get("bars", 0))
+    missing = [stem for stem, filename in names
+               if not any(stem.lower() in l or filename.lower() in l for l in fresh)]
+    return busy, missing
+
+
 class GeminiWebError(Exception):
     """Carries the exit code the CLI should die with."""
 
@@ -954,6 +981,9 @@ class Session:
         missing = [p for p in paths if not os.path.isfile(os.path.expanduser(p))]
         if missing:
             raise GeminiWebError(f"no such file(s): {', '.join(missing)}", EXIT_USAGE)
+        # Snapshot the composer BEFORE anything changes, so the upload check
+        # below only credits text that appeared because of the upload.
+        baseline = self._composer_snapshot()
         # The file input only exists once the drawer has rendered.
         self._tap(SELECTORS["tools_button"])
         self._require("file_input", 10_000, state="attached")
@@ -961,13 +991,29 @@ class Session:
             SELECTORS["file_input"], [os.path.expanduser(p) for p in paths]
         )
         self.page.keyboard.press("Escape")
-        self._await_uploads(paths)
+        self._await_uploads(paths, baseline)
 
     # Uploads of even a 31-byte file take far longer than the 1.5s this code
     # used to sleep. 60s is slack for a real document, not an expectation.
     UPLOAD_SETTLE_MS = 60_000
 
-    def _await_uploads(self, paths: list[str]) -> None:
+    # What the upload check reads from the composer. Scoped to
+    # <input-container>, not document.body: the body includes the conversation
+    # sidebar, so a previous chat's TITLE can satisfy a naive filename search
+    # and pass the check for the wrong reason. `bars` counts Angular Material
+    # progress indicators, the locale-independent half of the busy test.
+    COMPOSER_SNAPSHOT_JS = """() => {
+        const c = document.querySelector('input-container');
+        return {text: (c ? c.innerText : '') || '',
+                bars: c ? c.querySelectorAll('[role="progressbar"], mat-progress-bar, '
+                                             + 'mat-progress-spinner, mat-spinner').length
+                        : 0};
+    }"""
+
+    def _composer_snapshot(self) -> dict:
+        return self.page.evaluate(self.COMPOSER_SNAPSHOT_JS)
+
+    def _await_uploads(self, paths: list[str], baseline: dict) -> None:
         """Block until every attachment has finished uploading.
 
         This replaced a flat 1.5s sleep followed by sending regardless, which
@@ -975,37 +1021,41 @@ class Session:
         Gemini answered "the attached file is empty" and the worker exited 0,
         so a total failure looked like a correct answer.
 
-        Two things make the check less obvious than it looks:
+        The rule is: the upload must have been SEEN in progress, then seen to
+        finish, with a chip for every file. Each half exists for a reason:
 
-        - Scope to <input-container>, not document.body. The body includes the
-          conversation sidebar, so a previous chat's TITLE can satisfy a naive
-          filename search and pass this check for the wrong reason.
+        - "Seen in progress" is what makes this fail closed. The chip renders
+          within ~2s of the file being chosen while the bytes take 10-30s, so
+          a check that only looks for the chip passes mid-flight - the original
+          bug again - whenever the busy signal is missed. A UI in another
+          language, or a renamed indicator, therefore refuses to send rather
+          than sending an empty file.
+        - Chips are matched against text that was NOT in the composer before
+          the upload started (see `baseline`). The composer's own labels and
+          the model name are static text, so a file called gemini.md or
+          tools.csv would otherwise pass on the first poll with no chip at all.
         - Match the basename STEM, not the filename. The chip renders the type
           and the stem as separate lines ("CSV" then "parts"), so the string
           "parts.csv" never appears anywhere in the composer.
-
-        Locale note: the busy test reads the app's own "Uploading" string, so a
-        non-English UI falls through to the timeout and refuses to send. Safe
-        direction, and loud rather than silent.
         """
-        stems = [os.path.splitext(os.path.basename(os.path.expanduser(p)))[0]
-                 for p in paths]
+        names = [_attachment_names(p) for p in paths]
         deadline = time.monotonic() + self.UPLOAD_SETTLE_MS / 1000
+        seen_busy = False
         while True:
-            state = self.page.evaluate(
-                """(stems) => {
-                    const c = document.querySelector('input-container');
-                    const t = (c ? c.innerText : '') || '';
-                    const low = t.toLowerCase();
-                    return {busy: /uploading/i.test(t),
-                            missing: stems.filter(x => !low.includes(x.toLowerCase()))};
-                }""", stems)
-            if not state["busy"] and not state["missing"]:
+            busy, missing = _upload_progress(self._composer_snapshot(), baseline, names)
+            seen_busy = seen_busy or busy
+            if seen_busy and not busy and not missing:
                 self._pause(READ_PAUSE_MS)   # a person would glance at the chip
                 return
             if time.monotonic() > deadline:
-                why = ("still uploading" if state["busy"]
-                       else f"no chip for {', '.join(state['missing'])}")
+                if busy:
+                    why = "still uploading"
+                elif missing:
+                    why = f"no chip for {', '.join(missing)}"
+                else:
+                    why = ("chip is there but no upload indicator was ever "
+                           "seen, so whether the bytes arrived is unknowable "
+                           "from here - a non-English UI or a changed indicator")
                 raise GeminiWebError(
                     f"attachment never finished uploading after "
                     f"{self.UPLOAD_SETTLE_MS // 1000}s ({why}). NOTHING WAS "
@@ -1013,7 +1063,8 @@ class Session:
                     f"this failed silently before. Note that attachments do "
                     f"not currently survive --mode canvas; use chat.",
                     EXIT_TIMEOUT)
-            self.page.wait_for_timeout(500 + _ms((0, 300)))
+            # Short ticks: the busy signal has to be caught while it is up.
+            self.page.wait_for_timeout(250 + _ms((0, 150)))
 
     def send(self, prompt: str) -> int:
         """Type the prompt and submit. Returns the model-response count before
@@ -1348,8 +1399,18 @@ def cmd_ask(args) -> int:
                     f"to accept it.",
                     EXIT_WRONG_MODEL,
                 )
+        # --timeout is a budget for the whole ask, not just the answer. The
+        # launch, hydration and (now up to 60s of) upload wait come out of it,
+        # so the MCP server's kill deadline, which sits a fixed slack above
+        # --timeout, can never fire first and leave nothing to show.
+        left = args.timeout - (time.monotonic() - started)
+        if left <= 0:
+            raise GeminiWebError(
+                f"setup alone took longer than --timeout {args.timeout:.0f}s "
+                f"(launch, hydration, attachments). Nothing was sent. Raise "
+                f"--timeout.", EXIT_TIMEOUT)
         prior = s.send(args.prompt)
-        s.wait_for_response(prior, args.timeout)
+        s.wait_for_response(prior, left)
         markdown, how = s.last_response()
         cid = conversation_id_from_url(s.page.url)
 
@@ -1438,7 +1499,9 @@ def build_parser() -> argparse.ArgumentParser:
     ak.add_argument("--file", action="append", default=[],
                     help="attach a file; repeatable")
     ak.add_argument("--out", default="", help="also write the markdown here")
-    ak.add_argument("--timeout", type=float, default=300.0)
+    ak.add_argument("--timeout", type=float, default=300.0,
+                    help="seconds for the WHOLE ask, launch and uploads "
+                         "included; the answer gets what is left")
     ak.add_argument("--expect-model",
                     default=os.environ.get("GEMINI_WEB_EXPECT_MODEL", "flash"),
                     help="refuse to send unless the picker is on this model "

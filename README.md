@@ -678,15 +678,32 @@ longer than that — 10–30s even for a 31-byte CSV — so the prompt went out 
 the file was still in flight, Gemini received an **empty** attachment, and the
 worker exited 0. A total failure looked exactly like a correct answer.
 
-It now blocks on the composer's own upload state and makes a stall fatal. Two
-details that are not obvious and cost real debugging time:
+It now blocks on the composer's own upload state and makes a stall fatal. The
+rule is that the upload must be *seen in progress and then seen to finish*, with
+a chip for every file. Details that are not obvious and cost real debugging
+time:
 
+- **Seen in progress is what makes it fail closed.** The chip appears ~2s after
+  the file is chosen while the bytes take 10–30s, so a check that only looks
+  for the chip passes mid-flight whenever the busy signal is missed. A UI in
+  another language, or a renamed indicator, therefore refuses to send rather
+  than sending an empty file. The busy signal is read two ways: the app's
+  `Uploading` text and any progress indicator that was not there before.
+- **Chips count only if they are new.** The composer is snapshotted before the
+  upload starts and a chip has to appear in text that was not already there.
+  Otherwise a file called `gemini.md` or `tools.csv` passes on the first poll
+  against the composer's own labels, with no chip at all.
 - **Scope to `<input-container>`, never `document.body`.** The body contains the
   conversation sidebar, so a previous chat's *title* can satisfy a naive
   filename search and pass the check for entirely the wrong reason.
 - **Match the basename stem, not the filename.** The chip renders the type and
   the stem on separate lines — `CSV`, then `parts` — so the string `parts.csv`
   never appears in the composer at all.
+
+The worker's `--timeout` is a budget for the whole ask, launch and upload wait
+included, and the answer gets what is left. That is what keeps the MCP server's
+kill deadline, a fixed 20s above `--timeout`, from firing first when an upload
+eats most of a minute.
 
 > [!WARNING]
 > Attachments do not survive `--mode canvas` (ADM-6). In canvas mode no chip and

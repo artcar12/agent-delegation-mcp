@@ -1063,6 +1063,9 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
         return ("Refusing: another gemini_ask is using the browser right now. "
                 "One profile, one Chrome - wait for it to return.")
     try:
+        # The worker treats --timeout as a budget for its whole run, launch
+        # and upload wait included, so the 20s here only has to cover Chrome
+        # shutting down after the worker's own deadline fires.
         args = ["ask", "--prompt", prompt,
                 "--timeout", str(max(timeout_seconds - 20, 30))]
         if conversation_id:
