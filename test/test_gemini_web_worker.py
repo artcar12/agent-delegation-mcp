@@ -320,11 +320,23 @@ class ThrottleTests(unittest.TestCase):
             self.kind("You've reached your limit for 2.5 Pro. Try again after 4:15 PM."),
             "throttled")
 
-    def test_an_answer_about_rate_limiting_is_not_a_rate_limit(self):
-        """The false positive that would be miserable to debug. A CLI agent
-        asking Gemini about some service's quotas gets back an answer stuffed
-        with these exact phrases; length is the only thing separating the two,
-        which is why the gate is checked before any pattern."""
+    def test_the_short_real_answer_that_broke_1_5_2(self):
+        """VERBATIM from the live call that exposed the bug. 158 characters -
+        well under the length gate - correct, and classified as a quota wall
+        because the table carried bare technical vocabulary. This is the
+        regression case; the earlier version of this test used a LONG answer,
+        which was the convenient example rather than the realistic one."""
+        answer = ('The HTTP 429 status code means "Too Many Requests," '
+                  "indicating that the client has sent too many requests to "
+                  "the server within a given amount of time.")
+        self.assertLess(len(answer), gw.SYSTEM_REPLY_MAX_CHARS)
+        self.assertEqual(
+            gw.classify_response(
+                answer, "In one short sentence: what does the HTTP 429 status "
+                        "code mean?")[0],
+            "ok")
+
+    def test_a_long_answer_about_quotas_is_still_fine(self):
         answer = (
             "Redis Cloud enforces a rate limit per plan. When you exceed it the "
             "server replies with an error telling you that you have reached your "
@@ -337,10 +349,29 @@ class ThrottleTests(unittest.TestCase):
         self.assertGreater(len(answer), gw.SYSTEM_REPLY_MAX_CHARS)
         self.assertEqual(self.kind(answer), "ok")
 
-    def test_an_ambiguous_message_is_treated_as_a_throttle(self):
-        """'please try again later' matches both tables. Throttle wins on
-        purpose: declining to retry is the cheaper of the two mistakes."""
-        self.assertEqual(self.kind("Please try again later."), "throttled")
+    def test_every_throttle_pattern_addresses_the_reader(self):
+        """The invariant that replaced the length gate. A notice talks to YOU;
+        an answer describes something. Any pattern without a second-person
+        marker is technical vocabulary that will eventually match a correct
+        answer - which is precisely how 1.5.2 shipped broken."""
+        for pat in gw.THROTTLE_PATTERNS:
+            self.assertTrue(
+                any(m in pat for m in ("your", "you've", "you have")),
+                f"{pat!r} does not address the reader; it will false-positive")
+
+    def test_a_phrase_the_caller_asked_about_is_never_a_throttle(self):
+        """Second guard: if the question contains the phrase, the answer
+        containing it is the answer."""
+        self.assertEqual(
+            gw.classify_response("You have reached your limit means the server "
+                                 "is refusing further calls.",
+                                 "what does 'you have reached your limit' "
+                                 "mean?")[0],
+            "ok")
+        # ... and the same text with an unrelated prompt still trips.
+        self.assertEqual(
+            gw.classify_response("You have reached your limit.", "hello")[0],
+            "throttled")
 
     def test_short_real_answers_are_left_alone(self):
         # The smoke test asks for exactly this, so a regression here is loud.

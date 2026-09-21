@@ -136,39 +136,57 @@ CONVERSATION_ID_RE = re.compile(r"/app/([0-9a-f]{6,})")
 # the meta line; this table only catches the case where Gemini does reply.
 SYSTEM_REPLY_MAX_CHARS = 400
 
+# EVERY throttle pattern must address the reader -- "your", "you've", "you
+# have". That invariant is enforced by a test, and it is the load-bearing idea
+# here, not the length gate.
+#
+# 1.5.2 learned this the hard way. The table carried bare technical vocabulary
+# ("too many requests", "rate limit", "daily limit"), and a live call asking
+# what HTTP 429 means came back with "The HTTP 429 status code means \"Too Many
+# Requests,\" indicating that the client has sent too many requests..." -- 158
+# characters, comfortably under the length gate, correct, and thrown away as a
+# quota wall. A notice says "You've reached YOUR limit"; an answer describes
+# something in the third person. Second-person address is what separates them;
+# length is not, because a good answer is often short.
 THROTTLE_PATTERNS = (
-    "reached your limit", "reached the limit", "usage limit", "rate limit",
-    "daily limit", "too many requests", "out of requests",
-    "try again later", "come back later", "upgrade to",
+    "you've reached your", "you have reached your", "reached your limit",
+    "reached your usage limit", "your usage limit", "your limit will reset",
+    "your limit resets", "upgrade your plan", "your quota",
 )
+# No second-person rule available here -- these are Gemini's own words, quoted
+# from live runs. Misreading one costs a single retry, so the looser table is
+# the cheaper risk. The prompt guard below covers the obvious false positive.
 TRANSIENT_PATTERNS = (
     "something went wrong", "try your request again",
     "please try again", "unable to complete",
 )
 
 
-def classify_response(markdown: str) -> tuple[str, str]:
+def classify_response(markdown: str, prompt: str = "") -> tuple[str, str]:
     """('ok' | 'throttled' | 'transient', the pattern that matched).
 
-    Gated on LENGTH first, which is the whole trick. These notices are short
-    and are the entire response; a real answer that happens to discuss rate
-    limiting is long. Without the gate, asking Gemini about a service's quotas
-    would classify its own answer as a throttle -- a plausible thing for a CLI
-    agent to ask, and a maddening thing to debug.
+    Three guards, in order of how much work they do:
+
+    1. SECOND-PERSON ADDRESS, via the table above. A limit notice talks to you.
+    2. THE PROMPT. If the caller asked about a phrase, an answer containing it
+       is the answer, not a notice -- so a pattern present in the question is
+       never evidence of a throttle.
+    3. LENGTH, last and least. It only rules out essays; it does nothing for a
+       short, correct answer, which is exactly what broke 1.5.2.
     """
     text = (markdown or "").strip()
     if not text or len(text) > SYSTEM_REPLY_MAX_CHARS:
         return "ok", ""
     low = text.lower()
-    # Throttle first, deliberately: "please try again later" matches both
-    # tables, and calling an ambiguous message a throttle means we decline to
-    # retry. Failing closed on retries is the cheaper mistake of the two.
-    for pat in THROTTLE_PATTERNS:
-        if pat in low:
-            return "throttled", pat
-    for pat in TRANSIENT_PATTERNS:
-        if pat in low:
-            return "transient", pat
+    asked = (prompt or "").lower()
+    # Throttle first, deliberately: an ambiguous message read as a throttle
+    # means we decline to retry, and failing closed on retries is the cheaper
+    # mistake of the two.
+    for kind, patterns in (("throttled", THROTTLE_PATTERNS),
+                           ("transient", TRANSIENT_PATTERNS)):
+        for pat in patterns:
+            if pat in low and pat not in asked:
+                return kind, pat
     return "ok", ""
 
 
@@ -1198,7 +1216,7 @@ def cmd_ask(args) -> int:
         model = s.current_model()
 
     # Raised outside the `with` so Chrome has already shut down cleanly.
-    kind, pat = classify_response(markdown)
+    kind, pat = classify_response(markdown, args.prompt)
     if kind == "throttled":
         raise GeminiWebError(
             f"Gemini replied with a limit message rather than an answer "

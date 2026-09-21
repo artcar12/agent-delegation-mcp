@@ -1085,6 +1085,25 @@ claude mcp add opencode-wrapper -s user \
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
 
+### 1.5.3 (2026-09-21)
+
+**Fixes a false positive shipped in 1.5.0 that threw away correct answers.**
+Asking "what does HTTP 429 mean" produced a 158-character, entirely correct
+reply — and the worker reported a quota wall, because the pattern table carried
+bare technical vocabulary (`too many requests`, `rate limit`, `daily limit`) and
+the response was short enough to pass the length gate.
+
+The length gate was the wrong idea. A limit notice **addresses you** — "You've
+reached *your* limit" — while an answer describes something in the third person,
+and good answers are frequently short. Every throttle pattern must now contain
+`your`, `you've` or `you have`, enforced by a test. A second guard ignores any
+pattern that appears in the caller's own prompt. Length remains, last and least,
+ruling out essays only.
+
+Honest limits: a genuine answer containing "you have reached your rate limit"
+would still trip, and the transient table cannot use the second-person rule
+because those are Gemini's own quoted words. Detection is better, not airtight.
+
 ### 1.5.2 (2026-09-21)
 
 **`gemini_ask`'s description was being truncated before the model saw the end
