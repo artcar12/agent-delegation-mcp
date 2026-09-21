@@ -665,6 +665,25 @@ do not want to wait. The launch flags stay either way; they cost nothing.
 > rather than Playwright's chromium, a persistent profile with real history,
 > and headed by default.
 
+### Do not smoke-test it with the same string every time
+
+The pacing work above is undone for free by asking `reply with exactly: pong`
+fifty times. A repeated identical one-word prompt against a single account is
+the most script-like artifact in the whole flow — more so than the timing, which
+is what 1.4.0 spent effort disguising. Nothing in this repo hard-codes such a
+canary, and nothing should: vary the wording *and* the expected answer, or use a
+short question you actually wanted answered.
+
+Keeping it deterministic enough to assert on is easy — "answer in one word: what
+colour is a ripe banana", "one word: capital of Portugal" — and those read as use
+rather than instrumentation.
+
+> [!NOTE]
+> Proportion: this is a cheap habit, not a meaningful defence. Prompt text is a
+> weak signal next to cookies and request cadence, and there is no evidence
+> Google diffs prompt strings looking for automation. It costs nothing to avoid,
+> which is the entire argument for doing it.
+
 ### One browser, one profile, one call at a time
 
 Every tool here refuses when another is running. On the sibling servers that
@@ -1065,6 +1084,15 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.5.1 (2026-09-21)
+
+Docs and caller guidance only, no behaviour change. Callers are told not to
+smoke-test this tool with a fixed canary string: the pacing work in 1.4.0 is
+undone for free by sending `reply with exactly: pong` fifty times against one
+account. See [Do not smoke-test it with the same
+string](#do-not-smoke-test-it-with-the-same-string-every-time), including the
+note on how little this actually buys.
 
 ### 1.5.0 (2026-09-21)
 

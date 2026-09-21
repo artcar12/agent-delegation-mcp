@@ -779,6 +779,15 @@ def _instructions() -> str:
         "as though it were the answer. If a short, odd, system-sounding reply ever "
         "does reach you as content, treat it as a limit notice rather than a "
         "finding - the pattern list is good, not exhaustive.",
+        "DO NOT TEST THIS TOOL WITH A FIXED CANARY STRING. Checking that the "
+        "browser still works is reasonable; sending 'reply with exactly: pong' "
+        "fifty times is not. An identical one-word prompt repeated against one "
+        "account is the most obviously scripted thing in the whole flow - more "
+        "so than any timing, which is what the worker already goes to some "
+        "trouble to disguise. Vary it: ask something short you actually wanted "
+        "to know, or at minimum change both the wording and the expected answer "
+        "each time. A connectivity check that doubles as a real question costs "
+        "nothing extra and looks like use rather than instrumentation.",
         "Rules a tool result cannot deliver in time:\n"
         "- There is ONE browser on ONE profile, so genuinely one call at a time. This is "
         "not quota etiquette like the sibling servers, it is a hard constraint: Chrome "
