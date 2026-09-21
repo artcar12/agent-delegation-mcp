@@ -478,7 +478,11 @@ class WorkerCliTests(unittest.TestCase):
         """Flash by default is the point: Pro is the only model whose daily
         limit is reachable, so drifting onto it should cost a clear error
         rather than a quietly more expensive run."""
-        a = gw.build_parser().parse_args(["ask", "--prompt", "x"])
+        import os, unittest.mock
+        # The default reads GEMINI_WEB_EXPECT_MODEL, so without clearing it
+        # this test asserts the developer's environment rather than the code.
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            a = gw.build_parser().parse_args(["ask", "--prompt", "x"])
         self.assertEqual(a.expect_model, "flash")
 
     def test_ask_defaults_to_chat(self):

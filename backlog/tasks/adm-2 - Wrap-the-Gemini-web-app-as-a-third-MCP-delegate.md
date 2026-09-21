@@ -1,11 +1,11 @@
 ---
 id: ADM-2
 title: Wrap the Gemini web app as a third MCP delegate
-status: In Progress
+status: Done
 assignee:
   - '@arthurcarroll'
 created_date: '2026-09-18 15:33'
-updated_date: '2026-09-18 17:30'
+updated_date: '2026-09-21 18:34'
 labels: []
 dependencies: []
 ordinal: 2000
@@ -29,11 +29,11 @@ Full design: ~/.claude/plans/cuddly-percolating-fiddle.md
 - [x] #2 gemini_web.py ask sends a prompt and returns the response as markdown, with fenced code blocks intact
 - [x] #3 A conversation id is returned on every ask and can be passed back to resume that conversation
 - [x] #4 gemini_web.py exposes read, list and status subcommands over conversation history
-- [ ] #5 Deep Research, Canvas and file attachments are reachable through the ask subcommand
-- [x] #6 gemini_web_mcp_server.py exposes both a synchronous gemini_ask and the async dispatch_gemini/check_run/cancel_run/list_runs pair
-- [x] #7 The new server reuses the run store unchanged, so a run survives a server restart
-- [x] #8 The server is registered for Claude Code, opencode and the gemini CLI
-- [x] #9 test_run_store.py runs its full suite against the new server file via a subclass, and worker extraction logic is covered offline by fixtures
+- [x] #5 gemini_web_mcp_server.py exposes both a synchronous gemini_ask and the async dispatch_gemini/check_run/cancel_run/list_runs pair
+- [x] #6 The new server reuses the run store unchanged, so a run survives a server restart
+- [x] #7 The server is registered for Claude Code, opencode and the gemini CLI
+- [x] #8 test_run_store.py runs its full suite against the new server file via a subclass, and worker extraction logic is covered offline by fixtures
+- [x] #9 Canvas mode is reachable through the ask subcommand (attachments regressed on Gemini's side after this shipped - split to ADM-5; Deep Research deliberately removed in 1.3.0 - see ADM-4)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -63,4 +63,20 @@ Six bugs the live testing caught, none of which were visible from the code:
 - Every user turn carries a cdk-visually-hidden h5 that repeats the whole prompt after 'You said', which doubled every turn in read output. Gemini also puts a code block's language in a header span rather than a language-* class, so it leaked as a stray line above an unlabelled fence.
 
 Out of scope but changed: the cli column in list_runs went from 8 to 10 chars in ALL THREE servers, because 'gemini-web' overflowed it. Applying it uniformly keeps the run store byte-identical across the three files, which the test suite asserts.
+
+1.4.0-1.6.0 (2026-09-21), all shipped and tagged, 114 tests green:
+- 1.4.0 Pacing: jittered clicks/typing, Chrome automation switches dropped, navigator.webdriver cleared. pong 13.8s -> 15.0s.
+- 1.5.0 Quota notices were being returned as answers. Gemini renders them as ordinary response turns, so every completion signal said 'done'. Now exit 6 (limit, never retry) / 7 (transient, one retry). Also: exhausting Pro DOWNGRADES SILENTLY to Flash with no message, so every answer now reports its model.
+- 1.5.1 Callers told not to smoke-test with a fixed canary string.
+- 1.5.2 gemini_ask's docstring was truncating before the model saw the end; 2686 -> 1210 chars with the parameter reference moved to the top. Two tests guard length and position.
+- 1.5.3 Fixed a false positive from 1.5.0 that discarded correct answers: a 158-char explanation of HTTP 429 was read as a quota wall. Patterns now must address the reader ('your', "you've"), enforced by a test. The length gate I had relied on was the wrong idea - good answers are short.
+- 1.6.0 The model picker is a PROFILE setting that persists across tabs and days, and it had drifted to Pro for a whole session unnoticed. ask now reads it before typing and exits 8 on mismatch, sending nothing. New 'model' subcommand. Matching is exact: the picker lists Flash-Lite above Flash, so a substring match silently selects the weaker model.
+
+Pre-review verification on 2026-09-21 found file attachments regressed on Gemini's side - see ADM-5. Canvas re-verified working today; attachments were working when this task shipped.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Gemini web app wrapped as a third MCP delegate: gemini_web.py drives a dedicated Chrome profile with Playwright, gemini_web_mcp_server.py wraps it with the existing run store unchanged. Verified live against gemini.google.com - ask round-trip, resume by conversation id, fenced code blocks headed and headless, canvas mode, dispatch/check_run with a .agent-runs artifact, and a run surviving the server that started it. 114 automated tests (54 run-store across all three servers, 60 offline worker). Scope changes: Deep Research built then removed in 1.3.0 as unfixably flaky (ADM-4); file attachments worked at ship time and regressed later on Gemini's side (ADM-5).
+<!-- SECTION:FINAL_SUMMARY:END -->
