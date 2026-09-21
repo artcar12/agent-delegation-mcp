@@ -105,6 +105,13 @@ DEFAULT_CWD = _env("AGENT_MCP_DEFAULT_CWD", os.getcwd())
 DEFAULT_MODEL = _env("GEMINI_WEB_MCP_MODE", "chat")
 MODES = ("chat", "canvas", "image", "video")
 
+# Mirrors gemini_web.py. Duplicated rather than imported, like everything else
+# here: each server file has to stay a self-contained `uv run --script` target.
+# These are API between the two files -- change them in both or not at all.
+EXIT_NOT_LOGGED_IN = 3
+EXIT_THROTTLED = 6
+EXIT_TRANSIENT = 7
+
 # MUST stay below TIMEOUT_SECONDS: the worker's own deadline is the one that
 # should hit, because it exits cleanly with whatever the page had rendered
 # instead of being killed with nothing to show.
@@ -593,6 +600,16 @@ def _verdict_note(record: dict) -> str:
         return (f"Finished after {elapsed}s. No exit status: this run was started by a "
                 f"previous server process, and only a parent can read its child's exit "
                 f"code. The output files and the repo are the evidence.")
+    if code == EXIT_THROTTLED:
+        return (f"Gemini answered with a limit message rather than content, after "
+                f"{elapsed}s. This is a quota wall, not a failure to fix: do NOT "
+                f"retry in a loop, and do not route around it by calling the tool "
+                f"harder. Tell the user; the live numbers are in the web app under "
+                f"Settings -> Usage limits. The message itself is in stderr below.")
+    if code == EXIT_TRANSIENT:
+        return (f"Gemini glitched rather than answering, after {elapsed}s - not a "
+                f"limit. ONE retry is reasonable; if a second fails, stop and say "
+                f"so rather than looping. The message itself is in stderr below.")
     if code != 0:
         return (f"{cli} exited {code} after {elapsed}s.\nNOTE: a non-zero exit does NOT "
                 f"mean the work was not done. Check `git log` / `git status` and re-run "
@@ -724,11 +741,44 @@ def _instructions() -> str:
         "into one prompt to save requests, do not skip a follow-up, and do not "
         "skip a verification pass because it would be a second call. The real "
         "limits are wall clock and the single browser (below), not quota.\n"
-        "Running out through this server is not really achievable - the one way "
-        "to do it is several Deep Research runs on Pro High inside a five-hour "
-        "window, and this server cannot start those. If a call ever does fail on "
-        "quota, the live numbers are in the web app under Settings -> Usage "
-        "limits - look there rather than trusting this text.",
+        "Running out through this server takes real effort - the one way to do it "
+        "is several Deep Research runs on Pro High inside a five-hour window, and "
+        "this server cannot start those. If it does happen you will get a clear "
+        "error rather than a wrong answer (see the throttle rule below), and the "
+        "live numbers are in the web app under Settings -> Usage limits - look "
+        "there rather than trusting this text.",
+        "STAY ON FLASH. Flash - including Flash with a long, detailed prompt - is "
+        "enough for essentially everything a CLI agent asks for: lookups, version "
+        "checks, comparisons, 'what changed in X since Y', reading and summarising "
+        "pages. Reach for Pro only for a genuinely hard reasoning problem, which is "
+        "rare in this kind of work. Two reasons this matters. First, Pro is the one "
+        "model whose daily limits you can actually exhaust; Flash is where the "
+        "allowance is effectively unreachable. Second, THIS SERVER CANNOT SWITCH "
+        "MODELS - the picker holds whatever the profile was last left on, and "
+        "changing it is a human action in the browser. So if you conclude a task "
+        "needs Pro, say so and let the user decide; do not treat one thin Flash "
+        "answer as proof, sharpen the prompt and ask again first.",
+        "THE LOUDEST QUOTA SYMPTOM IS SILENCE. Gemini's own account of its "
+        "limit behaviour is that exhausting Pro DOWNGRADES YOU TO FLASH with no "
+        "message - you get a real answer from a smaller model and nothing says "
+        "so. Every answer therefore reports which model produced it; read that "
+        "field before concluding a weak answer means the question was hard. The "
+        "other two silent-ish symptoms: a full conversation limit LOCKS the "
+        "prompt box (surfaces here as 'the prompt box never appeared'), and "
+        "compute-heavy modes - image, video, canvas - are WITHDRAWN from the "
+        "tools drawer while throttled (surfaces as 'no tool labelled ...'). "
+        "Neither is a DOM break, though both read like one.",
+        "IF A CALL COMES BACK THROTTLED, STOP. Exit 6 means Gemini replied with a "
+        "limit message instead of an answer. Exit 7 means it glitched. Seven is "
+        "worth exactly one retry. SIX IS WORTH NONE - retrying into a limit is how "
+        "a soft throttle becomes a hard one, and the account being throttled is the "
+        "user's own paid subscription, so the cost of getting this wrong lands on "
+        "them. Report it and let them decide. Note what these codes exist to "
+        "prevent: Gemini renders a limit notice as an ordinary response turn, so "
+        "without the check the worker would hand you 'Sorry, something went wrong' "
+        "as though it were the answer. If a short, odd, system-sounding reply ever "
+        "does reach you as content, treat it as a limit notice rather than a "
+        "finding - the pattern list is good, not exhaustive.",
         "Rules a tool result cannot deliver in time:\n"
         "- There is ONE browser on ONE profile, so genuinely one call at a time. This is "
         "not quota etiquette like the sibling servers, it is a hard constraint: Chrome "
@@ -986,6 +1036,13 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     that never finished. If a job genuinely needs Deep Research, ask the USER to
     run it in the browser and hand you the conversation id.
 
+    FLASH IS THE RIGHT MODEL FOR ALMOST EVERYTHING YOU WILL ASK. A long prompt to
+    Flash beats a short one to Pro for lookups, comparisons and page-reading, which
+    is nearly all CLI research. Pro is for rare hard reasoning, and it is also the
+    only model whose daily limit is reachable. This tool cannot switch models
+    anyway - the browser profile holds that setting - so if you truly need Pro, say
+    so and let the user change it.
+
     Use dispatch_gemini instead when the work is long enough to outlast this
     tool's timeout.
 
@@ -1014,11 +1071,22 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
         _browser_lock.release()
 
     if rc != 0:
-        return (f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}"
-                + ("\n\nSign in first: run `uv run --script gemini_web.py login` "
-                   "in a terminal. Google blocks its own sign-in flow inside an "
-                   "automated browser, so this cannot be done for you."
-                   if rc == 3 else ""))
+        hint = ""
+        if rc == EXIT_NOT_LOGGED_IN:
+            hint = ("\n\nSign in first: run `uv run --script gemini_web.py login` "
+                    "in a terminal. Google blocks its own sign-in flow inside an "
+                    "automated browser, so this cannot be done for you.")
+        elif rc == EXIT_THROTTLED:
+            hint = ("\n\nThat is a quota wall, not a bug. Do NOT retry in a loop and "
+                    "do NOT compensate by calling this tool harder - that is how a "
+                    "soft limit becomes a hard one. Say so plainly and let the user "
+                    "decide; Settings -> Usage limits in the web app has the real "
+                    "numbers.")
+        elif rc == EXIT_TRANSIENT:
+            hint = ("\n\nGemini glitched rather than hitting a limit. ONE retry is "
+                    "reasonable here. If a second fails, stop and report it instead "
+                    "of looping.")
+        return f"Error: the Gemini worker exited {rc}.\n{_truncate(err.strip())}{hint}"
 
     meta = _meta_of(out)
     answer = _strip_meta(out)
@@ -1026,6 +1094,9 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     if meta.get("conversation_id"):
         footer.append(f"conversation_id: {meta['conversation_id']}  "
                       f"(pass it back to continue this thread)")
+    if meta.get("model"):
+        footer.append(f"answered by: {meta['model']}  (an unexpected Flash here "
+                      f"can mean Pro quota ran out - the app downgrades silently)")
     if meta.get("elapsed_seconds"):
         footer.append(f"{meta['elapsed_seconds']}s, extracted via "
                       f"{meta.get('extraction', '?')}")

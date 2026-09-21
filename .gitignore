@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 .agent-runs/
 REVIEW-*.md
+.claude/settings.local.json

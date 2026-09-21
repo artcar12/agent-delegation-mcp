@@ -678,6 +678,51 @@ log tail in `check_run` means "still working", not "stuck" — judge it by elaps
 time. This is also why `GEMINI_WEB_MCP_IDLE_TIMEOUT` defaults to off: every
 healthy run looks idle for its entire duration.
 
+### Running out of quota, and how it shows up
+
+Gemini does not answer an over-quota request with an HTTP error. It answers with
+something that looks like an answer, which is the whole problem. Through 1.4.0
+the worker returned those straight to the caller, so a delegating agent could
+receive *"Sorry, something went wrong. Please try your request again."* and treat
+it as a research finding.
+
+Four symptoms, in rough order of how badly they mislead:
+
+| Symptom | What it looks like from here | Handling |
+|---|---|---|
+| **Pro exhausted → silent downgrade to Flash** | A real, complete, slightly weaker answer. No message. | Every answer now reports `answered by: <model>`. |
+| **Limit notice as a reply** | A finished response turn, action row and all | `classify_response()` → exit **6** |
+| **Transient glitch** | Same shape, different wording | exit **7**, one retry is reasonable |
+| **Conversation limit → composer locked** | The prompt box never appears | Reads as a selector break; the error now names the lockout as a candidate |
+| **Throttled while a heavy mode is requested** | image / video / canvas missing from the tools drawer | Reads as a rename; the error now says so |
+
+The split between 6 and 7 is the point. A transient glitch is worth one retry; a
+limit is worth none, because retrying into a throttle is how a soft limit becomes
+a hard one — and the account absorbing that is your own paid subscription.
+
+**What this does not do.** Detection is a pattern list against short responses,
+so an unrecognised limit message still comes back as content. The length gate is
+deliberate: without it, asking Gemini about *some other service's* rate limits
+would classify its own answer as a throttle. Only the transient pattern has been
+observed from this worker; the throttle patterns match Gemini's own description
+of its limit behaviour, which traces to third-party write-ups rather than Google
+documentation. Treat the table as a good net, not a seal.
+
+There is deliberately **no retry loop and no backoff**. Both would convert a
+clear signal into a slow one.
+
+### Flash is the right model for almost everything
+
+Reserve Pro for genuinely hard reasoning, which is rare in CLI work. A long,
+specific prompt to Flash beats a short one to Pro for lookups, version checks,
+comparisons and page-reading — which is nearly all of what an agent asks for.
+Pro is also the only model whose daily limit is realistically reachable, so
+defaulting to it spends the scarce resource on the cases that did not need it.
+
+The worker cannot switch models: the picker holds whatever the profile was last
+left on, and changing it is a human action in the browser. That is deliberate —
+it keeps model choice a decision you make rather than one an agent drifts into.
+
 ### When Google reshuffles the DOM
 
 Every selector is unversioned Angular internals, collected in one `SELECTORS`
@@ -988,6 +1033,10 @@ reopening settled questions or rediscovering the same platform gotcha.
 | gemini-web: a link in an answer goes to a Google redirect, not the page | Gemini rewrites outbound hrefs through `google.com/search?q=<real url>&utm_source=gemini` while the anchor text shows the real destination | already handled: the real URL is taken back out of the `q` parameter during extraction |
 | gemini-web: `selector 'conversation_link' never appeared` | nothing moved — Gemini ships the sidebar collapsed, and Angular does not render the history list until it is opened | already handled: the sidebar is expanded before the list is read |
 | gemini-web: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | ask for a URL per claim instead of a quote, and retry |
+| gemini-web: an answer reads like a system message ("Sorry, something went wrong") | Gemini renders limit notices and glitches as ordinary response turns, so every completion signal says "done" | already handled: `classify_response()` exits **6** (limit, do not retry) or **7** (transient, one retry). An unrecognised message still comes back as content — see [Running out of quota](#running-out-of-quota-and-how-it-shows-up) |
+| gemini-web: answers got noticeably weaker with no error | Pro quota exhausted; the app downgrades to Flash **silently** | already handled: every answer reports `answered by: <model>`. Check that before assuming the question was hard |
+| gemini-web: "the prompt box never appeared" | usually a selector change — but a fully exhausted account has its composer **locked** | open the profile in a browser and look before chasing the selector; the error names both |
+| gemini-web: a mode that worked yesterday is "no tool labelled ..." today | compute-heavy tools (image, video, canvas) are withdrawn from the drawer while throttled | same: check the browser first. The error now says so |
 | gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
@@ -1016,6 +1065,28 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.5.0 (2026-09-21)
+
+**A quota wall no longer arrives disguised as an answer.** Gemini reports being
+over quota as an ordinary response turn — action row, stable text, every
+completion signal saying "done" — so the worker used to hand that notice back as
+content. It now classifies the response and exits **6** (limit; do not retry) or
+**7** (transient glitch; one retry is reasonable), and the MCP server maps both
+to explicit guidance rather than a generic non-zero exit.
+
+Also surfaced: the answering model is reported on every answer, because the
+primary symptom of exhausting Pro is a *silent* downgrade to Flash with no
+message at all. A locked composer and a withdrawn image/video/canvas tool both
+read like DOM breakage; those errors now name throttling as a candidate cause.
+
+Guidance added for callers: **stay on Flash**. It handles essentially every
+lookup, comparison and page-read a CLI agent needs, and Pro is the only model
+whose daily limit is reachable.
+
+No retry loop and no backoff, deliberately. See
+[Running out of quota](#running-out-of-quota-and-how-it-shows-up) for what the
+detection does not cover.
 
 ### 1.4.0 (2026-09-21)
 

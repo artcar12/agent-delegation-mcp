@@ -53,6 +53,12 @@ EXIT_USAGE = 2
 EXIT_NOT_LOGGED_IN = 3
 EXIT_SELECTOR = 4
 EXIT_TIMEOUT = 5
+# Gemini answered, but with a system message rather than content. Two codes
+# rather than one because the right reaction differs: a transient glitch is
+# worth a single retry, a limit message is worth none -- retrying into a
+# throttle is how a soft limit becomes a hard one.
+EXIT_THROTTLED = 6
+EXIT_TRANSIENT = 7
 
 # The SPA takes ~8s to hydrate a deep-linked conversation on a cold load; 30s
 # is slack for a slow morning, not an expectation.
@@ -106,6 +112,64 @@ TOOL_LABELS = {
 }
 
 CONVERSATION_ID_RE = re.compile(r"/app/([0-9a-f]{6,})")
+
+# Gemini reports being over quota, or having glitched, as an ORDINARY response
+# turn: it gets an action row, its text stops growing, and every completion
+# signal we have says "done". Without this table the worker hands that message
+# back as though it were the answer, and a delegating agent treats "Sorry,
+# something went wrong" as a research finding.
+#
+# Honesty about provenance: only the TRANSIENT patterns have been seen from
+# this worker. The THROTTLE ones match how Gemini describes its own limit
+# behaviour ("an in-line message stating you have reached your usage limit,
+# displaying the time until limits refresh") but have NOT been observed here,
+# and that description traces to third-party write-ups rather than Google
+# documentation. A wrong throttle pattern costs a false alarm, which is the
+# safe direction. An unrecognised message is still returned as an answer --
+# that residual gap is real and the README says so rather than implying this
+# is airtight.
+#
+# Text matching is also NOT the main event. Per the same description the
+# primary response to Pro exhaustion is a SILENT DOWNGRADE to Flash, with no
+# message at all, and a full conversation limit LOCKS THE COMPOSER rather than
+# replying. Those are handled in open() and by reporting the answering model in
+# the meta line; this table only catches the case where Gemini does reply.
+SYSTEM_REPLY_MAX_CHARS = 400
+
+THROTTLE_PATTERNS = (
+    "reached your limit", "reached the limit", "usage limit", "rate limit",
+    "daily limit", "too many requests", "out of requests",
+    "try again later", "come back later", "upgrade to",
+)
+TRANSIENT_PATTERNS = (
+    "something went wrong", "try your request again",
+    "please try again", "unable to complete",
+)
+
+
+def classify_response(markdown: str) -> tuple[str, str]:
+    """('ok' | 'throttled' | 'transient', the pattern that matched).
+
+    Gated on LENGTH first, which is the whole trick. These notices are short
+    and are the entire response; a real answer that happens to discuss rate
+    limiting is long. Without the gate, asking Gemini about a service's quotas
+    would classify its own answer as a throttle -- a plausible thing for a CLI
+    agent to ask, and a maddening thing to debug.
+    """
+    text = (markdown or "").strip()
+    if not text or len(text) > SYSTEM_REPLY_MAX_CHARS:
+        return "ok", ""
+    low = text.lower()
+    # Throttle first, deliberately: "please try again later" matches both
+    # tables, and calling an ambiguous message a throttle means we decline to
+    # retry. Failing closed on retries is the cheaper mistake of the two.
+    for pat in THROTTLE_PATTERNS:
+        if pat in low:
+            return "throttled", pat
+    for pat in TRANSIENT_PATTERNS:
+        if pat in low:
+            return "transient", pat
+    return "ok", ""
 
 
 def _chrome_binary() -> str:
@@ -704,7 +768,20 @@ class Session:
     def open(self, conversation_id: str = "", expect_history: bool = False) -> None:
         url = f"{ORIGIN}/app/{conversation_id}" if conversation_id else f"{ORIGIN}/app"
         self.page.goto(url, wait_until="domcontentloaded", timeout=NAV_MS)
-        self._require("editor", HYDRATE_MS)
+        try:
+            self._require("editor", HYDRATE_MS)
+        except GeminiWebError:
+            # Gemini locks the input box outright once conversation limits are
+            # hit entirely, so a missing composer is not only a redesign. Not
+            # observed here, so this names a candidate rather than diagnosing.
+            raise GeminiWebError(
+                "the prompt box never appeared. Usually that means the editor "
+                "selector moved - but Gemini also LOCKS the composer when the "
+                "account is fully out of quota, and the two look identical from "
+                "here. Open the profile in a browser and look before assuming a "
+                "selector broke.",
+                EXIT_SELECTOR,
+            ) from None
         if expect_history:
             self._require("model_response", HYDRATE_MS)
         # The app is usable before this; a person is not looking at it yet.
@@ -811,7 +888,11 @@ class Session:
         self.page.keyboard.press("Escape")
         raise GeminiWebError(
             f"no tool labelled {label!r} in the Upload & tools drawer, even "
-            f"after expanding More tools. Available: {available}",
+            f"after expanding More tools. Available: {available}.\n"
+            f"Compute-heavy tools (image, video, canvas) are also WITHDRAWN from "
+            f"this drawer while the account is over quota, so one that worked "
+            f"yesterday and is missing today is more likely throttled than "
+            f"renamed - check the browser before chasing a selector.",
             EXIT_SELECTOR,
         )
 
@@ -869,7 +950,10 @@ class Session:
         while self.page.locator(sel_resp).count() <= prior_count:
             if time.monotonic() > deadline:
                 raise GeminiWebError(
-                    f"Gemini never started a response within {timeout_s:.0f}s.",
+                    f"Gemini never started a response within {timeout_s:.0f}s. "
+                    f"A hard throttle is indistinguishable from a hang at this "
+                    f"point -- if the browser is showing a limit notice, that "
+                    f"is the cause rather than a wedged page.",
                     EXIT_TIMEOUT,
                 )
             self.page.wait_for_timeout(500 + _ms((0, 400)))
@@ -1111,6 +1195,27 @@ def cmd_ask(args) -> int:
         s.wait_for_response(prior, args.timeout)
         markdown, how = s.last_response()
         cid = conversation_id_from_url(s.page.url)
+        model = s.current_model()
+
+    # Raised outside the `with` so Chrome has already shut down cleanly.
+    kind, pat = classify_response(markdown)
+    if kind == "throttled":
+        raise GeminiWebError(
+            f"Gemini replied with a limit message rather than an answer "
+            f"(matched {pat!r}): {markdown.strip()}\n"
+            f"Do NOT retry in a loop - that is how a soft limit becomes a hard "
+            f"one. The live numbers are in the web app under Settings -> Usage "
+            f"limits. Conversation: {cid or '(none)'}",
+            EXIT_THROTTLED,
+        )
+    if kind == "transient":
+        raise GeminiWebError(
+            f"Gemini glitched rather than answering (matched {pat!r}): "
+            f"{markdown.strip()}\n"
+            f"This one is usually transient and a single retry succeeds. "
+            f"Conversation: {cid or '(none)'}",
+            EXIT_TRANSIENT,
+        )
 
     sys.stdout.write(markdown.rstrip() + "\n")
     if args.out:
@@ -1118,7 +1223,7 @@ def cmd_ask(args) -> int:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as fh:
             fh.write(markdown.rstrip() + "\n")
-    _emit_meta(conversation_id=cid, mode=args.mode, extraction=how,
+    _emit_meta(conversation_id=cid, mode=args.mode, extraction=how, model=model,
                elapsed_seconds=round(time.monotonic() - started, 1),
                chars=len(markdown), out=args.out or "")
     return EXIT_OK

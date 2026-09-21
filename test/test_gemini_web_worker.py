@@ -301,6 +301,61 @@ class SidebarTests(unittest.TestCase):
         self.assertIn("open_sidebar", src)
 
 
+class ThrottleTests(unittest.TestCase):
+    """Gemini renders a limit notice as an ordinary response turn - action row,
+    stable text, every completion signal saying 'done'. Without classification
+    the worker returns that notice as though it were the answer, and a
+    delegating agent acts on 'Sorry, something went wrong' as a finding."""
+
+    def kind(self, text):
+        return gw.classify_response(text)[0]
+
+    def test_the_transient_error_we_actually_saw_is_caught(self):
+        self.assertEqual(
+            self.kind("Sorry, something went wrong. Please try your request again."),
+            "transient")
+
+    def test_a_limit_notice_is_caught(self):
+        self.assertEqual(
+            self.kind("You've reached your limit for 2.5 Pro. Try again after 4:15 PM."),
+            "throttled")
+
+    def test_an_answer_about_rate_limiting_is_not_a_rate_limit(self):
+        """The false positive that would be miserable to debug. A CLI agent
+        asking Gemini about some service's quotas gets back an answer stuffed
+        with these exact phrases; length is the only thing separating the two,
+        which is why the gate is checked before any pattern."""
+        answer = (
+            "Redis Cloud enforces a rate limit per plan. When you exceed it the "
+            "server replies with an error telling you that you have reached your "
+            "limit, and well-behaved clients back off rather than try again "
+            "later. The free tier's daily limit is the one people meet first; "
+            "past that you are prompted to upgrade to a paid plan. Note that "
+            "'too many requests' here means HTTP 429, which is retryable, "
+            "whereas hard quota exhaustion is not."
+        )
+        self.assertGreater(len(answer), gw.SYSTEM_REPLY_MAX_CHARS)
+        self.assertEqual(self.kind(answer), "ok")
+
+    def test_an_ambiguous_message_is_treated_as_a_throttle(self):
+        """'please try again later' matches both tables. Throttle wins on
+        purpose: declining to retry is the cheaper of the two mistakes."""
+        self.assertEqual(self.kind("Please try again later."), "throttled")
+
+    def test_short_real_answers_are_left_alone(self):
+        # The smoke test asks for exactly this, so a regression here is loud.
+        self.assertEqual(self.kind("pong"), "ok")
+        self.assertEqual(self.kind(""), "ok")
+        self.assertEqual(self.kind("   "), "ok")
+
+    def test_the_new_codes_collide_with_nothing(self):
+        self.assertNotEqual(gw.EXIT_THROTTLED, gw.EXIT_TRANSIENT)
+        taken = (gw.EXIT_OK, gw.EXIT_USAGE, gw.EXIT_NOT_LOGGED_IN,
+                 gw.EXIT_SELECTOR, gw.EXIT_TIMEOUT)
+        self.assertNotIn(gw.EXIT_THROTTLED, taken)
+        self.assertNotIn(gw.EXIT_TRANSIENT, taken)
+
+
 class MetaLineTests(unittest.TestCase):
     """The MCP server only ever sees the worker's stdout as a file, so this
     line is the whole channel for the conversation id."""
@@ -393,6 +448,13 @@ class ServerArgvTests(unittest.TestCase):
             mcp.server = server
             sys.modules["mcp"], sys.modules["mcp.server"] = mcp, server
         cls.srv = _load("gemini_web_mcp_server.py", "gw_server_under_test")
+
+    def test_exit_codes_match_the_worker(self):
+        """Duplicated by design - each server file stays a standalone
+        `uv run --script` target - so only a test keeps the copies honest.
+        A drift here means the server misreports a quota wall as a crash."""
+        for name in ("EXIT_NOT_LOGGED_IN", "EXIT_THROTTLED", "EXIT_TRANSIENT"):
+            self.assertEqual(getattr(self.srv, name), getattr(gw, name), name)
 
     def test_modes_match_the_worker(self):
         self.assertEqual(set(self.srv.MODES),
