@@ -306,6 +306,7 @@ Code itself inherits. All are optional.
 | `AGENT_MCP_RUN_RETENTION_DAYS` | all three | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
 | `GEMINI_WEB_PROFILE` | gemini-web | `~/.agent-delegation-mcp/gemini-profile` | The Chrome user-data-dir the worker drives. Never point this at your daily profile: Chrome refuses to share one with a running instance. |
 | `GEMINI_WEB_CHROME` | gemini-web | the system Chrome | Only used by `login`, which needs a Chrome that Playwright is *not* driving. |
+| `GEMINI_WEB_NO_PACING` | gemini-web | unset | Set to `1` to drop the interaction delays while debugging. The anti-automation launch flags stay on regardless. |
 | `GEMINI_WEB_HEADLESS` | gemini-web | off | `1` runs the automation without a window. Off by default: headless is likelier to trip Google's bot heuristics, and the clipboard extraction path needs a focused window. |
 | `GEMINI_WEB_WORKER` | gemini-web | `gemini_web.py` beside the server | Point the server at a worker somewhere else. |
 | `GEMINI_WEB_UV_BIN` | gemini-web | `uv` on PATH | `uv run --script` is what honours the worker's inline dependency block, so this is the launcher, not python. PATH is not reliably inherited. |
@@ -617,6 +618,52 @@ Two traps worth naming:
   still signed out, with nothing on screen having looked wrong. `login` lands you
   on the account chooser rather than on Gemini for exactly this reason, and checks
   the profile's cookies before it claims success.
+
+### Pacing: not looking like a script
+
+This drives a paid account that the account holder is entitled to use, under
+the same quota everyone else gets. The goal is not to take more than the plan
+allows — it is to not be conspicuous while taking what it allows.
+
+A script is obvious for boring reasons. It clicks the instant an element
+exists, types a 900-character prompt as one `insertText` event, and polls on an
+exact 500ms metronome. None of that is how a person behaves, and all of it is
+cheap for a site to measure.
+
+| | before | now |
+|---|---|---|
+| clicking | immediate | scroll into view, hover, 90–320ms, click |
+| typing | one event for the whole prompt | bursts of 3–11 chars, 30–130ms apart |
+| after navigation | act immediately | 600–1900ms dwell |
+| before sending | immediate | 600–1900ms, the re-read everyone does |
+| response polls | exactly 500ms / 1500ms | both jittered |
+
+Plus two browser tells: `--enable-automation` is dropped (it is what sets
+`navigator.webdriver` and raises the "controlled by automated test software"
+infobar), `--disable-blink-features=AutomationControlled` is added, and an init
+script clears `navigator.webdriver` for anything that re-reads it.
+
+Past ~450 characters the rest of a prompt goes in as a single paste. Typing
+4000 characters at a human rate is its own anomaly — nobody hand-types an essay
+into a chat box, they paste, and a paste is one event.
+
+**The window size is deliberately not randomised.** It is chosen once and
+persisted in the profile. A window that is a different size every session is an
+inconsistency that a fixed size would never have produced. Same reasoning for
+not spoofing user-agent, locale or timezone: a real Chrome against a real
+profile already reports truthful ones, and overriding them manufactures
+mismatches.
+
+`GEMINI_WEB_NO_PACING=1` drops the delays when you are debugging a selector and
+do not want to wait. The launch flags stay either way; they cost nothing.
+
+> [!NOTE]
+> Honest ceiling: this stops the *obvious* signals. It will not defeat serious
+> fingerprinting, and nothing here touches a CAPTCHA or any other challenge —
+> if one appears the run fails and a human deals with it. The strongest
+> protections were already in place before any of this: a stock Chrome build
+> rather than Playwright's chromium, a persistent profile with real history,
+> and headed by default.
 
 ### One browser, one profile, one call at a time
 
@@ -969,6 +1016,27 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.4.0 (2026-09-21)
+
+**The worker no longer behaves like a metronome.** Every interaction now carries
+jitter: clicks scroll into view and hover before pressing, prompts go in as
+uneven bursts rather than one `insertText` event, there is a dwell after
+navigation and before sending, and the two response polls no longer tick on an
+exact interval. Chrome's automation switches are dropped and
+`navigator.webdriver` is cleared.
+
+This changes timing, not entitlement — same account, same quota, same plan. A
+`pong` round-trip went from 13.8s to 15.0s.
+
+The window size is chosen once and persisted per profile rather than randomised
+per launch, for the same reason user-agent and timezone are left alone: a real
+Chrome against a real profile already reports consistent values, and varying
+them manufactures mismatches that a fixed value never would.
+
+`GEMINI_WEB_NO_PACING=1` turns the delays off for debugging. See
+[Pacing](#pacing-not-looking-like-a-script) for the honest ceiling on what this
+does and does not achieve.
 
 ### 1.3.1 (2026-09-18)
 

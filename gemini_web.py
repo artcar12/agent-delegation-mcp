@@ -33,6 +33,7 @@ the selector name rather than hanging -- see _require().
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -132,6 +133,97 @@ CHROME_BIN = _chrome_binary()
 # screen having looked wrong.
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin?continue="
              "https%3A%2F%2Fgemini.google.com%2Fapp")
+
+
+# --------------------------------------------------------------------------
+# Pacing
+#
+# Two separate problems, worth not confusing:
+#
+#   1. A script clicks the instant an element exists, types a 900-character
+#      prompt as ONE insertText event, and polls on an exact 500ms metronome.
+#      No person produces that timing profile. It is the cheapest possible
+#      signal to collect and the cheapest to stop emitting.
+#   2. The browser announces itself. navigator.webdriver is true under the
+#      DevTools protocol, and Chrome's automation switches are visible.
+#
+# What follows addresses both, and it is worth being honest about the ceiling:
+# this defeats trivial checks. It does not defeat serious fingerprinting, and
+# nothing here touches a CAPTCHA or any other challenge -- if one appears, the
+# run fails and a human deals with it. The real protections were already in
+# place before any of this: a stock Chrome build rather than Playwright's
+# chromium, a persistent profile with genuine history, and headed by default.
+#
+# Set GEMINI_WEB_NO_PACING=1 to turn the delays off when debugging; the launch
+# flags stay either way, since they cost nothing.
+# --------------------------------------------------------------------------
+
+def _truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+PACING = not _truthy("GEMINI_WEB_NO_PACING")
+
+# A short beat before committing to a click, the way a hand arrives at a
+# target before pressing it.
+CLICK_PAUSE_MS = (90, 320)
+# After a navigation, before touching anything: a person looks at the page.
+READ_PAUSE_MS = (600, 1900)
+# Between bursts of typing.
+TYPE_PAUSE_MS = (30, 130)
+# Characters per burst. Real typing is not per-character uniform either, it
+# comes in runs, so bursts model it better than a fixed per-key delay.
+TYPE_BURST = (3, 11)
+# A long prompt would take minutes at human speed, which is its own anomaly
+# (nobody types 4000 characters into a chat box in one go -- they paste). Past
+# this, send the remainder as a paste, which is what a person would do.
+TYPE_BUDGET_CHARS = 450
+
+# Chrome's own automation tells. --enable-automation sets navigator.webdriver
+# and shows the "controlled by automated test software" infobar;
+# AutomationControlled is the Blink feature behind the same flag.
+STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+STEALTH_IGNORE = ["--enable-automation"]
+
+# Runs before any page script on every document, including iframes.
+STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+"""
+
+
+def _ms(span) -> int:
+    """A random count of MILLISECONDS from (lo, hi), or 0 when pacing is off.
+
+    Every span above is already in milliseconds; this does not scale them.
+    """
+    return int(random.uniform(*span)) if PACING else 0
+
+
+def _viewport_for_profile() -> dict:
+    """A window size that stays the same for this profile across runs.
+
+    Deliberately NOT randomised per launch. A real person's window size barely
+    changes; one that is different every session is an inconsistency a fixed
+    size would not have produced. So it is chosen once, from a plausible range
+    of real laptop-sized windows, and then remembered.
+    """
+    path = os.path.join(PROFILE_DIR, "viewport.json")
+    try:
+        with open(path) as fh:
+            saved = json.load(fh)
+        if {"width", "height"} <= saved.keys():
+            return {"width": int(saved["width"]), "height": int(saved["height"])}
+    except Exception:
+        pass
+    vp = {"width": random.choice([1440, 1512, 1680, 1728]),
+          "height": random.choice([812, 852, 900, 946])}
+    try:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(vp, fh)
+    except Exception:
+        pass
+    return vp
 
 
 def google_cookie_count(profile_dir: str = "") -> int:
@@ -477,10 +569,6 @@ def conversation_id_from_url(url: str) -> str:
 # Browser
 # --------------------------------------------------------------------------
 
-def _truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
 class Session:
     """A live browser on the Gemini app. Use as a context manager."""
 
@@ -513,8 +601,9 @@ class Session:
                 PROFILE_DIR,
                 channel="chrome",
                 headless=self.headless,
-                viewport={"width": 1440, "height": 900},
-                args=["--no-first-run", "--no-default-browser-check"],
+                viewport=_viewport_for_profile(),
+                args=["--no-first-run", "--no-default-browser-check",
+                      *STEALTH_ARGS],
                 # THE flag that matters on macOS. Playwright passes
                 # --use-mock-keychain by default, which hands Chrome a
                 # different cookie-encryption key than the one the real
@@ -524,7 +613,11 @@ class Session:
                 # it was supposed to use, and the symptom looks exactly like
                 # "the sign-in never took". Ignoring it makes Chrome use the
                 # real Keychain; expect a one-time macOS prompt to allow it.
-                ignore_default_args=["--use-mock-keychain"],
+                #
+                # --enable-automation is dropped for an unrelated reason: it is
+                # what sets navigator.webdriver and raises the "controlled by
+                # automated test software" infobar.
+                ignore_default_args=["--use-mock-keychain", *STEALTH_IGNORE],
             )
         except Exception as exc:
             if "ProcessSingleton" in str(exc) or "already in use" in str(exc):
@@ -543,8 +636,59 @@ class Session:
         except Exception:
             # Not fatal: html_to_markdown() is the fallback extraction path.
             pass
+        try:
+            # Belt to --disable-blink-features' braces: the flag covers the
+            # main world, this covers anything that re-reads the property.
+            self.context.add_init_script(STEALTH_INIT_JS)
+        except Exception:
+            pass
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         return self
+
+    # -- pacing -----------------------------------------------------------
+    def _pause(self, span=CLICK_PAUSE_MS) -> None:
+        ms = _ms(span)
+        if ms:
+            self.page.wait_for_timeout(ms)
+
+    def _tap(self, selector, timeout: float = 10_000) -> None:
+        """Click, but arrive at the target first.
+
+        Playwright's click already moves the mouse to the element, so the
+        point of hovering separately is the gap between arriving and pressing
+        -- and the scroll, which a script otherwise skips entirely because it
+        can click an element that is off-screen.
+        """
+        loc = self.page.locator(selector).first if isinstance(selector, str) else selector
+        try:
+            loc.scroll_into_view_if_needed(timeout=timeout)
+            loc.hover(timeout=timeout)
+            self._pause()
+        except Exception:
+            pass  # hovering is a nicety; never let it block the click
+        loc.click(timeout=timeout)
+
+    def _type(self, text: str) -> None:
+        """Enter text in uneven bursts rather than one atomic event.
+
+        Past TYPE_BUDGET_CHARS the rest goes in as a single insert, because
+        typing thousands of characters at a steady human rate is not human
+        either -- a person pastes a long prompt, and a paste is one event.
+        """
+        if not text:
+            return
+        if not PACING:
+            self.page.keyboard.insert_text(text)
+            return
+        i = 0
+        while i < len(text) and i < TYPE_BUDGET_CHARS:
+            n = random.randint(*TYPE_BURST)
+            self.page.keyboard.insert_text(text[i:i + n])
+            i += n
+            self._pause(TYPE_PAUSE_MS)
+        if i < len(text):
+            self._pause(TYPE_PAUSE_MS)
+            self.page.keyboard.insert_text(text[i:])
 
     def __exit__(self, *exc_info):
         for closer in (getattr(self.context, "close", None),
@@ -563,6 +707,8 @@ class Session:
         self._require("editor", HYDRATE_MS)
         if expect_history:
             self._require("model_response", HYDRATE_MS)
+        # The app is usable before this; a person is not looking at it yet.
+        self._pause(READ_PAUSE_MS)
 
     def _require(self, key: str, timeout_ms: int, state: str = "visible"):
         """wait_for_selector, but the failure names the selector that moved.
@@ -631,8 +777,9 @@ class Session:
         label = TOOL_LABELS.get(mode)
         if not label:
             return
-        self.page.click(SELECTORS["tools_button"])
+        self._tap(SELECTORS["tools_button"])
         self._require("tool_toggle", 10_000)
+        self._pause()
 
         def _click_labelled() -> bool:
             toggles = self.page.locator(SELECTORS["tool_toggle"])
@@ -640,7 +787,7 @@ class Session:
                 btn = toggles.nth(i)
                 if label in (btn.inner_text() or "").strip().lower():
                     if btn.get_attribute("aria-checked") != "true":
-                        btn.click()
+                        self._tap(btn)
                     return True
             return False
 
@@ -649,8 +796,8 @@ class Session:
             # Which tools get promoted varies by session; the rest sit
             # behind "More tools".
             try:
-                self.page.click(SELECTORS["more_tools"], timeout=5_000)
-                self.page.wait_for_timeout(800)
+                self._tap(SELECTORS["more_tools"], timeout=5_000)
+                self.page.wait_for_timeout(800 + _ms(CLICK_PAUSE_MS))
                 found = _click_labelled()
             except Exception:
                 pass
@@ -673,7 +820,7 @@ class Session:
         if missing:
             raise GeminiWebError(f"no such file(s): {', '.join(missing)}", EXIT_USAGE)
         # The file input only exists once the drawer has rendered.
-        self.page.click(SELECTORS["tools_button"])
+        self._tap(SELECTORS["tools_button"])
         self._require("file_input", 10_000, state="attached")
         self.page.set_input_files(
             SELECTORS["file_input"], [os.path.expanduser(p) for p in paths]
@@ -681,14 +828,15 @@ class Session:
         self.page.keyboard.press("Escape")
         # Gemini refuses to send while an upload is in flight; the send key is
         # simply swallowed. Give the chips time to settle.
-        self.page.wait_for_timeout(1500)
+        self.page.wait_for_timeout(1500 + _ms(READ_PAUSE_MS))
 
     def send(self, prompt: str) -> int:
         """Type the prompt and submit. Returns the model-response count before
         sending, which wait_for_response() needs as its baseline."""
         prior = self.page.locator(SELECTORS["model_response"]).count()
         editor = self.page.locator(SELECTORS["editor"]).first
-        editor.click()
+        self._tap(editor)
+        self._pause()
         # Quill listens for real input events, so neither .fill() nor setting
         # innerText registers. insert_text dispatches one insertText event for
         # the whole string -- far faster than per-character typing on a long
@@ -699,13 +847,16 @@ class Session:
                 # Enter submits, so a newline has to be Shift+Enter.
                 self.page.keyboard.press("Shift+Enter")
             if line:
-                self.page.keyboard.insert_text(line)
+                self._type(line)
+        # A beat between finishing the prompt and sending it: re-reading what
+        # you just wrote is the most universal thing people do here.
+        self._pause(READ_PAUSE_MS)
         # Click the button when it is there, and keep Enter as the fallback
         # for the headed case where a redesign moves the button: Enter works
         # there, it is only headless that swallows it.
         try:
             self.page.wait_for_selector(SELECTORS["send_button"], timeout=5_000)
-            self.page.click(SELECTORS["send_button"])
+            self._tap(SELECTORS["send_button"])
         except Exception:
             self.page.keyboard.press("Enter")
         return prior
@@ -721,7 +872,7 @@ class Session:
                     f"Gemini never started a response within {timeout_s:.0f}s.",
                     EXIT_TIMEOUT,
                 )
-            self.page.wait_for_timeout(500)
+            self.page.wait_for_timeout(500 + _ms((0, 400)))
 
         # Done when the action row has rendered AND the text has stopped
         # growing. Either signal alone lies: actions can appear a beat before
@@ -750,7 +901,7 @@ class Session:
                     f"({last_len} chars so far). Raise --timeout.",
                     EXIT_TIMEOUT,
                 )
-            self.page.wait_for_timeout(1500)
+            self.page.wait_for_timeout(1500 + _ms((0, 600)))
 
     # -- extraction -------------------------------------------------------
     def last_response(self) -> tuple[str, str]:
@@ -805,8 +956,8 @@ class Session:
         is already open the button is absent and this is a no-op.
         """
         try:
-            self.page.click(SELECTORS["open_sidebar"], timeout=5_000)
-            self.page.wait_for_timeout(1_200)
+            self._tap(SELECTORS["open_sidebar"], timeout=5_000)
+            self.page.wait_for_timeout(1_200 + _ms(CLICK_PAUSE_MS))
         except Exception:
             pass  # already open, or Google renamed the control -- the wait below decides
 

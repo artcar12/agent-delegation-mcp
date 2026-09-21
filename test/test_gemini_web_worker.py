@@ -192,6 +192,94 @@ class LinkUnwrappingTests(unittest.TestCase):
         self.assertEqual(gw._unwrap_google_redirect(url), url)
 
 
+class PacingTests(unittest.TestCase):
+    """Timing jitter and the typing burst splitter.
+
+    The units here have already been wrong once: the spans are named `_MS` and
+    an early `_ms()` multiplied them by 1000 as well, which would have paused
+    90 seconds before every click. Cheap to assert, expensive to notice live.
+    """
+
+    SPANS = ("CLICK_PAUSE_MS", "READ_PAUSE_MS", "TYPE_PAUSE_MS")
+
+    def test_pauses_are_milliseconds_not_seconds(self):
+        for name in self.SPANS:
+            span = getattr(gw, name)
+            with self.subTest(span=name):
+                self.assertLess(max(span), 5_000, f"{name} looks like seconds")
+                for _ in range(200):
+                    self.assertTrue(span[0] <= gw._ms(span) <= span[1])
+
+    def test_pacing_can_be_switched_off(self):
+        """Debugging a selector against a page that pauses is miserable."""
+        try:
+            gw.PACING = False
+            self.assertEqual(gw._ms(gw.READ_PAUSE_MS), 0)
+        finally:
+            gw.PACING = True
+
+    def test_typing_bursts_reassemble_into_the_original_prompt(self):
+        """The whole point is that the text is split. If a burst boundary ever
+        drops or reorders a character, every prompt is silently corrupted and
+        the answers just get subtly wrong."""
+        class FakeKeyboard:
+            def __init__(self): self.chunks = []
+            def insert_text(self, t): self.chunks.append(t)
+
+        class FakePage:
+            def __init__(self): self.keyboard = FakeKeyboard()
+            def wait_for_timeout(self, ms): pass
+
+        for text in ("", "pong", "x" * 40, "unicode — ok? ✓ " * 30, "y" * 2000):
+            with self.subTest(length=len(text)):
+                session = gw.Session.__new__(gw.Session)
+                session.page = FakePage()
+                session._type(text)
+                self.assertEqual("".join(session.page.keyboard.chunks), text)
+
+    def test_a_long_prompt_is_not_typed_out_one_burst_at_a_time(self):
+        """Nobody hand-types 2000 characters into a chat box; they paste. So
+        past the budget the remainder goes in as one event -- which is both
+        more realistic and keeps a long prompt from taking minutes."""
+        class FakeKeyboard:
+            def __init__(self): self.chunks = []
+            def insert_text(self, t): self.chunks.append(t)
+
+        class FakePage:
+            def __init__(self): self.keyboard = FakeKeyboard()
+            def wait_for_timeout(self, ms): pass
+
+        session = gw.Session.__new__(gw.Session)
+        session.page = FakePage()
+        session._type("z" * 3000)
+        self.assertLess(len(session.page.keyboard.chunks),
+                        gw.TYPE_BUDGET_CHARS // min(gw.TYPE_BURST) + 5)
+        self.assertGreater(len(session.page.keyboard.chunks[-1]), 1_000)
+
+    def test_the_window_size_is_stable_across_runs(self):
+        """Deliberately NOT random per launch: a window that is a different
+        size every session is an inconsistency a fixed size never produces."""
+        import tempfile, unittest.mock as mock
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(gw, "PROFILE_DIR", tmp):
+                first = gw._viewport_for_profile()
+                self.assertEqual(first, gw._viewport_for_profile())
+                self.assertEqual(first, gw._viewport_for_profile())
+
+    def test_the_automation_switches_are_dropped(self):
+        self.assertIn("--enable-automation", gw.STEALTH_IGNORE)
+        self.assertTrue(any("AutomationControlled" in a for a in gw.STEALTH_ARGS))
+
+    def test_the_keychain_flag_is_still_ignored(self):
+        """STEALTH_IGNORE is spread into the same ignore_default_args list as
+        --use-mock-keychain. Dropping that one destroys the saved session on
+        every launch, so it must survive any edit to the stealth list."""
+        import inspect
+        src = inspect.getsource(gw.Session.__enter__)
+        self.assertIn("--use-mock-keychain", src)
+        self.assertIn("STEALTH_IGNORE", src)
+
+
 class SidebarTests(unittest.TestCase):
     """The history list is behind a collapsed sidebar.
 
