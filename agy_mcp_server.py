@@ -72,7 +72,7 @@ AGY_BIN = _env("AGY_BIN", shutil.which("agy") or "agy")
 # default. Set AGENT_MCP_DEFAULT_CWD to pin one project regardless of session.
 DEFAULT_CWD = _env("AGENT_MCP_DEFAULT_CWD", os.getcwd())
 
-DEFAULT_MODEL = _env("AGY_MCP_MODEL", "gemini-3.6-flash-high")
+DEFAULT_MODEL = _env("AGY_MCP_MODEL", "gemini-3.8-flash-high")
 
 # MUST be set: agy 1.1.12 defaults its print-mode wait to 5m0s independently of
 # the run timeout below, and kills longer runs after the work landed.

@@ -296,7 +296,7 @@ environment Claude Code itself inherits. All are optional.
 | `AGENT_MCP_DEFAULT_CWD` | all three | the session's working directory | Pin every dispatch to one project regardless of where Claude was started. The `cwd` tool argument always wins. |
 | `AGY_BIN` | agy | `agy` on PATH | PATH is not reliably inherited by an MCP subprocess. |
 | `OPENCODE_BIN` | opencode | `opencode` on PATH | Same, and more urgent: `opencode` usually lives under an nvm node dir whose path carries the node version, so it moves on every node upgrade. Point this at a stable symlink such as `/usr/local/bin/opencode`. |
-| `AGY_MCP_MODEL` | agy | `gemini-3.6-flash-high` | Model ids go stale. Check `agy models`. |
+| `AGY_MCP_MODEL` | agy | `gemini-3.8-flash-high` | Model ids go stale. Check `agy models`. |
 | `OPENCODE_MCP_MODEL` | opencode | `opencode-go/glm-5.2` | Check `opencode models`. |
 | `OPENCODE_MCP_AGENT` | opencode | `build` | Only if you have renamed your write-capable agent. See [§4](#4-what-the-tools-actually-run). |
 | `AGY_MCP_PRINT_TIMEOUT` | agy | `60m` | Passed to `agy --print-timeout`. See [§4](#4-what-the-tools-actually-run). |
