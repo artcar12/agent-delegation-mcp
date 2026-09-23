@@ -1162,6 +1162,12 @@ claude mcp add opencode-wrapper -s user \
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
 
+### 1.6.3 (2026-09-22)
+
+**agy now defaults to `gemini-3.8-flash-high`**, up from the outdated
+`gemini-3.6-flash-high`. Nothing to do unless you pinned `AGY_MCP_MODEL`; if you
+did, check it against `agy models`.
+
 ### 1.6.2 (2026-09-21)
 
 **The upload wait now fails closed.** 1.6.1's check held the send back only
