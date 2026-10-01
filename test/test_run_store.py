@@ -3,7 +3,9 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Exercises the run store in all three servers against fake CLIs.
+"""Exercises the run store in the agy and opencode servers against fake CLIs.
+
+The gemini-web server had a third copy until 1.7.0 removed dispatch_gemini.
 
 Runs with plain `python3 test/test_run_store.py` - no MCP install needed. The
 decorator is the only thing the servers use from the SDK, so a stub that
@@ -372,17 +374,6 @@ class OpenCodeRunStoreTests(RunStoreTests):
     BIN_VAR = "OPENCODE_BIN"
     TIMEOUT_VAR = "OPENCODE_MCP_TIMEOUT"
     IDLE_VAR = "OPENCODE_MCP_IDLE_TIMEOUT"
-
-
-class GeminiWebRunStoreTests(RunStoreTests):
-    """Same store, third copy. GEMINI_WEB_BIN is the escape hatch that runs a
-    ready-made executable instead of `uv run --script gemini_web.py`, which is
-    what lets the fake CLI stand in for the worker here."""
-    SERVER = "gemini_web_mcp_server.py"
-    BIN_VAR = "GEMINI_WEB_BIN"
-    TIMEOUT_VAR = "GEMINI_WEB_MCP_TIMEOUT"
-    IDLE_VAR = "GEMINI_WEB_MCP_IDLE_TIMEOUT"
-    FATAL_PHRASE = "not signed in"
 
 
 if __name__ == "__main__":

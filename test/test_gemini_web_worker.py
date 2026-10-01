@@ -664,9 +664,8 @@ class ServerArgvTests(unittest.TestCase):
         _instructions(), which is a different channel with no such limit."""
         import inspect
         LIMIT = 2000                      # under the observed ~2200 ceiling
-        for name in ("gemini_ask", "dispatch_gemini", "gemini_conversations",
-                     "gemini_read_conversation", "delegation_status",
-                     "check_run", "cancel_run", "list_runs"):
+        for name in ("gemini_ask", "gemini_conversations",
+                     "gemini_read_conversation", "delegation_status"):
             doc = inspect.getdoc(getattr(self.srv, name)) or ""
             self.assertLess(len(doc), LIMIT,
                             f"{name} docstring is {len(doc)} chars; trim it or "
@@ -700,11 +699,6 @@ class ServerArgvTests(unittest.TestCase):
         self.assertTrue(argv[3].endswith("gemini_web.py"))
         self.assertEqual(argv[4], "status")
 
-    def test_worker_cap_stays_under_the_wall_clock(self):
-        """The worker's own deadline has to hit first: it exits with whatever
-        the page rendered, where the outer kill leaves nothing to show."""
-        self.assertLess(self.srv.WORKER_TIMEOUT, self.srv.TIMEOUT_SECONDS)
-
     def test_meta_helpers_agree_with_the_worker(self):
         out = 'answer\nGEMINI_WEB_META {"conversation_id": "zz"}\n'
         self.assertEqual(self.srv._meta_of(out),
@@ -712,17 +706,102 @@ class ServerArgvTests(unittest.TestCase):
         self.assertEqual(self.srv._strip_meta(out), "answer")
 
     def test_canvas_with_files_is_refused_before_a_browser_opens(self):
-        for fn in (self.srv.gemini_ask, self.srv.dispatch_gemini):
-            with self.subTest(tool=fn.__name__):
-                out = fn("x", mode="canvas", files="parts.csv")
-                self.assertIn("mode=canvas", out)
-                self.assertIn("Nothing was sent", out)
+        out = self.srv.gemini_ask("x", mode="canvas", files="parts.csv")
+        self.assertIn("mode=canvas", out)
+        self.assertIn("Nothing was sent", out)
 
     def test_an_unknown_mode_is_refused_before_a_browser_opens(self):
         self.assertIn("mode must be one of",
-                      self.srv.dispatch_gemini("x", mode="telepathy"))
-        self.assertIn("mode must be one of",
                       self.srv.gemini_ask("x", mode="telepathy"))
+
+    def test_every_tool_refuses_while_another_holds_the_browser(self):
+        """One profile, one Chrome. With the run store gone the lock is the
+        only guard, so every tool has to go through it, not just gemini_ask."""
+        calls = {
+            "gemini_ask": lambda: self.srv.gemini_ask("x"),
+            "gemini_conversations": lambda: self.srv.gemini_conversations(),
+            "gemini_read_conversation":
+                lambda: self.srv.gemini_read_conversation("abc"),
+        }
+        self.srv._browser_lock.acquire()
+        try:
+            for name, call in calls.items():
+                with self.subTest(tool=name):
+                    self.assertEqual(call(), self.srv.BUSY)
+            self.assertIn("not checked", self.srv.delegation_status())
+        finally:
+            self.srv._browser_lock.release()
+
+    def test_the_automated_dispatch_path_is_gone(self):
+        """1.7.0 removed dispatch_gemini and the run store behind it. A
+        session that still finds it will use it, so its absence is the
+        contract."""
+        for name in ("dispatch_gemini", "check_run", "cancel_run",
+                     "list_runs", "_dispatch", "RUN_DIR"):
+            self.assertFalse(hasattr(self.srv, name), name)
+
+
+class ResearchHandoverInstructionsTests(unittest.TestCase):
+    """ADM-7: web research is handed to the user as a prompt. These pin the
+    parts of the connect-time instructions a session acts on, so a later
+    edit cannot quietly restore 'use gemini_ask by default'."""
+
+    @classmethod
+    def setUpClass(cls):
+        ServerArgvTests.setUpClass()
+        cls.text = ServerArgvTests.srv._instructions()
+
+    def test_research_is_handed_over_not_run(self):
+        self.assertIn("WEB RESEARCH IS HANDED TO THE USER", self.text)
+        self.assertNotIn("USE THIS FOR WEB RESEARCH BY DEFAULT", self.text)
+        self.assertIn("gemini_ask IS FOR EXPLICIT REQUESTS ONLY", self.text)
+
+    def test_unsure_counts_as_not_knowing(self):
+        self.assertIn("ERR ON THE SIDE OF NOT KNOWING", self.text)
+        self.assertIn("training data", self.text)
+
+    def test_an_unattended_session_proceeds_and_leaves_notes(self):
+        self.assertIn("UNATTENDED SESSION", self.text)
+        self.assertIn("goal skill", self.text)
+        self.assertIn("do not call gemini_ask in their place", self.text)
+        self.assertIn("leave a note", self.text)
+
+    def test_the_prompt_asks_for_urls_not_quotes(self):
+        self.assertIn("source URL per claim", self.text)
+        self.assertIn("never a verbatim quote per claim", self.text)
+
+    def test_every_handover_names_its_session(self):
+        self.assertIn("NEW Gemini conversation or CONTINUE", self.text)
+        self.assertIn("default to the same conversation", self.text)
+
+    def test_the_rules_survive_client_truncation(self):
+        """Claude Code cuts server instructions off at roughly 2000 chars:
+        the 1.6.x text reached sessions ending 'a verbatim quote for ev...
+        [truncated]'. Every rule a session must act on has to land before
+        that, or it is not a rule."""
+        head = self.text[:2000]
+        for phrase in ("WEB RESEARCH IS HANDED TO THE USER",
+                       "ERR ON THE SIDE OF NOT KNOWING",
+                       "source URL per claim",
+                       "never a verbatim quote per claim",
+                       "NEW Gemini conversation or CONTINUE",
+                       "default to the same conversation",
+                       "UNATTENDED SESSION",
+                       "leave a note",
+                       "gemini_ask IS FOR EXPLICIT REQUESTS ONLY",
+                       "/agent-delegation:gemini-ask"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, head)
+
+    def test_the_skill_ships_and_calls_no_tools(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "skills", "gemini-ask", "SKILL.md")
+        with open(path) as fh:
+            skill = fh.read()
+        self.assertTrue(skill.startswith("---\nname: gemini-ask\n"))
+        self.assertIn("Calls no tools", skill)
+        self.assertIn("$ARGUMENTS", skill)
+        self.assertIn("/agent-delegation:gemini-ask", self.text)
 
 
 if __name__ == "__main__":
