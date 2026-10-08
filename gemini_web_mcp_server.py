@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 # mcp 2.x renamed FastMCP -> MCPServer and dropped the `mcp.server.fastmcp`
 # module. Same API: _Server("name"), @mcp.tool(), mcp.run() (stdio default).
@@ -309,6 +310,49 @@ BUSY = ("Refusing: another call is using the browser right now. "
         "One profile, one Chrome - wait for it to return.")
 
 
+# ---------------------------------------------------------------------------
+# Idle exit
+#
+# Claude Code starts one copy of this server per session and keeps it for as
+# long as that session's process lives. The desktop app and `claude rc` keep
+# finished sessions alive for hours, so without this every session opened that
+# day holds a server it will never call again. They are not orphans - the
+# parent is alive and stdin never closes - so nothing else ends them.
+#
+# Leaving is cheap: Claude Code restarts a stdio server that went away, and the
+# next tool call in that session lands on a fresh process (checked against
+# 2.1.29x). Chrome is launched per call by the worker, so nothing is held here.
+#
+# Never leave mid-call: a long gemini_ask can outlast the limit, and the lock
+# is held for exactly the length of every call.
+#
+# Wall clock, not monotonic: on macOS the monotonic clock stops while the
+# machine sleeps, and a session left overnight is exactly the case to catch.
+SERVER_IDLE_EXIT = _int_env("AGENT_MCP_SERVER_IDLE_EXIT", 1800, allow_zero=True)
+
+_last_call = time.time()
+
+
+def _touch() -> None:
+    """Mark a tool call. Every @mcp.tool starts with this."""
+    global _last_call
+    _last_call = time.time()
+
+
+def _should_idle_exit(now: float) -> bool:
+    return (bool(SERVER_IDLE_EXIT) and not _browser_lock.locked()
+            and now - _last_call > SERVER_IDLE_EXIT)
+
+
+def _idle_exit_watch() -> None:
+    while True:
+        time.sleep(min(60, SERVER_IDLE_EXIT))
+        if _should_idle_exit(time.time()):
+            sys.stderr.write(f"[{SERVER_NAME}] no tool call in {SERVER_IDLE_EXIT}s; exiting\n")
+            sys.stderr.flush()
+            os._exit(0)
+
+
 def _refuse_canvas_files(mode: str, files: str) -> str:
     """Attachments never upload in canvas mode (worker ADM-6): no chip, no
     progress, and Gemini answers about an empty file. The worker refuses the
@@ -384,6 +428,7 @@ def gemini_ask(prompt: str, conversation_id: str = "", mode: str = "chat",
     app has to hydrate. That is the floor, not a fault. Raise timeout_seconds
     for Canvas or image/video work, which can take minutes.
     """
+    _touch()
     if mode not in MODES:
         return f"Error: mode must be one of {', '.join(MODES)}; got {mode!r}."
     if refused := _refuse_canvas_files(mode, files):
@@ -454,6 +499,7 @@ def gemini_conversations(query: str = "", limit: int = 20) -> str:
 
     This opens a browser, so it costs the same ~20s as any other call here.
     """
+    _touch()
     args = ["list", "--limit", str(max(limit, 1))]
     if query:
         args += ["--query", query]
@@ -482,6 +528,7 @@ def gemini_read_conversation(conversation_id: str) -> str:
     research prompt by hand in the browser and gives you its conversation id.
     Find ids with gemini_conversations().
     """
+    _touch()
     if not conversation_id.strip():
         return "Error: conversation_id is required. List them with gemini_conversations()."
     result = _worker_sync(
@@ -506,6 +553,7 @@ def delegation_status() -> str:
     looks like a broken tool and is not one. Checking sign-in opens a browser,
     so this is slower than the sibling servers' status.
     """
+    _touch()
     version = _plugin_version()
     result = _worker_sync(["status"], 180)
     if result is None:
@@ -526,10 +574,13 @@ def delegation_status() -> str:
         f"  worker:     {' '.join(_worker_argv())}",
         f"  signed in:  {signed_in}",
         f"  modes:      {', '.join(MODES)}",
+        f"  self-exit:  " + (f"after {SERVER_IDLE_EXIT}s with no tool call" if SERVER_IDLE_EXIT else "off"),
         f"  research:   handed to the user as a prompt; gemini_ask on explicit request",
     ]
     return "\n".join(lines)
 
 
 if __name__ == "__main__":
+    if SERVER_IDLE_EXIT:
+        threading.Thread(target=_idle_exit_watch, daemon=True).start()
     mcp.run()

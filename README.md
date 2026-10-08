@@ -310,6 +310,7 @@ environment Claude Code itself inherits. All are optional.
 | `AGENT_MCP_MAX_OUTPUT` | all three | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
 | `AGENT_MCP_RUN_DIR` | agy, opencode | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. Both share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
 | `AGENT_MCP_RUN_RETENTION_DAYS` | agy, opencode | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
+| `AGENT_MCP_SERVER_IDLE_EXIT` | all three | `1800` | The server exits after this many seconds with no tool call, so a session left open for hours stops holding it; Claude Code starts a fresh one on that session's next call. Never fires while a run the agy or opencode server started is still live, or mid-call on gemini-web. `0` keeps the server for the life of the session. |
 | `GEMINI_WEB_PROFILE` | gemini-web | `~/.agent-delegation-mcp/gemini-profile` | The Chrome user-data-dir the worker drives. Never point this at your daily profile: Chrome refuses to share one with a running instance. |
 | `GEMINI_WEB_CHROME` | gemini-web | the system Chrome | Only used by `login`, which needs a Chrome that Playwright is *not* driving. |
 | `GEMINI_WEB_EXPECT_MODEL` | gemini-web | `flash` | The model `ask` requires before it will send anything; a mismatch exits 8 having sent nothing. `any` skips the check. The picker is a profile setting that persists across runs, so this is what stops a change made days ago from quietly re-pricing every call. |
@@ -1182,6 +1183,16 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.8.0 (2026-10-07)
+
+**Idle servers now shut themselves down.** Claude Code keeps one copy of each
+server per session for as long as that session's process lives, and the desktop
+app and `claude rc` keep finished sessions alive for hours. Each server now
+exits after 30 minutes with no tool call; the next call in that session starts
+a fresh one, so the only cost is a slower first call. agy and opencode never
+exit while a run they started is still live, and gemini-web never exits
+mid-call. Set `AGENT_MCP_SERVER_IDLE_EXIT` (seconds, `0` = off) to change it.
 
 ### 1.7.0 (2026-10-01)
 

@@ -365,6 +365,36 @@ class RunStoreTests(unittest.TestCase):
         leftovers = [f for f in os.listdir(mod.RUN_DIR) if ".tmp" in f]
         self.assertEqual(leftovers, [], "temp file was left behind")
 
+    # -- server idle exit ---------------------------------------------------
+
+    def test_idle_exit_after_limit_without_calls(self):
+        mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
+        now = mod._last_call
+        self.assertFalse(mod._should_idle_exit(now + 59))
+        self.assertTrue(mod._should_idle_exit(now + 61))
+
+    def test_tool_call_resets_idle_clock(self):
+        mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
+        mod._last_call -= 3600
+        self.assertTrue(mod._should_idle_exit(time.time()))
+        mod.list_runs()
+        self.assertFalse(mod._should_idle_exit(time.time()))
+
+    def test_no_idle_exit_while_own_run_is_live(self):
+        # This process's monitor is what enforces the run's deadlines between
+        # calls; leaving would defer them to whoever checks next.
+        mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
+        run_id = self.run_id_from(self.dispatch(mod))
+        mod._last_call -= 3600
+        self.assertFalse(mod._should_idle_exit(time.time()))
+        mod.cancel_run(run_id)
+        mod._last_call -= 3600          # cancel_run is itself a call
+        self.assertTrue(mod._should_idle_exit(time.time()))
+
+    def test_idle_exit_zero_disables(self):
+        mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="0")
+        self.assertFalse(mod._should_idle_exit(mod._last_call + 10 ** 9))
+
 
 class OpenCodeRunStoreTests(RunStoreTests):
     """The servers are self-contained duplicates by design, so the store has to
@@ -374,6 +404,37 @@ class OpenCodeRunStoreTests(RunStoreTests):
     BIN_VAR = "OPENCODE_BIN"
     TIMEOUT_VAR = "OPENCODE_MCP_TIMEOUT"
     IDLE_VAR = "OPENCODE_MCP_IDLE_TIMEOUT"
+
+
+class GeminiIdleExitTests(unittest.TestCase):
+    """gemini-web has no run store, so its idle exit guards the browser lock
+    instead: a gemini_ask can run longer than the limit."""
+    counter = 0
+
+    def server(self, limit):
+        _stub_mcp()
+        GeminiIdleExitTests.counter += 1
+        return _load("gemini_web_mcp_server.py", f"srv_gw_{GeminiIdleExitTests.counter}",
+                     {"AGENT_MCP_SERVER_IDLE_EXIT": limit})
+
+    def tearDown(self):
+        for mod in list(sys.modules):
+            if mod.startswith("srv_gw_"):
+                del sys.modules[mod]
+
+    def test_idle_exit_after_limit(self):
+        mod = self.server("60")
+        self.assertFalse(mod._should_idle_exit(mod._last_call + 59))
+        self.assertTrue(mod._should_idle_exit(mod._last_call + 61))
+
+    def test_no_idle_exit_mid_call(self):
+        mod = self.server("60")
+        with mod._browser_lock:
+            self.assertFalse(mod._should_idle_exit(mod._last_call + 3600))
+
+    def test_zero_disables(self):
+        mod = self.server("0")
+        self.assertFalse(mod._should_idle_exit(mod._last_call + 10 ** 9))
 
 
 if __name__ == "__main__":

@@ -488,6 +488,49 @@ def _startup() -> None:
             sys.stderr.write(f"[{SERVER_NAME}] reconcile {run_id}: {exc}\n")
     _prune()
 
+
+# ---------------------------------------------------------------------------
+# Idle exit
+#
+# Claude Code starts one copy of this server per session and keeps it for as
+# long as that session's process lives. The desktop app and `claude rc` keep
+# finished sessions alive for hours, so without this every session opened that
+# day holds a server it will never call again. They are not orphans - the
+# parent is alive and stdin never closes - so nothing else ends them.
+#
+# Leaving is cheap: Claude Code restarts a stdio server that went away, and the
+# next tool call in that session lands on a fresh process (checked against
+# 2.1.29x). Runs live on disk, so the new server adopts them.
+#
+# What a fresh server cannot do is enforce a run's deadlines BETWEEN calls;
+# that is this process's monitor thread. So never leave while a run this
+# process started is still live.
+#
+# Wall clock, not monotonic: on macOS the monotonic clock stops while the
+# machine sleeps, and a session left overnight is exactly the case to catch.
+SERVER_IDLE_EXIT = _int_env("AGENT_MCP_SERVER_IDLE_EXIT", 1800, allow_zero=True)
+
+_last_call = time.time()
+
+
+def _touch() -> None:
+    """Mark a tool call. Every @mcp.tool starts with this."""
+    global _last_call
+    _last_call = time.time()
+
+
+def _should_idle_exit(now: float) -> bool:
+    return bool(SERVER_IDLE_EXIT) and not _live and now - _last_call > SERVER_IDLE_EXIT
+
+
+def _idle_exit_watch() -> None:
+    while True:
+        time.sleep(min(60, SERVER_IDLE_EXIT))
+        if _should_idle_exit(time.time()):
+            sys.stderr.write(f"[{SERVER_NAME}] no tool call in {SERVER_IDLE_EXIT}s; exiting\n")
+            sys.stderr.flush()
+            os._exit(0)
+
 def _tail(path: str, lines: int) -> str:
     """Last `lines` lines of a file, read from the end so a 400MB log costs the
     same as a small one."""
@@ -912,6 +955,7 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     RETURN VALUE IS NOT EVIDENCE, in either direction. Verify with git and the
     gate.
     """
+    _touch()
     # `--` stops flag parsing so a prompt that starts with `-` (e.g. "--help")
     # is treated as the prompt, not as an opencode flag.
     argv = [OPENCODE_BIN, "run", "--auto", "--agent", AGENT, "--print-logs",
@@ -931,6 +975,7 @@ def delegation_status() -> str:
     per session and holds its code in memory, so after a plugin update this
     reports the version still serving this session, not the one on disk.
     """
+    _touch()
     version = _plugin_version()
     live = _live_runs()
     lines = [
@@ -944,6 +989,7 @@ def delegation_status() -> str:
         f"  wall clock: {TIMEOUT_SECONDS}s",
         f"  idle limit: {str(IDLE_SECONDS) + 's' if IDLE_SECONDS else 'off'}",
         f"  fail-fast:  {len(FATAL_PATTERNS)} stderr patterns",
+        f"  self-exit:  " + (f"after {SERVER_IDLE_EXIT}s with no tool call" if SERVER_IDLE_EXIT else "off"),
         f"  run store:  {RUN_DIR} ({len(_record_ids())} records, "
         f"retention {RETENTION_DAYS or 'forever'}d)",
         f"  live now:   {len(live)} "
@@ -972,6 +1018,7 @@ def check_run(run_id: str, tail_lines: int = 80) -> str:
     progress signal - the delegate writes that deliberately, whereas the tail
     here is whatever the CLI happened to print.
     """
+    _touch()
     record = _reconcile(run_id)
     if record is None:
         known = _record_ids()
@@ -1000,6 +1047,7 @@ def cancel_run(run_id: str) -> str:
     Work the delegate already committed stays committed - this stops the agent,
     it does not roll anything back.
     """
+    _touch()
     record = _reconcile(run_id)
     if record is None:
         return f"No run {run_id!r} in {RUN_DIR}."
@@ -1025,6 +1073,7 @@ def list_runs(cwd: str = "", include_finished: bool = True, limit: int = 20) -> 
     re-dispatching anything. A re-dispatch on top of a run that is still going
     doubles the load on a shared quota pool, which is a common way to kill both.
     """
+    _touch()
     ids = _record_ids()
     rows = []
     for run_id in ids:
@@ -1062,4 +1111,6 @@ def list_runs(cwd: str = "", include_finished: bool = True, limit: int = 20) -> 
 if __name__ == "__main__":
     # Off-thread so a slow or large store cannot delay the client's connect.
     threading.Thread(target=_startup, daemon=True).start()
+    if SERVER_IDLE_EXIT:
+        threading.Thread(target=_idle_exit_watch, daemon=True).start()
     mcp.run()
