@@ -11,6 +11,9 @@ through the user: you write the prompt, they run it by hand, they paste the
 answer back. Do not call `gemini_ask`, `WebSearch` or `WebFetch` for this. The
 user can still tell you to run it yourself, and then `gemini_ask` is fine.
 
+One exception: if the user gives you a direct URL, fetch and read it with
+`WebFetch`. That is not research, and handing it over wastes their time.
+
 Topic: $ARGUMENTS
 
 If the topic is empty, use whatever the conversation is currently stuck on.

@@ -527,6 +527,7 @@ writes the research prompt, prints it for you to run in the Gemini web app, and
 waits for you to paste the answer back. It does not call `gemini_ask` for
 research on its own, and it does not fall back to its built-in `WebSearch` /
 `WebFetch` either.
+The one exception is a direct URL you give it: it reads that with `WebFetch`.
 
 **Why.** Automating the Gemini web app is too flaky to depend on. The app is
 buggy, changes often, and throws odd errors even when you drive it by hand. Up
@@ -1183,6 +1184,12 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.8.1 (2026-10-15)
+
+**Direct links are read, not handed over.** When you give Claude a URL, it now
+reads it with `WebFetch` instead of writing a Gemini prompt for it. Open-ended
+research still goes through the handover.
 
 ### 1.8.0 (2026-10-07)
 

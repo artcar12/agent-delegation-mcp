@@ -172,7 +172,7 @@ def _instructions() -> str:
         "write the research prompt, output it as plain text for the user to run "
         "in the Gemini web app, stop, and work from what they paste back. The "
         "gemini-ask skill (/agent-delegation:gemini-ask <topic>) has the full "
-        "procedure.",
+        "procedure. Exception: given a direct URL, just WebFetch it.",
         "ERR ON THE SIDE OF NOT KNOWING. Hand over whenever a fact may sit "
         "outside your training data - versions, releases, prices, APIs, "
         "deprecations, 'is X still true' - and treat being unsure it is current "

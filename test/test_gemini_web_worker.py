@@ -789,7 +789,8 @@ class ResearchHandoverInstructionsTests(unittest.TestCase):
                        "UNATTENDED SESSION",
                        "leave a note",
                        "gemini_ask IS FOR EXPLICIT REQUESTS ONLY",
-                       "/agent-delegation:gemini-ask"):
+                       "/agent-delegation:gemini-ask",
+                       "direct URL, just WebFetch it"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, head)
 
