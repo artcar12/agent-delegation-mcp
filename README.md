@@ -483,8 +483,10 @@ give it: Claude reads that with `WebFetch`.
 drove gemini.google.com in a real Chrome through Playwright (`gemini_ask`,
 `gemini_conversations`, `gemini_read_conversation`). 1.7.0 already demoted it
 from the default research path because the app was too flaky to drive. 1.9.0
-removes it entirely: Google is restricting automated use of the consumer web
-app, so driving a signed-in account risks the account. The code is in git
+removes it entirely: tools that drove the web app to reach Argon (Gemini 4
+Pro) on the Pro plan, where agy offers it only on Ultra, led Google to crack
+down on automating the web app, so driving a signed-in account risks the
+account. The code is in git
 history at tag `agent-delegation--v1.8.1`. `agy` is unaffected; it is a
 supported CLI.
 
@@ -829,8 +831,9 @@ to act on are written up here; the rest is `git log` between tags.
 **The Gemini web wrapper is gone.** `gemini-web-wrapper` and its tools
 (`gemini_ask`, `gemini_conversations`, `gemini_read_conversation`, and its
 `delegation_status`) are removed, along with `gemini_web.py` and every
-`GEMINI_WEB_*` variable. Google is restricting automated use of the consumer
-Gemini web app, and a driven account is at risk. Web research stays a prompt
+`GEMINI_WEB_*` variable. Google is cracking down on automating the web app,
+because tools used it to reach Argon (Gemini 4 Pro) on the Pro plan when agy
+offers it only on Ultra, and a driven account is at risk. Web research stays a prompt
 handover through the `gemini-ask` skill; nothing replaces running the prompt for
 you. The dedicated Chrome profile at `~/.agent-delegation-mcp/gemini-profile`
 is no longer used and still holds a signed-in Google session; delete it if you
