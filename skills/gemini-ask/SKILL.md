@@ -1,6 +1,6 @@
 ---
 name: gemini-ask
-description: Write a ready-to-paste web research prompt for the user to run in the Gemini web app, instead of searching yourself. Use when the user invokes /gemini-ask <topic>, asks for a research prompt, or whenever an answer depends on facts that may be newer than your training data (current versions, release dates, prices, API changes, deprecations, "is X still true") and you are not sure what you know is current. Calls no tools.
+description: Write a ready-to-paste web research prompt for the user to run in the Gemini web app, instead of searching yourself. Use when the user invokes /gemini-ask <topic>, asks for a research prompt, or when an answer needs open-ended research across many sources (comparisons, surveys, current state of the art). NOT for a single fact, a yes/no about something common but newer than your training data, or a direct URL; look those up yourself with WebSearch/WebFetch. Calls no tools.
 argument-hint: <topic or question>
 ---
 
@@ -12,8 +12,15 @@ they run it by hand, they paste the answer back. Do not call `WebSearch` or
 `WebFetch` for this, and do not try to drive the web app through a browser
 tool.
 
-One exception: if the user gives you a direct URL, fetch and read it with
-`WebFetch`. That is not research, and handing it over wastes their time.
+Exceptions, handled yourself with `WebFetch`/`WebSearch`, because handing them
+over wastes the user's time:
+
+- The user gives you a direct URL: fetch and read it.
+- A single fact, or a yes/no about something common that may be newer than
+  your training data (a current version, a release date, "does X support Y
+  yet"): look it up.
+
+Only open-ended research that needs many sources comes here.
 
 Topic: $ARGUMENTS
 
@@ -21,9 +28,11 @@ If the topic is empty, use whatever the conversation is currently stuck on.
 
 ## When to reach for this unprompted
 
-Err on the side of not knowing. If a fact could sit outside your training data
-and you are not sure it is current, hand over a prompt rather than answering
-from memory with a caveat.
+When an answer depends on open-ended research (comparing options, surveying
+what exists, the current state of the art) and what you know may be out of
+date, hand over a prompt rather than answering from memory with a caveat. A
+single checkable fact is not that: look it up instead (see the exceptions
+above).
 
 **Exception: the user is away.** If the session is running a goal skill, or the
 user said they will not be around, do not stop to wait for a handover. Carry on
@@ -52,12 +61,12 @@ Write ONE complete, specific prompt. Length is not a problem:
 ## The session line
 
 Always say whether to run it in a **new** Gemini conversation or **continue**
-the previous one. Default to the same conversation when the prompt is a direct
-follow-up on the same subject; use a new one for an unrelated topic. Say it
+the previous one. Same Gemini conversation only if the prompt needs something
+only the earlier answers contain; otherwise a new one. No default. Say it
 explicitly either way, for example:
 
-- "Same thread as before: this follows up on the same vendors."
-- "New conversation: unrelated topic."
+- "Same thread as before: this builds on the vendor list it gave."
+- "New conversation: nothing here depends on the earlier answers."
 
 ## Output
 
