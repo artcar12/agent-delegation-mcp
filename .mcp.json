@@ -15,14 +15,6 @@
         "--script",
         "./agy_mcp_server.py"
       ]
-    },
-    "gemini-web-wrapper": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--script",
-        "./gemini_web_mcp_server.py"
-      ]
     }
   }
 }

@@ -5,7 +5,8 @@
 # ///
 """Exercises the run store in the agy and opencode servers against fake CLIs.
 
-The gemini-web server had a third copy until 1.7.0 removed dispatch_gemini.
+The gemini-web server had a third copy until 1.7.0 removed dispatch_gemini;
+1.9.0 removed the server.
 
 Runs with plain `python3 test/test_run_store.py` - no MCP install needed. The
 decorator is the only thing the servers use from the SDK, so a stub that
@@ -76,7 +77,7 @@ def _load(filename, alias, env):
 
 
 def _fake_cli(directory, body):
-    """A stand-in for agy/opencode/gemini_web: a shell script we control."""
+    """A stand-in for agy/opencode: a shell script we control."""
     path = os.path.join(directory, "fake-cli")
     with open(path, "w") as fh:
         fh.write("#!/bin/sh\n" + body)
@@ -404,37 +405,6 @@ class OpenCodeRunStoreTests(RunStoreTests):
     BIN_VAR = "OPENCODE_BIN"
     TIMEOUT_VAR = "OPENCODE_MCP_TIMEOUT"
     IDLE_VAR = "OPENCODE_MCP_IDLE_TIMEOUT"
-
-
-class GeminiIdleExitTests(unittest.TestCase):
-    """gemini-web has no run store, so its idle exit guards the browser lock
-    instead: a gemini_ask can run longer than the limit."""
-    counter = 0
-
-    def server(self, limit):
-        _stub_mcp()
-        GeminiIdleExitTests.counter += 1
-        return _load("gemini_web_mcp_server.py", f"srv_gw_{GeminiIdleExitTests.counter}",
-                     {"AGENT_MCP_SERVER_IDLE_EXIT": limit})
-
-    def tearDown(self):
-        for mod in list(sys.modules):
-            if mod.startswith("srv_gw_"):
-                del sys.modules[mod]
-
-    def test_idle_exit_after_limit(self):
-        mod = self.server("60")
-        self.assertFalse(mod._should_idle_exit(mod._last_call + 59))
-        self.assertTrue(mod._should_idle_exit(mod._last_call + 61))
-
-    def test_no_idle_exit_mid_call(self):
-        mod = self.server("60")
-        with mod._browser_lock:
-            self.assertFalse(mod._should_idle_exit(mod._last_call + 3600))
-
-    def test_zero_disables(self):
-        mod = self.server("0")
-        self.assertFalse(mod._should_idle_exit(mod._last_call + 10 ** 9))
 
 
 if __name__ == "__main__":

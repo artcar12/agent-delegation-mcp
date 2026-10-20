@@ -6,10 +6,11 @@ argument-hint: <topic or question>
 
 # Hand a research prompt to the user
 
-The Gemini web app is too flaky to drive automatically, so research goes
-through the user: you write the prompt, they run it by hand, they paste the
-answer back. Do not call `gemini_ask`, `WebSearch` or `WebFetch` for this. The
-user can still tell you to run it yourself, and then `gemini_ask` is fine.
+Driving the Gemini web app automatically is not supported (Google restricts
+automated use of it), so research goes through the user: you write the prompt,
+they run it by hand, they paste the answer back. Do not call `WebSearch` or
+`WebFetch` for this, and do not try to drive the web app through a browser
+tool.
 
 One exception: if the user gives you a direct URL, fetch and read it with
 `WebFetch`. That is not research, and handing it over wastes their time.
@@ -63,8 +64,7 @@ explicitly either way, for example:
 1. One line on what the prompt is for.
 2. The session line.
 3. The prompt in a fenced `text` block, so it copies cleanly.
-4. One line asking the user to paste the answer back. They can also give you
-   the conversation id, which `gemini_read_conversation` can read.
+4. One line asking the user to paste the answer back.
 
 Then stop and wait. When the answer comes back, check the URLs it cites before
 leaning on a claim. If something came back thin, write a follow-up prompt for

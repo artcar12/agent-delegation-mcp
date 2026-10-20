@@ -4,11 +4,10 @@
 
 **Claude plans. Cheaper models build. Claude decides whether it's correct.**
 
-Three local MCP stdio servers, shipped as a Claude Code plugin, that let Claude Code
+Two local MCP stdio servers, shipped as a Claude Code plugin, that let Claude Code
 hand implementation work to the **Antigravity CLI** (`agy`, Gemini) and to
-**OpenCode**, run it fully unattended, and then gate the result. The third
-reaches the **Gemini web app**; web research through it is handed to you as a
-prompt to run, not automated.
+**OpenCode**, run it fully unattended, and then gate the result. Web research is
+handed to you as a Gemini prompt to run by hand, not automated.
 
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![plugin](https://img.shields.io/badge/claude%20code-plugin-8A63D2)
@@ -48,7 +47,7 @@ established by mutation testing on a real project, at the versions listed in
 | [2. Install](#2-install) | Prerequisites, plugin install, why there is no venv |
 | [3. Configuration](#3-configuration) | Every environment variable |
 | [4. What the tools actually run](#4-what-the-tools-actually-run) | The argv, the seven silent flags, the five tools, the reconcile loop |
-| [4.5 The Gemini web wrapper](#45-the-gemini-web-wrapper) | Research handed to you as a prompt, the browser app as a fallback, and the sign-in you do by hand |
+| [4.5 Web research handover](#45-web-research-handover) | Research handed to you as a Gemini prompt, and why the web app is not automated |
 | [5. Operating rules](#5-operating-rules) | The part that took weeks instead of an hour |
 | [6. Repo conventions](#6-repo-conventions-that-make-this-work) | Where state lives |
 | [7. Known failure modes](#7-known-failure-modes-condensed) | Symptom → cause → fix |
@@ -307,18 +306,10 @@ environment Claude Code itself inherits. All are optional.
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
-| `AGENT_MCP_MAX_OUTPUT` | all three | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
+| `AGENT_MCP_MAX_OUTPUT` | both | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
 | `AGENT_MCP_RUN_DIR` | agy, opencode | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. Both share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
 | `AGENT_MCP_RUN_RETENTION_DAYS` | agy, opencode | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
-| `AGENT_MCP_SERVER_IDLE_EXIT` | all three | `1800` | The server exits after this many seconds with no tool call, so a session left open for hours stops holding it; Claude Code starts a fresh one on that session's next call. Never fires while a run the agy or opencode server started is still live, or mid-call on gemini-web. `0` keeps the server for the life of the session. |
-| `GEMINI_WEB_PROFILE` | gemini-web | `~/.agent-delegation-mcp/gemini-profile` | The Chrome user-data-dir the worker drives. Never point this at your daily profile: Chrome refuses to share one with a running instance. |
-| `GEMINI_WEB_CHROME` | gemini-web | the system Chrome | Only used by `login`, which needs a Chrome that Playwright is *not* driving. |
-| `GEMINI_WEB_EXPECT_MODEL` | gemini-web | `flash` | The model `ask` requires before it will send anything; a mismatch exits 8 having sent nothing. `any` skips the check. The picker is a profile setting that persists across runs, so this is what stops a change made days ago from quietly re-pricing every call. |
-| `GEMINI_WEB_NO_PACING` | gemini-web | unset | Set to `1` to drop the interaction delays while debugging. The anti-automation launch flags stay on regardless. |
-| `GEMINI_WEB_HEADLESS` | gemini-web | off | `1` runs the automation without a window. Off by default: headless is likelier to trip Google's bot heuristics, and the clipboard extraction path needs a focused window. |
-| `GEMINI_WEB_WORKER` | gemini-web | `gemini_web.py` beside the server | Point the server at a worker somewhere else. |
-| `GEMINI_WEB_UV_BIN` | gemini-web | `uv` on PATH | `uv run --script` is what honours the worker's inline dependency block, so this is the launcher, not python. PATH is not reliably inherited. |
-| `GEMINI_WEB_BIN` | gemini-web | — | Skip uv entirely and run this executable as the worker. Mostly an escape hatch for tests. |
+| `AGENT_MCP_SERVER_IDLE_EXIT` | both | `1800` | The server exits after this many seconds with no tool call, so a session left open for hours stops holding it; Claude Code starts a fresh one on that session's next call. Never fires while a run the server started is still live. `0` keeps the server for the life of the session. |
 
 ---
 
@@ -479,384 +470,45 @@ breaks the loop.
 
 ---
 
-## 4.5 The Gemini web wrapper
+## 4.5 Web research handover
 
-`gemini-web-wrapper` is the third server and the odd one out: it does not wrap a
-CLI, it wraps **gemini.google.com in a real Chrome**.
+Web research is a **prompt handover**. Claude writes the research prompt, prints
+it for you to run in the Gemini web app, and waits for you to paste the answer
+back. The skill `/agent-delegation:gemini-ask <topic>` does this on demand, and
+its description makes Claude reach for it unprompted when a fact may be newer
+than its training data. It calls no tools. The one exception is a direct URL you
+give it: Claude reads that with `WebFetch`.
 
-### Why it exists
+**Why not automate it.** Up to 1.8.x a third server, `gemini-web-wrapper`,
+drove gemini.google.com in a real Chrome through Playwright (`gemini_ask`,
+`gemini_conversations`, `gemini_read_conversation`). 1.7.0 already demoted it
+from the default research path because the app was too flaky to drive. 1.9.0
+removes it entirely: Google is restricting automated use of the consumer web
+app, so driving a signed-in account risks the account. The code is in git
+history at tag `agent-delegation--v1.8.1`. `agy` is unaffected; it is a
+supported CLI.
 
-`agy` and `gemini` both reach Gemini through an API that has no live search,
-no Canvas, no Gems, no conversation history and no attachments. Those exist only
-in the logged-in web app. If you have a Pro subscription, this is how a CLI agent
-reaches what you are already paying for.
-
-### Shape
-
-```
-MCP client  ->  gemini_web_mcp_server.py  ->  gemini_web.py  ->  Chrome  ->  gemini.google.com
-                (run store, tools)            (Playwright)       (dedicated profile)
-```
-
-Playwright deliberately does **not** run inside the MCP server. The worker is an
-ordinary child process, one per call, and every tool blocks until it returns.
-There is no run store on this server: `dispatch_gemini` and its `check_run` /
-`cancel_run` / `list_runs` were removed in 1.7.0 (see below).
-
-### Tools
-
-| Tool | Blocks? | Notes |
-|---|---|---|
-| `gemini_ask` | yes | Only when you explicitly ask Claude to run it, or for Canvas, image, video or an attachment. ~20s floor: Chrome has to launch and the Angular app has to hydrate before a prompt can be typed. `timeout_seconds` (default 240) covers longer work. |
-| `gemini_conversations` | yes | Sidebar history as `id  title`. |
-| `gemini_read_conversation` | yes | Dump a thread as markdown without adding to it. This is how a handover can come back without copy-paste: run the prompt by hand, give Claude the conversation id. |
-| `delegation_status` | yes | Also reports whether the profile is still signed in. |
-
-And one skill, `/agent-delegation:gemini-ask <topic>`, which writes a research
-prompt for you to run and calls no tools.
-
-Modes: `chat` (default), `canvas`, `image`, `video`.
-
-Every answer reports a `conversation_id`. Pass it back to `gemini_ask` to
-continue that thread instead of starting a new one.
-
-### Web research is handed to you, not run here
-
-Since 1.7.0 the default for web research is a **prompt handover**. Claude
-writes the research prompt, prints it for you to run in the Gemini web app, and
-waits for you to paste the answer back. It does not call `gemini_ask` for
-research on its own, and it does not fall back to its built-in `WebSearch` /
-`WebFetch` either.
-The one exception is a direct URL you give it: it reads that with `WebFetch`.
-
-**Why.** Automating the Gemini web app is too flaky to depend on. The app is
-buggy, changes often, and throws odd errors even when you drive it by hand. Up
-to 1.6.x the MCP instructions told every session to use `gemini_ask` for
-research by default and to retry rather than fall back. That made the flakiest
-path the one every research question went through. A prompt you run yourself
-fails in front of you, where you can see it and retry, instead of inside a
-tool call. (ADM-7.)
-
-What the instructions now tell a session:
+What the skill asks of a handover:
 
 - **Err on the side of not knowing.** Hand over a prompt whenever a fact may be
   newer than the model's training data: versions, release dates, prices, API
-  changes, deprecations, "is X still true". Being *unsure* whether it is current
-  counts as not knowing.
-- **Unattended sessions are the exception.** If you are running a goal skill or
-  have said you will be away, Claude carries on from what it knows. For each
-  fact that really needs live knowledge it leaves a note: the claim, why it may
-  be stale, what depends on it, and the prompt, ready to run. It does not call
-  `gemini_ask` in your place.
+  changes, deprecations, "is X still true".
+- **Unattended sessions are the exception.** In a goal skill, or when you have
+  said you will be away, Claude carries on and leaves a note per fact that
+  needs live knowledge, with the prompt ready to run.
 - **One complete, specific prompt** with context, the exact questions and the
   shape of answer wanted. There is no prompt length worth worrying about.
-- **A source URL per claim**, never a verbatim quote per claim (see the caveat
-  below).
+- **A source URL per claim**, never a verbatim quote per claim. Asking for
+  quotes can make Gemini announce it has no web access and answer from memory.
+  If an answer says it cannot browse, it is wrong; retry without the quote
+  demand.
 - **Always say which session**: a new Gemini conversation, or continue the
-  previous one. Same conversation is the default for a direct follow-up on the
-  same subject. Either way it is said explicitly, so you never have to ask.
+  previous one.
 - **Follow-ups over fresh prompts.** When an answer comes back thin, the next
   prompt pushes on exactly that, in the same thread.
-
-`/agent-delegation:gemini-ask <topic>` does the same thing on demand.
-
-> [!NOTE]
-> Claude Code truncates a server's instructions at roughly 2000 characters; the
-> 1.6.x text reached sessions cut off mid-sentence, so its quota and model rules
-> never arrived. All of the rules above now sit in the first ~1800 characters,
-> and a test fails if an edit pushes one past 2000. Keep it that way: anything
-> added to `_instructions()` goes after them.
-
-`gemini_ask` still works when you tell Claude to run it ("run it yourself"),
-and it is still the tool for Canvas, image, video and attachments. When it is
-used, the quota rules below hold. The web app meters separately from the
-`agy`/`gemini` CLI, and generously: after a heavy day of use its rolling window
-read 16% consumed and its weekly limit 1%. So neither a handover nor an
-explicit call should bundle unrelated questions or skip a follow-up to save a
-request.
-
-> [!NOTE]
-> Live numbers are in the web app under **Settings → Usage limits**, which is
-> where to look if a call ever fails on quota — not at this paragraph.
-
-### There is no Deep Research here, on purpose
-
-It was built, tested, and taken back out in 1.3.0. Both halves of that decision
-are worth recording, because the obvious instinct is to put it back.
-
-**It did not work reliably.** Of three kick-offs, one produced a report in about
-40 minutes and two wedged: panel frozen at the same character count and thought
-count for over an hour, no error shown, the chip still reading *"Researching 64
-websites…"*, and no recovery. The harvest code reported that honestly rather
-than inventing a report, but honest reporting of a two-thirds failure rate is
-not a feature. Known-brittle machinery is worse than none, because it invites a
-plan that depends on it.
-
-**And it was solving a problem a CLI agent does not have.** An agent can write a
-prompt of any length and ask as many follow-ups as it likes. That covers most of
-what Deep Research is for, in half a minute rather than forty. Tested head to
-head on the same question — a detailed Redis vs Valkey comparison — the long
-`gemini_ask` on Flash answered in **37 seconds** with governance, divergence,
-benchmarks, an ecosystem table and recommendations split by situation. The Deep
-Research run on the identical question never finished.
-
-So the shape of a handover prompt is: **one long, specific prompt, then
-follow-ups into the same thread** to push on whatever came back thin. That is
-not a workaround; it is the better tool.
-
-If a job genuinely does need Deep Research, the handover says so, so you can
-run it in Deep Research mode, then paste the report back or hand over the
-conversation id. `gemini_read_conversation` reads the finished thread.
-Extraction still drops the reasoning trace and browse chips, so that path works
-today and is covered by tests.
-
-The removed code is in git history at tag `agent-delegation--v1.2.2`, along with
-the one genuinely hard-won piece of knowledge in it: a finished report keeps its
-`thinking-panel-skeleton-loader` mounted and visible, so "is a loader still
-showing?" reports every completed report as running forever. See ADM-4.
-
-One caveat for writing the prompt, learned the annoying way: **asking for a
-verbatim quote per claim can make the model announce it has no web access and
-then answer from memory anyway.** Asking for a *URL* per claim is safe. If an
-answer ever claims it cannot browse, it is wrong — a control question came back
-with a Node.js release from two days earlier, URL included. Retry without the
-quote demand.
-
-### Signing in: you have to do this by hand, once
-
-```bash
-uv run --script gemini_web.py login
-```
-
-That opens a **plain** Chrome against `~/.agent-delegation-mcp/gemini-profile`,
-waits for you to sign in and quit it, then verifies with Playwright.
-
-It has to work this way. Google refuses its own sign-in flow inside a browser
-under the DevTools protocol — you get *"Couldn't sign you in / This browser or app
-may not be secure"* and no user-agent or flag tweak gets past it. The block
-applies to the sign-in flow only, not to cookies that already exist, so the
-sign-in happens in an unautomated Chrome and Playwright picks the profile up
-afterwards. Chrome will not share a user-data-dir between instances, which is why
-`login` waits for you to quit rather than running alongside.
-
-Two traps worth naming:
-
-- **That window is its own Chrome instance.** No bookmarks, no other tabs, not
-  signed in. Signing into your everyday Chrome does nothing for it.
-- **Gemini serves anonymous visitors a fully working composer.** So "the prompt
-  box rendered" proves nothing — you can use that window for a while and quit it
-  still signed out, with nothing on screen having looked wrong. `login` lands you
-  on the account chooser rather than on Gemini for exactly this reason, and checks
-  the profile's cookies before it claims success.
-
-### Pacing: not looking like a script
-
-This drives a paid account that the account holder is entitled to use, under
-the same quota everyone else gets. The goal is not to take more than the plan
-allows — it is to not be conspicuous while taking what it allows.
-
-A script is obvious for boring reasons. It clicks the instant an element
-exists, types a 900-character prompt as one `insertText` event, and polls on an
-exact 500ms metronome. None of that is how a person behaves, and all of it is
-cheap for a site to measure.
-
-| | before | now |
-|---|---|---|
-| clicking | immediate | scroll into view, hover, 90–320ms, click |
-| typing | one event for the whole prompt | bursts of 3–11 chars, 30–130ms apart |
-| after navigation | act immediately | 600–1900ms dwell |
-| before sending | immediate | 600–1900ms, the re-read everyone does |
-| response polls | exactly 500ms / 1500ms | both jittered |
-
-Plus two browser tells: `--enable-automation` is dropped (it is what sets
-`navigator.webdriver` and raises the "controlled by automated test software"
-infobar), `--disable-blink-features=AutomationControlled` is added, and an init
-script clears `navigator.webdriver` for anything that re-reads it.
-
-Past ~450 characters the rest of a prompt goes in as a single paste. Typing
-4000 characters at a human rate is its own anomaly — nobody hand-types an essay
-into a chat box, they paste, and a paste is one event.
-
-**The window size is deliberately not randomised.** It is chosen once and
-persisted in the profile. A window that is a different size every session is an
-inconsistency that a fixed size would never have produced. Same reasoning for
-not spoofing user-agent, locale or timezone: a real Chrome against a real
-profile already reports truthful ones, and overriding them manufactures
-mismatches.
-
-`GEMINI_WEB_NO_PACING=1` drops the delays when you are debugging a selector and
-do not want to wait. The launch flags stay either way; they cost nothing.
-
-> [!NOTE]
-> Honest ceiling: this stops the *obvious* signals. It will not defeat serious
-> fingerprinting, and nothing here touches a CAPTCHA or any other challenge —
-> if one appears the run fails and a human deals with it. The strongest
-> protections were already in place before any of this: a stock Chrome build
-> rather than Playwright's chromium, a persistent profile with real history,
-> and headed by default.
-
-### Attachments are waited for, not slept on
-
-`attach()` used to sleep a flat 1.5s and then send regardless. Uploads take far
-longer than that — 10–30s even for a 31-byte CSV — so the prompt went out while
-the file was still in flight, Gemini received an **empty** attachment, and the
-worker exited 0. A total failure looked exactly like a correct answer.
-
-It now blocks on the composer's own upload state and makes a stall fatal. The
-rule is that the upload must be *seen in progress and then seen to finish*, with
-a chip for every file. Details that are not obvious and cost real debugging
-time:
-
-- **Seen in progress is what makes it fail closed.** The chip appears ~2s after
-  the file is chosen while the bytes take 10–30s, so a check that only looks
-  for the chip passes mid-flight whenever the busy signal is missed. A UI in
-  another language, or a renamed indicator, therefore refuses to send rather
-  than sending an empty file. The busy signal is read two ways: the app's
-  `Uploading` text and any progress indicator that was not there before.
-- **Chips count only if they are new.** The composer is snapshotted before the
-  upload starts and a chip has to appear in text that was not already there.
-  Otherwise a file called `gemini.md` or `tools.csv` passes on the first poll
-  against the composer's own labels, with no chip at all.
-- **Scope to `<input-container>`, never `document.body`.** The body contains the
-  conversation sidebar, so a previous chat's *title* can satisfy a naive
-  filename search and pass the check for entirely the wrong reason.
-- **Match the basename stem, not the filename.** The chip renders the type and
-  the stem on separate lines — `CSV`, then `parts` — so the string `parts.csv`
-  never appears in the composer at all.
-
-The worker's `--timeout` is a budget for the whole ask, launch and upload wait
-included, and the answer gets what is left. That is what keeps the MCP server's
-kill deadline, a fixed 20s above `--timeout`, from firing first when an upload
-eats most of a minute.
-
-> [!WARNING]
-> Attachments do not survive `--mode canvas` (ADM-6). In canvas mode no chip and
-> no upload indicator appear, so the upload never starts. The combination is
-> refused up front, by the worker and by `gemini_ask`, before a browser
-> opens. Use chat mode with attachments.
-
-### The model is a profile setting, and it is checked before every prompt
-
-Whatever model the picker shows is stored **in the profile, not the tab**.
-Switch it once and it persists across new tabs, later runs and later days. That
-is convenient and it is the hazard: a change made at any point silently applies
-to every call afterwards, and the only symptom is a quietly more expensive run.
-
-This is not hypothetical. The picker sat on Pro for a whole session of calls
-before anyone noticed, and Pro is the one model whose daily limit is reachable.
-
-So `ask` reads the picker **before typing** and refuses on a mismatch:
-
-```bash
-uv run --script gemini_web.py model                 # what is it on?
-uv run --script gemini_web.py model --set flash     # switch it
-uv run --script gemini_web.py ask --expect-model any --prompt '...'   # opt out
-```
-
-A refusal exits **8**, having sent nothing and spent no quota. The default
-expectation is Flash; `GEMINI_WEB_EXPECT_MODEL` changes it.
-
-> [!NOTE]
-> Matching is exact on the normalised name, never a substring. The picker lists
-> `3.5 Flash-Lite` *above* `3.8 Flash`, so `"flash" in label` selects Flash-Lite
-> — a weaker model, chosen silently, with nothing downstream to reveal it. The
-> version prefix is stripped because Google bumps it at will.
-
-The MCP tools deliberately expose no way to switch models. An agent that could
-escalate itself to Pro would defeat the point of the check; changing the model
-stays a human decision, made either in the browser or with the CLI above.
-
-### Do not smoke-test it with the same string every time
-
-The pacing work above is undone for free by asking `reply with exactly: pong`
-fifty times. A repeated identical one-word prompt against a single account is
-the most script-like artifact in the whole flow — more so than the timing, which
-is what 1.4.0 spent effort disguising. Nothing in this repo hard-codes such a
-canary, and nothing should: vary the wording *and* the expected answer, or use a
-short question you actually wanted answered.
-
-Keeping it deterministic enough to assert on is easy — "answer in one word: what
-colour is a ripe banana", "one word: capital of Portugal" — and those read as use
-rather than instrumentation.
-
-> [!NOTE]
-> Proportion: this is a cheap habit, not a meaningful defence. Prompt text is a
-> weak signal next to cookies and request cadence, and there is no evidence
-> Google diffs prompt strings looking for automation. It costs nothing to avoid,
-> which is the entire argument for doing it.
-
-### One browser, one profile, one call at a time
-
-Every tool here refuses when another is running. On the sibling servers that
-refusal is quota etiquette; here it is a hard constraint — Chrome cannot open the
-same user-data-dir twice, and the alternative to refusing is a corrupted profile.
-
-### It is silent while it works
-
-A browser run prints **nothing** between launch and the final answer, so
-`gemini_ask` simply blocks until it is done. Raise `timeout_seconds` for Canvas
-or image/video work, which can take minutes.
-
-### Running out of quota, and how it shows up
-
-Gemini does not answer an over-quota request with an HTTP error. It answers with
-something that looks like an answer, which is the whole problem. Through 1.4.0
-the worker returned those straight to the caller, so a delegating agent could
-receive *"Sorry, something went wrong. Please try your request again."* and treat
-it as a research finding.
-
-Four symptoms, in rough order of how badly they mislead:
-
-| Symptom | What it looks like from here | Handling |
-|---|---|---|
-| **Pro exhausted → silent downgrade to Flash** | A real, complete, slightly weaker answer. No message. | Every answer now reports `answered by: <model>`. |
-| **Limit notice as a reply** | A finished response turn, action row and all | `classify_response()` → exit **6** |
-| **Transient glitch** | Same shape, different wording | exit **7**, one retry is reasonable |
-| **Conversation limit → composer locked** | The prompt box never appears | Reads as a selector break; the error now names the lockout as a candidate |
-| **Throttled while a heavy mode is requested** | image / video / canvas missing from the tools drawer | Reads as a rename; the error now says so |
-
-The split between 6 and 7 is the point. A transient glitch is worth one retry; a
-limit is worth none, because retrying into a throttle is how a soft limit becomes
-a hard one — and the account absorbing that is your own paid subscription.
-
-**What this does not do.** Detection is a pattern list against short responses,
-so an unrecognised limit message still comes back as content. The length gate is
-deliberate: without it, asking Gemini about *some other service's* rate limits
-would classify its own answer as a throttle. Only the transient pattern has been
-observed from this worker; the throttle patterns match Gemini's own description
-of its limit behaviour, which traces to third-party write-ups rather than Google
-documentation. Treat the table as a good net, not a seal.
-
-There is deliberately **no retry loop and no backoff**. Both would convert a
-clear signal into a slow one.
-
-### Flash is the right model for almost everything
-
-Reserve Pro for genuinely hard reasoning, which is rare in CLI work. A long,
-specific prompt to Flash beats a short one to Pro for lookups, version checks,
-comparisons and page-reading — which is nearly all of what an agent asks for.
-Pro is also the only model whose daily limit is realistically reachable, so
-defaulting to it spends the scarce resource on the cases that did not need it.
-
-The worker cannot switch models: the picker holds whatever the profile was last
-left on, and changing it is a human action in the browser. That is deliberate —
-it keeps model choice a decision you make rather than one an agent drifts into.
-
-### When Google reshuffles the DOM
-
-Every selector is unversioned Angular internals, collected in one `SELECTORS`
-dict at the top of `gemini_web.py`. A redesign is a one-file fix, and the worker
-fails naming the selector that moved rather than hanging. Response extraction
-prefers Gemini's own copy-to-clipboard markdown and falls back to an HTML ->
-Markdown pass in Python — which is Python rather than JS in the page precisely so
-`test/test_gemini_web_worker.py` can test it offline against captured fixtures.
-
-> [!WARNING]
-> Automating the web UI is outside Google's terms for automated access. A driven
-> account can be rate-limited or suspended. Using a stock Chrome build with a
-> persistent profile lowers the odds; it does not remove them.
-
----
+- **Deep Research only when the job needs it** (dozens of sources, a written
+  report as the deliverable). One long prompt plus follow-ups beat it head to
+  head: 37 seconds against a run that never finished.
 
 ## 5. Operating rules
 
@@ -1143,20 +795,7 @@ reopening settled questions or rediscovering the same platform gotcha.
 | Gate passes, feature does not work | tests cover the helper, not the caller | the [§5.5](#55-verify-the-plans-named-test-files-actually-exist-and-that-they-test-the-caller) checklist |
 | No visibility during a long run | dispatch used to block with no interim output | `check_run` for the log tail; the mandatory progress file for real phase-by-phase progress |
 | `ImportError: mcp.server.fastmcp` | mcp 2.0 removed that module | already handled: the servers import `MCPServer` and fall back to `FastMCP` |
-| gemini-web: sign in, verify, "still signed out" — every time | **the verification itself destroyed the session.** Playwright passes `--use-mock-keychain` by default; on macOS that hands Chrome a different cookie-encryption key than the real Keychain holds, so Chrome cannot decrypt the profile's cookies and silently deletes them on launch | already handled: `ignore_default_args=["--use-mock-keychain"]`. `login` now counts google.com cookies before and after and says so outright if they vanish |
-| gemini-web: "Couldn't sign you in / This browser or app may not be secure" | Google refuses OAuth in a browser under the DevTools protocol. No user-agent or flag tweak gets past it | sign in via `gemini_web.py login`, which runs a Chrome that Playwright is *not* driving. Only the sign-in *flow* is blocked; existing cookies work fine |
-| gemini-web: `Failed to create a ProcessSingleton` | Chrome will not share a user-data-dir between instances, and a crash leaves a stale lock | quit the other Chrome on that profile; if none is running, delete `SingletonLock` in the profile dir |
-| gemini-web: prompt lands in the box and never sends, headless only | Angular ignores a synthetic Enter in headless Chrome | already handled: the send button is clicked, with Enter only as fallback |
-| gemini-web: `selector 'file_input' never appeared` | Gemini's file inputs are `class="hidden-file-input"` and Playwright waits for *visible* by default | already handled: that wait uses `state="attached"` |
-| gemini-web: "no tool labelled 'canvas'" | which tools the drawer promotes varies; the rest sit behind **More tools** | already handled: the overflow is expanded and searched again |
-| gemini-web: a link in an answer goes to a Google redirect, not the page | Gemini rewrites outbound hrefs through `google.com/search?q=<real url>&utm_source=gemini` while the anchor text shows the real destination | already handled: the real URL is taken back out of the `q` parameter during extraction |
-| gemini-web: `selector 'conversation_link' never appeared` | nothing moved — Gemini ships the sidebar collapsed, and Angular does not render the history list until it is opened | already handled: the sidebar is expanded before the list is read |
-| gemini-web: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | rewrite the prompt to ask for a URL per claim instead of a quote, and run it again |
-| gemini-web: an answer reads like a system message ("Sorry, something went wrong") | Gemini renders limit notices and glitches as ordinary response turns, so every completion signal says "done" | already handled: `classify_response()` exits **6** (limit, do not retry) or **7** (transient, one retry). An unrecognised message still comes back as content — see [Running out of quota](#running-out-of-quota-and-how-it-shows-up) |
-| gemini-web: answers got noticeably weaker with no error | Pro quota exhausted; the app downgrades to Flash **silently** | already handled: every answer reports `answered by: <model>`. Check that before assuming the question was hard |
-| gemini-web: "the prompt box never appeared" | usually a selector change — but a fully exhausted account has its composer **locked** | open the profile in a browser and look before chasing the selector; the error names both |
-| gemini-web: a mode that worked yesterday is "no tool labelled ..." today | compute-heavy tools (image, video, canvas) are withdrawn from the drawer while throttled | same: check the browser first. The error now says so |
-| gemini-web: `login` says signed in, `status` says signed out | the composer renders for anonymous visitors, so "the page loaded" proves nothing | both now check the account footer and the profile's cookies, not the composer |
+| Gemini handover: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | rewrite the prompt to ask for a URL per claim instead of a quote, and run it again |
 | An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
 | A delegate left over from a session that ended | nothing kills a run when its server dies, by design | `list_runs` finds it; `cancel_run` stops it; `check_run` applies its deadlines |
@@ -1184,6 +823,18 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.9.0 (2026-10-20)
+
+**The Gemini web wrapper is gone.** `gemini-web-wrapper` and its tools
+(`gemini_ask`, `gemini_conversations`, `gemini_read_conversation`, and its
+`delegation_status`) are removed, along with `gemini_web.py` and every
+`GEMINI_WEB_*` variable. Google is restricting automated use of the consumer
+Gemini web app, and a driven account is at risk. Web research stays a prompt
+handover through the `gemini-ask` skill; nothing replaces running the prompt for
+you. The dedicated Chrome profile at `~/.agent-delegation-mcp/gemini-profile`
+is no longer used and still holds a signed-in Google session; delete it if you
+do not want that around. `agy` and `opencode` are unchanged.
 
 ### 1.8.1 (2026-10-15)
 
