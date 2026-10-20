@@ -492,9 +492,10 @@ supported CLI.
 
 What the skill asks of a handover:
 
-- **Err on the side of not knowing.** Hand over a prompt whenever a fact may be
-  newer than the model's training data: versions, release dates, prices, API
-  changes, deprecations, "is X still true".
+- **Open-ended research only.** Hand over a prompt when the answer needs many
+  sources: comparisons, surveys, the current state of the art. A single fact,
+  a yes/no about something common but recent, or a direct URL Claude looks up
+  itself with WebSearch/WebFetch.
 - **Unattended sessions are the exception.** In a goal skill, or when you have
   said you will be away, Claude carries on and leaves a note per fact that
   needs live knowledge, with the prompt ready to run.
@@ -504,8 +505,9 @@ What the skill asks of a handover:
   quotes can make Gemini announce it has no web access and answer from memory.
   If an answer says it cannot browse, it is wrong; retry without the quote
   demand.
-- **Always say which session**: a new Gemini conversation, or continue the
-  previous one.
+- **Always say which session**: the same Gemini conversation only if the
+  prompt needs something only the earlier answers contain, otherwise a new
+  one. No default.
 - **Follow-ups over fresh prompts.** When an answer comes back thin, the next
   prompt pushes on exactly that, in the same thread.
 - **Deep Research only when the job needs it** (dozens of sources, a written
