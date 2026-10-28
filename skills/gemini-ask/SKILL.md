@@ -75,6 +75,22 @@ explicitly either way, for example:
 3. The prompt in a fenced `text` block, so it copies cleanly.
 4. One line asking the user to paste the answer back.
 
-Then stop and wait. When the answer comes back, check the URLs it cites before
-leaning on a claim. If something came back thin, write a follow-up prompt for
-the same thread that pushes on exactly that, rather than a new mega-prompt.
+Then stop and wait.
+
+## When the answer comes back
+
+Report a bottom line, not an audit of what Gemini got right or wrong.
+
+1. Verify silently. Check the cited pages (license pages, repos, release
+   dates) for the claims the recommendation depends on. Do not narrate the
+   checking.
+2. Lead with the result: what is worth using or doing in the user's situation
+   and why, in a few lines. Only verified items go in it.
+3. Mention a wrong claim only if it changes a pick, as one clause ("skip X:
+   its dependency is non-commercial only"). No right/wrong breakdown, no
+   "confirmed" list.
+4. Whatever could not be verified goes in one line at the end, only if it
+   matters for the decision.
+5. If the answer needs correcting or came back thin, write a follow-up prompt
+   for the same Gemini thread that pushes on exactly that, instead of
+   describing the errors in prose or writing a new mega-prompt.
