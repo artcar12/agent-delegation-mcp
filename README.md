@@ -510,6 +510,9 @@ What the skill asks of a handover:
   one. No default.
 - **Follow-ups over fresh prompts.** When an answer comes back thin, the next
   prompt pushes on exactly that, in the same thread.
+- **A bottom line, not an audit.** Claude checks the cited pages silently and
+  leads with what is worth using and why. A wrong claim gets one clause only
+  if it changes a pick; corrections go into a follow-up prompt.
 - **Deep Research only when the job needs it** (dozens of sources, a written
   report as the deliverable). One long prompt plus follow-ups beat it head to
   head: 37 seconds against a run that never finished.
@@ -827,6 +830,12 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.9.1 (2026-10-28)
+
+**Research answers come back as a bottom line.** After you paste a Gemini answer
+back, Claude verifies the cited pages without narrating it and leads with what
+to use and why, instead of listing which claims held up and which did not.
 
 ### 1.9.0 (2026-10-20)
 
