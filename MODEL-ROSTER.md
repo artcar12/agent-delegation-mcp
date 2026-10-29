@@ -10,6 +10,13 @@ being worth exactly its `conf` column: `low` means one weak secondary source,
 Read [Keeping this current](#keeping-this-current) before trusting anything here
 if the date above is more than a few weeks old. These ids go stale fast.
 
+**OpenCode version.** The research and tests were done on OpenCode 1.x. The
+wrapper now supports only 2.x (checked on 2.2.1, 2026-10-29). Every
+`opencode-go/` id the routing verdict names is still listed there. Two free ids
+are gone: `opencode/mimo-v2.5-free` and `opencode/ling-3.0-flash-fin-free`.
+`opencode/glm-5.3-flash-free` passed a write-a-file probe on 2.2.1. In 2.x the
+quota error reads `AI.Error: Go usage limit exceeded`, not `AI_APICallError`.
+
 ## Contents
 
 - [Why tool-calling reliability dominates](#why-tool-calling-reliability-dominates)

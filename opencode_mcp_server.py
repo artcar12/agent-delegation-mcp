@@ -98,9 +98,10 @@ POLL_SECONDS = 1.0
 
 # Matched case-insensitively against the child's stderr, and ONLY stderr: these
 # strings appear routinely in stdout that merely discusses quotas or auth, and a
-# false match kills a healthy run. Each one is a wall the CLI reports and then
-# does NOT exit on - it keeps the process alive at 0% CPU, which is what turns a
-# 20-second failure into an hour of waiting.
+# false match kills a healthy run. Each one is a wall the CLI reports. 1.x then
+# did NOT exit - it kept the process alive at 0% CPU, which is what turned a
+# 20-second failure into an hour of waiting. 2.x exits 1 on the quota wall, so
+# there the match mostly latches the line that explains the exit.
 #
 # Deliberately narrow. "stream error" is excluded: it also covers transient
 # drops the CLI retries past on its own, and the quota line that motivated this
@@ -109,8 +110,9 @@ POLL_SECONDS = 1.0
 # these.
 FATAL_PATTERNS = tuple(
     p for p in (
-        "ai_apicallerror",
+        "ai_apicallerror",              # 1.x
         "usage limit reached",
+        "usage limit exceeded",         # 2.x: "AI.Error: Go usage limit exceeded"
         "quota exceeded",
         "insufficient credit",
         "invalid api key",
@@ -617,6 +619,13 @@ def _verdict_note(record: dict) -> str:
         return (f"Finished after {elapsed}s. No exit status: this run was started by a "
                 f"previous server process, and only a parent can read its child's exit "
                 f"code. The output files and the repo are the evidence.")
+    if code != 0 and record.get("fatal_line"):
+        # opencode 2.x exits on a quota wall instead of hanging, so the fatal
+        # line arrives with an ordinary exit rather than a kill.
+        return (f"{cli} exited {code} after {elapsed}s on a provider-side failure:\n\n"
+                f"  {record['fatal_line']}\n\n"
+                "That message is the whole diagnosis, including any reset time: decide "
+                "whether to wait or switch provider before re-dispatching.")
     if code != 0:
         return (f"{cli} exited {code} after {elapsed}s.\nNOTE: a non-zero exit does NOT "
                 f"mean the work was not done. Check `git log` / `git status` and re-run "
@@ -786,9 +795,12 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
     # process that can be killed. start_new_session additionally makes the
     # child a group leader (pgid == pid) so its own workers can be taken down
     # with it.
+    # PWD as well as cwd: opencode 2.x resolves its project from $PWD, which
+    # Popen(cwd=...) does not touch, so the child would inherit THIS server's
+    # PWD and write there while reporting success. Verified by mutation.
     try:
         proc = subprocess.Popen(
-            argv, cwd=cwd, env=_child_env(),
+            argv, cwd=cwd, env=dict(_child_env(), PWD=os.path.abspath(cwd)),
             stdout=out_fh, stderr=err_fh,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
@@ -877,9 +889,12 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     finished result in one round trip; the run is unaffected if the wait
     expires first, only the waiting stops.
 
-    Runs `opencode run --auto --agent build --print-logs --dir <cwd>
-    --model <model> -- <prompt>`, with stdout and stderr redirected to files
-    under the run store. Same dangerous-mode, secrets and scope caveats as
+    Requires OpenCode 2.x (npm package @opencode/cli). 1.x needs `--dir`,
+    which 2.x rejects, so one argv cannot serve both.
+
+    Runs `opencode run --standalone --auto --agent build --print-logs
+    --model <model> -- <prompt>` in `cwd`, with stdout and stderr redirected
+    to files under the run store. Same dangerous-mode, secrets and scope caveats as
     dispatch_agy: it self-approves shell commands, file edits and git
     operations under `cwd` with no mid-run checkpoint, so calling this tool IS
     the confirmation step. For long prompts, write a plan .md into
@@ -889,14 +904,24 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     sets "default_agent": "plan", which is read-only. Without the override this
     tool silently returns a plan and edits nothing while looking like it worked.
 
-    `--dir` is NOT optional either: opencode ignores the subprocess working
-    directory. Verified by mutation - with only subprocess(cwd=...) set, it
-    wrote the file into the CALLER's directory while reporting success. This is
-    the opencode analogue of agy's --new-project trap.
+    `--standalone` is NOT optional either. Without it 2.x hands the session to
+    a shared background service: the server logs never reach this run's
+    stderr, and the session lives in a long-running process outside the group
+    cancel_run signals. With it, the run starts a private `serve --stdio`.
+    That server (and the MCP servers it starts) take their own process groups,
+    but they talk over the run's stdio and exit when it closes: verified, a
+    cancel_run left none of them alive.
 
-    `--print-logs` is what makes failure visible: opencode's stream errors go to
-    its own logfile, never to stdout, and it does not exit on them. Routed to
-    stderr they can be caught in seconds instead of blocking for the full hour.
+    2.x has no `--dir` and resolves the project from $PWD, not from the real
+    working directory, so the wrapper sets both. Verified by mutation: with
+    only subprocess(cwd=...) set, it wrote the file into the CALLER's $PWD
+    while reporting success. This is the opencode analogue of agy's
+    --new-project trap, and 1.x had it too.
+
+    `--print-logs` is what makes failure visible: opencode's provider errors
+    go to its server log, never to stdout. 2.x exits 1 on a quota wall (1.x
+    sat at 0% CPU), but the error line on stderr is still the diagnosis, and
+    the per-step log lines are the heartbeat the idle timeout relies on.
 
     MODELS - routing verdict (researched 2026-09-10). Full roster of all 34
     ids, with per-model evidence, sourcing confidence and what is still
@@ -918,10 +943,10 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     omen-alpha (ignores the provided tools and rewrites files from scratch).
 
     Free tier (`opencode/` rather than `opencode-go/`), for smoke tests and
-    mechanical work when quota is tight: mimo-v2.5-free is the pick - same
-    weights as paid, though it silently strips Authorization headers in
-    transport. ling-3.0-flash-fin-free, big-pickle and the muse-sparks also
-    pass a write-a-file probe. Block every muse-spark-*-contributor variant,
+    mechanical work when quota is tight: on 2.x, glm-5.3-flash-free passes a
+    write-a-file probe; big-pickle passed on 1.x and is still listed.
+    mimo-v2.5-free (the old pick) and ling-3.0-flash-fin-free are no longer
+    listed. Block every muse-spark-*-contributor variant,
     free AND paid, for proprietary code: Meta retains prompts and completions
     for training. Both nemotron tiers FAILED here and the failures are
     confirmed upstream bugs.
@@ -957,9 +982,10 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     """
     _touch()
     # `--` stops flag parsing so a prompt that starts with `-` (e.g. "--help")
-    # is treated as the prompt, not as an opencode flag.
-    argv = [OPENCODE_BIN, "run", "--auto", "--agent", AGENT, "--print-logs",
-            "--dir", os.path.expanduser(cwd), "--model", model, "--", prompt]
+    # is treated as the prompt, not as an opencode flag. No `--dir`: 2.x
+    # rejects it; _dispatch sets the subprocess cwd and $PWD instead.
+    argv = [OPENCODE_BIN, "run", "--standalone", "--auto", "--agent", AGENT,
+            "--print-logs", "--model", model, "--", prompt]
     return _dispatch(prompt, argv, cwd, model, wait_seconds, force)
 
 

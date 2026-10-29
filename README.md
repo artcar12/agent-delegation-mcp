@@ -12,7 +12,7 @@ handed to you as a Gemini prompt to run by hand, not automated.
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![plugin](https://img.shields.io/badge/claude%20code-plugin-8A63D2)
 ![python](https://img.shields.io/badge/python-%E2%89%A53.10-3776AB)
-![status](https://img.shields.io/badge/verified-agy%201.1.27%20%C2%B7%20opencode%201.18.29-success)
+![status](https://img.shields.io/badge/verified-agy%201.1.27%20%C2%B7%20opencode%202.2.1-success)
 
 ```bash
 claude plugin marketplace add artcar12/agent-delegation-mcp
@@ -131,9 +131,13 @@ which is why the tools take a `model` argument rather than hard-coding one.
 
 1. **Antigravity CLI** on PATH as `agy`, logged in once interactively so
    credentials exist. Skip if you only want OpenCode.
-2. **OpenCode CLI** on PATH as `opencode`, likewise authenticated.
+2. **OpenCode CLI 2.x** on PATH as `opencode`, likewise authenticated.
    `opencode models` lists the `provider/model` ids. Skip if you only want
-   Antigravity.
+   Antigravity. 1.x will not work: the wrapper's argv is 2.x-only (see
+   [§4](#4-what-the-tools-actually-run)). 2.x moved npm packages, from
+   `opencode-ai` to `@opencode/cli`, so `opencode upgrade` will not cross over.
+   Install it with `npm uninstall -g opencode-ai && npm install -g @opencode/cli`,
+   with npm from the Node you want it under.
 3. **Claude Code**, and [`uv`](https://docs.astral.sh/uv/) **on the PATH Claude
    Code itself runs with**. uv is not optional: it is what resolves each server's
    single dependency, and there is no venv to build or maintain because of it.
@@ -319,11 +323,11 @@ environment Claude Code itself inherits. All are optional.
 agy --dangerously-skip-permissions --new-project --disable-slash-commands \
     --print-timeout 60m --model <model> --print <prompt>
 
-opencode run --auto --agent build --print-logs --dir <cwd> --model <model> \
-    -- <prompt>
+PWD=<cwd> opencode run --standalone --auto --agent build --print-logs \
+    --model <model> -- <prompt>        # run in <cwd>
 ```
 
-Seven flags there are non-obvious, and **each one fails silently when dropped**.
+Eight settings there are non-obvious, and **each one fails silently when dropped**.
 Every one cost a debugging session.
 
 | Flag | What happens without it |
@@ -331,9 +335,10 @@ Every one cost a debugging session.
 | `--print` | `agy` launches an *interactive* session against a subprocess with no TTY and hangs forever at ~0% CPU. Looks exactly like "the model is thinking hard." `stdin=subprocess.DEVNULL` in the wrapper is belt and braces against the same hang. |
 | `--new-project` | `agy` has its own persistent project concept (`~/.gemini/config/projects/`) **separate from the OS-level `cwd`**. Without it, agy writes files into `~/.gemini/antigravity-cli/scratch/` while cheerfully reporting success. |
 | `--print-timeout 60m` | `agy` defaults its print-mode wait to **5m0s**, independently of the Python subprocess timeout. Verified: a `sleep 400` dispatch completed in 407s *with* the flag. Almost certainly the real cause of the "`timeout waiting for response`, but the commits were already there" story people blame on summary generation. |
-| `--dir <cwd>` | `opencode` **ignores the subprocess working directory**. Verified by mutation: with only `subprocess.run(cwd=...)` set, it wrote the file into the *caller's* directory and reported success. Same shape as agy's `--new-project` trap. |
+| `PWD=<cwd>` | `opencode` 2.x takes its project from `$PWD`, **not the real working directory**, and `Popen(cwd=...)` leaves `$PWD` alone. Verified by mutation: with only `cwd` set, it wrote the file into the server's `$PWD` and reported success. Same shape as agy's `--new-project` trap. 1.x had it too and took `--dir <cwd>`, which 2.x rejects with `Unrecognized flag: --dir`. |
+| `--standalone` | 2.x otherwise runs the session in a shared background service: the server logs never reach this run's stderr, so `--print-logs` has nothing to show, and the session lives outside the process group `cancel_run` signals. Standalone starts a private `serve --stdio` per run that exits with it. |
 | `--agent build` | Mandatory whenever `~/.config/opencode/opencode.json` sets `"default_agent": "plan"`, which is read-only. Without the override the tool returns a plan, edits nothing, and looks like it worked. |
-| `--print-logs` | What makes opencode's failures *visible*. Its stream errors — including the provider quota wall — go to `~/.local/share/opencode/log/opencode.log` and **never to stdout**, and the CLI does not exit on them: it sits at 0% CPU until something else kills it. Without this flag the wrapper has nothing to match on and blocks for the full hour on a failure the CLI knew about in twenty seconds. The per-step log lines double as the heartbeat that makes the idle timeout safe to enable. |
+| `--print-logs` | What makes opencode's failures *visible*. Its stream errors — including the provider quota wall — go to `~/.local/share/opencode/log/opencode.log` and **never to stdout**. 1.x then did not exit: it sat at 0% CPU until something else killed it, so without this flag the wrapper blocked for the full hour on a failure the CLI knew about in twenty seconds. 2.x exits 1 within seconds (`Error: Go usage limit exceeded`), and the logged line is what tells you why. The per-step log lines double as the heartbeat that makes the idle timeout safe to enable. Server logs only reach stderr with `--standalone`. |
 | `--auto` / `--dangerously-skip-permissions` | Nothing fails — this is what makes the run unattended, and it is the entire risk surface. See the warning at the top. |
 
 ### The five tools
@@ -791,7 +796,9 @@ reopening settled questions or rediscovering the same platform gotcha.
 |---|---|---|
 | Call hangs forever, ~0% CPU | missing `--print`; interactive mode with no TTY | `--print` plus `stdin=DEVNULL` |
 | Reports success, no files changed (agy) | agy's own project concept is not the OS `cwd` | `--new-project`; verify the path after the first dispatch |
-| Reports success, files written to the caller's dir (opencode) | opencode ignores the subprocess cwd | `--dir <cwd>` |
+| Reports success, files written to the caller's dir (opencode) | opencode takes its project from `$PWD`, not the subprocess cwd | already handled: the wrapper sets `PWD=<cwd>` |
+| `Unrecognized flag: --dir in command opencode run`, exit 1 at once | opencode 2.x with a wrapper older than 2.x support | update the plugin |
+| `opencode run` hangs with no output when tried by hand | stdin is an open pipe that never closes (scripts, agents) | `< /dev/null`; the wrapper already uses `stdin=DEVNULL` |
 | Returns a plan, edits nothing | `"default_agent": "plan"` is read-only | `--agent build` |
 | `timeout waiting for response` after ~5 minutes | agy's print-mode default wait, not the subprocess timeout | `--print-timeout 60m`; check `git log` before believing the error |
 | Tools missing from Claude entirely | a hand-built venv's `python` symlink followed a system Python upgrade | let `uv run --script` resolve the interpreter, as the plugin does |
@@ -803,7 +810,7 @@ reopening settled questions or rediscovering the same platform gotcha.
 | No visibility during a long run | dispatch used to block with no interim output | `check_run` for the log tail; the mandatory progress file for real phase-by-phase progress |
 | `ImportError: mcp.server.fastmcp` | mcp 2.0 removed that module | already handled: the servers import `MCPServer` and fall back to `FastMCP` |
 | Gemini handover: an answer says it cannot browse the web | it can; demanding a verbatim quote per claim provokes the disclaimer, and it then answers from memory | rewrite the prompt to ask for a URL per claim instead of a quote, and run it again |
-| An hour of silence, then a timeout with no output | provider quota wall; the CLI reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds |
+| An hour of silence, then a timeout with no output | provider quota wall; opencode 1.x reports it to its own log and then does not exit | already handled: `--print-logs` plus the stderr fail-fast returns the error, reset time included, in seconds. 2.x exits on its own, and the report quotes the line |
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
 | A delegate left over from a session that ended | nothing kills a run when its server dies, by design | `list_runs` finds it; `cancel_run` stops it; `check_run` applies its deadlines |
 | A run reports `lost` / `pid-recycled` | the record is old enough that its pid now belongs to something else | nothing was signalled — that is the point. The delegate ended long ago; read its output files |
@@ -830,6 +837,16 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.10.0 (2026-10-29)
+
+**`dispatch_opencode` needs OpenCode 2.x.** 2.x dropped `opencode run --dir`,
+so the old argv failed at once with `Unrecognized flag: --dir`. The wrapper now
+runs `opencode run --standalone` and sets `PWD` to the target directory, which is
+where 2.x looks for the project. It no longer works with 1.x. Upgrade with
+`npm uninstall -g opencode-ai && npm install -g @opencode/cli` (the package
+moved). A quota wall now exits within seconds instead of hanging, and the report
+quotes the provider's line (`Go usage limit exceeded`).
 
 ### 1.9.1 (2026-10-28)
 
@@ -1206,7 +1223,7 @@ No changes to the servers themselves, their tools, or their flags.
 
 ## Verified against
 
-macOS, `agy` 1.1.27, `opencode` 1.18.29, `mcp` 2.2.0 on uv-managed CPython
+macOS, `agy` 1.1.27, `opencode` 2.2.1, `mcp` 2.2.0 on uv-managed CPython
 3.14.5, `uv` 0.11.19, Claude Code with Opus. Version-sensitive claims are called
 out inline. The failure modes came from real production use.
 

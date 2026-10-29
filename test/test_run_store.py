@@ -406,6 +406,42 @@ class OpenCodeRunStoreTests(RunStoreTests):
     TIMEOUT_VAR = "OPENCODE_MCP_TIMEOUT"
     IDLE_VAR = "OPENCODE_MCP_IDLE_TIMEOUT"
 
+    def test_argv_targets_opencode_2(self):
+        # 2.x rejects --dir outright, and without --standalone the session runs
+        # in a shared background service that cancel_run cannot reach.
+        mod = self.server('echo "argv: $*"; echo "pwd: $(pwd -P)"\n')
+        out = self.dispatch(mod, prompt="--help", wait_seconds=10)
+        self.assertNotIn("--dir", out)
+        self.assertIn("argv: run --standalone --auto --agent build --print-logs", out)
+        self.assertIn("-- --help", out)
+        self.assertIn(f"pwd: {os.path.realpath(self.project)}", out)
+
+    def test_quota_exit_reports_the_provider_line(self):
+        # 2.x exits 1 on the quota wall rather than hanging, so the line can
+        # arrive with a plain exit instead of a kill. Either way it is reported.
+        mod = self.server('echo "Error: Go usage limit exceeded" >&2; exit 1\n')
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("Go usage limit exceeded", out.split("--- stdout")[0])
+
+    def test_child_pwd_is_the_target_not_the_server_s(self):
+        # opencode 2.x picks its project from $PWD. The fake CLI cannot show
+        # this itself, since /bin/sh corrects a stale PWD at startup, so check
+        # what the wrapper hands to Popen.
+        mod = self.server("true\n")
+        real, seen = mod.subprocess.Popen, {}
+
+        def spy(*a, **kw):
+            seen.update(kw)
+            return real(*a, **kw)
+
+        mod.subprocess.Popen = spy
+        try:
+            self.dispatch(mod, wait_seconds=5)
+        finally:
+            mod.subprocess.Popen = real
+        self.assertEqual(seen["env"]["PWD"], self.project)
+        self.assertEqual(seen["cwd"], self.project)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
