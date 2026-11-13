@@ -602,12 +602,14 @@ def _verdict_note(record: dict) -> str:
     if verdict == "idle":
         return (f"{cli} produced no output for {record.get('idle_seconds')}s (of {elapsed}s "
                 f"total) and its process group was killed as hung. This is NOT the "
-                f"wall-clock timeout: the run went silent rather than running long. Raise "
-                f"or unset the idle timeout if the task legitimately runs silent for that "
-                f"long. Work may still have landed - check git.")
+                f"wall-clock timeout: the run went silent rather than running long. If the "
+                f"task legitimately runs silent that long (a long test suite, a build), "
+                f"re-dispatch with a larger idle_seconds, or 0 to turn the check off. "
+                f"Work may still have landed - check git.")
     if verdict == "timeout":
         return (f"{cli} did not finish within {record.get('timeout_seconds')}s; its process "
-                f"group was killed. Work may still have landed - check git.")
+                f"group was killed. Re-dispatch with a larger timeout_seconds if the task "
+                f"needs longer. Work may still have landed - check git.")
     if verdict == "cancelled":
         return f"Cancelled after {elapsed}s. Work already committed is still committed."
     if verdict == "pid-recycled":
@@ -646,6 +648,8 @@ def _report(record: dict, tail_lines: int = 80) -> str:
         f"{record.get('model', '')}".rstrip(),
         f"  cwd:     {record.get('cwd', '')}",
         f"  elapsed: {elapsed}s" + ("" if state == "running" else " (ended)"),
+        f"  limits:  {record.get('timeout_seconds') or 'none'}s wall clock, "
+        + (f"{record['idle_seconds']}s idle" if record.get("idle_seconds") else "no idle limit"),
         f"  stdout:  {out_path}",
         f"  stderr:  {err_path}",
     ]
@@ -756,8 +760,27 @@ def _live_runs(cli: str = "") -> list:
     return out
 
 
+def _deadlines(timeout_seconds, idle_seconds):
+    """The limits one run gets: the server defaults unless the caller overrode
+    them for this run. Returns (timeout, idle, error); a bad value is refused
+    rather than clamped, so a caller never believes a run has a limit it lacks."""
+    timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    idle = IDLE_SECONDS if idle_seconds is None else idle_seconds
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        return None, None, (f"Error: timeout_seconds must be a positive whole number of "
+                            f"seconds, got {timeout_seconds!r}. Nothing was started.")
+    if isinstance(idle, bool) or not isinstance(idle, int) or idle < 0:
+        return None, None, (f"Error: idle_seconds must be a whole number of seconds, 0 to "
+                            f"turn the idle check off, got {idle_seconds!r}. Nothing was started.")
+    return timeout, idle, None
+
+
 def _dispatch(prompt: str, argv: list, cwd: str, model: str,
-              wait_seconds: int, force: bool) -> str:
+              wait_seconds: int, force: bool,
+              timeout_seconds=None, idle_seconds=None) -> str:
+    timeout, idle, bad = _deadlines(timeout_seconds, idle_seconds)
+    if bad:
+        return bad
     cwd = os.path.expanduser(cwd)
     if not os.path.isdir(cwd):
         return (f"Error: cwd {cwd!r} is not an existing directory. Create it first or "
@@ -834,8 +857,8 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "model": model,
         "prompt_preview": prompt[:500],
         "started_at": time.time(),
-        "timeout_seconds": TIMEOUT_SECONDS,
-        "idle_seconds": IDLE_SECONDS,
+        "timeout_seconds": timeout,
+        "idle_seconds": idle,
         "stdout_path": out_path,
         "stderr_path": err_path,
         "scan_offset": 0,
@@ -870,15 +893,17 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         f"  check_run('{run_id}')   - state, elapsed, log tail, artifacts\n"
         f"  cancel_run('{run_id}')  - stop it and its workers\n"
         f"  list_runs()             - everything still live\n\n"
-        f"Deadlines ({TIMEOUT_SECONDS}s wall clock"
-        + (f", {IDLE_SECONDS}s idle" if IDLE_SECONDS else "")
+        f"Deadlines ({timeout}s wall clock"
+        + (f", {idle}s idle" if idle else ", no idle limit")
         + ") are enforced on inspection as well as by this server, so they still apply "
         "if this connection drops."
     )
 
 @mcp.tool()
 def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD,
-                      wait_seconds: int = 0, force: bool = False) -> str:
+                      wait_seconds: int = 0, force: bool = False,
+                      timeout_seconds: int | None = None,
+                      idle_seconds: int | None = None) -> str:
     """
     Delegates a coding/research task to OpenCode, running fully autonomously
     with NO permission prompts in between.
@@ -888,6 +913,11 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     Pass wait_seconds to block up to that long for a short task and get the
     finished result in one round trip; the run is unaffected if the wait
     expires first, only the waiting stops.
+
+    timeout_seconds and idle_seconds override this server's wall-clock and
+    idle limits for this run only (delegation_status shows the defaults).
+    idle_seconds=0 turns the idle check off. Raise them when you know the run
+    will sit in one long quiet command; see LONG COMMANDS below.
 
     Requires OpenCode 2.x (npm package @opencode/cli). 1.x needs `--dir`,
     which 2.x rejects, so one argv cannot serve both.
@@ -965,6 +995,25 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     shaped work - including writing the plan itself - is in scope here. Run
     `opencode stats` before and after big dispatches for real usage numbers.
 
+    LONG COMMANDS. Two separate limits stop a delegate that runs one long,
+    quiet command, such as a full test suite, and neither is model-specific.
+    Seen 2026-11-10: three deepseek-v4-pro reviews died on a ~23 minute
+    `make test`.
+      - opencode's bash tool (2.2.1) stops a foreground command after 120000
+        ms unless the model passes a larger `timeout`; 0 disables it.
+        Background commands have no timeout, but `opencode run` exits when
+        the model stops, so a run that backgrounds the command and finishes
+        never sees the result.
+      - This wrapper's idle limit kills a run whose stdout and stderr stay
+        silent that long. --print-logs is quiet while one bash call runs, and
+        `cmd | tail -80` prints nothing at all until cmd ends.
+    When the brief includes a command that may run past two minutes, say so
+    in the brief: run it in the foreground with a bash timeout above its
+    expected runtime (or 0), write its output to a log file instead of piping
+    it through tail or head, and read the log afterwards. Then dispatch with
+    idle_seconds above that command's runtime, and timeout_seconds above the
+    whole run's.
+
     DELIVERABLE GOES IN A FILE. Brief the delegate to write its result to
     `.agent-runs/<topic>-<model>.md` and to append one line per phase to
     `.agent-runs/<topic>.log`. Raw stdout is now captured to a file as well, so
@@ -986,7 +1035,8 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     # rejects it; _dispatch sets the subprocess cwd and $PWD instead.
     argv = [OPENCODE_BIN, "run", "--standalone", "--auto", "--agent", AGENT,
             "--print-logs", "--model", model, "--", prompt]
-    return _dispatch(prompt, argv, cwd, model, wait_seconds, force)
+    return _dispatch(prompt, argv, cwd, model, wait_seconds, force,
+                     timeout_seconds, idle_seconds)
 
 
 @mcp.tool()

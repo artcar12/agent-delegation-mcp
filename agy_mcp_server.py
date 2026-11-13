@@ -596,12 +596,14 @@ def _verdict_note(record: dict) -> str:
     if verdict == "idle":
         return (f"{cli} produced no output for {record.get('idle_seconds')}s (of {elapsed}s "
                 f"total) and its process group was killed as hung. This is NOT the "
-                f"wall-clock timeout: the run went silent rather than running long. Raise "
-                f"or unset the idle timeout if the task legitimately runs silent for that "
-                f"long. Work may still have landed - check git.")
+                f"wall-clock timeout: the run went silent rather than running long. If the "
+                f"task legitimately runs silent that long (a long test suite, a build), "
+                f"re-dispatch with a larger idle_seconds, or 0 to turn the check off. "
+                f"Work may still have landed - check git.")
     if verdict == "timeout":
         return (f"{cli} did not finish within {record.get('timeout_seconds')}s; its process "
-                f"group was killed. Work may still have landed - check git.")
+                f"group was killed. Re-dispatch with a larger timeout_seconds if the task "
+                f"needs longer. Work may still have landed - check git.")
     if verdict == "cancelled":
         return f"Cancelled after {elapsed}s. Work already committed is still committed."
     if verdict == "pid-recycled":
@@ -633,6 +635,8 @@ def _report(record: dict, tail_lines: int = 80) -> str:
         f"{record.get('model', '')}".rstrip(),
         f"  cwd:     {record.get('cwd', '')}",
         f"  elapsed: {elapsed}s" + ("" if state == "running" else " (ended)"),
+        f"  limits:  {record.get('timeout_seconds') or 'none'}s wall clock, "
+        + (f"{record['idle_seconds']}s idle" if record.get("idle_seconds") else "no idle limit"),
         f"  stdout:  {out_path}",
         f"  stderr:  {err_path}",
     ]
@@ -743,8 +747,27 @@ def _live_runs(cli: str = "") -> list:
     return out
 
 
+def _deadlines(timeout_seconds, idle_seconds):
+    """The limits one run gets: the server defaults unless the caller overrode
+    them for this run. Returns (timeout, idle, error); a bad value is refused
+    rather than clamped, so a caller never believes a run has a limit it lacks."""
+    timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    idle = IDLE_SECONDS if idle_seconds is None else idle_seconds
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        return None, None, (f"Error: timeout_seconds must be a positive whole number of "
+                            f"seconds, got {timeout_seconds!r}. Nothing was started.")
+    if isinstance(idle, bool) or not isinstance(idle, int) or idle < 0:
+        return None, None, (f"Error: idle_seconds must be a whole number of seconds, 0 to "
+                            f"turn the idle check off, got {idle_seconds!r}. Nothing was started.")
+    return timeout, idle, None
+
+
 def _dispatch(prompt: str, argv: list, cwd: str, model: str,
-              wait_seconds: int, force: bool) -> str:
+              wait_seconds: int, force: bool,
+              timeout_seconds=None, idle_seconds=None) -> str:
+    timeout, idle, bad = _deadlines(timeout_seconds, idle_seconds)
+    if bad:
+        return bad
     cwd = os.path.expanduser(cwd)
     if not os.path.isdir(cwd):
         return (f"Error: cwd {cwd!r} is not an existing directory. Create it first or "
@@ -818,8 +841,8 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "model": model,
         "prompt_preview": prompt[:500],
         "started_at": time.time(),
-        "timeout_seconds": TIMEOUT_SECONDS,
-        "idle_seconds": IDLE_SECONDS,
+        "timeout_seconds": timeout,
+        "idle_seconds": idle,
         "stdout_path": out_path,
         "stderr_path": err_path,
         "scan_offset": 0,
@@ -854,15 +877,17 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         f"  check_run('{run_id}')   - state, elapsed, log tail, artifacts\n"
         f"  cancel_run('{run_id}')  - stop it and its workers\n"
         f"  list_runs()             - everything still live\n\n"
-        f"Deadlines ({TIMEOUT_SECONDS}s wall clock"
-        + (f", {IDLE_SECONDS}s idle" if IDLE_SECONDS else "")
+        f"Deadlines ({timeout}s wall clock"
+        + (f", {idle}s idle" if idle else ", no idle limit")
         + ") are enforced on inspection as well as by this server, so they still apply "
         "if this connection drops."
     )
 
 @mcp.tool()
 def dispatch_agy(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD,
-                 wait_seconds: int = 0, force: bool = False) -> str:
+                 wait_seconds: int = 0, force: bool = False,
+                 timeout_seconds: int | None = None,
+                 idle_seconds: int | None = None) -> str:
     """
     Delegates a coding/research task to Gemini via the Antigravity ("agy") CLI,
     running fully autonomously with NO permission prompts in between.
@@ -872,6 +897,13 @@ def dispatch_agy(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     Pass wait_seconds to block up to that long for a short task and get the
     finished result in one round trip; the run is unaffected if the wait
     expires first, only the waiting stops.
+
+    timeout_seconds and idle_seconds override this server's wall-clock and
+    idle limits for this run only (delegation_status shows the defaults).
+    idle_seconds=0 turns the idle check off. Raise them when you know the run
+    will sit in one long quiet command. agy's own --print-timeout still
+    applies inside the run (see delegation_status), so a timeout_seconds
+    above it buys nothing.
 
     WHY THIS EXISTS: Gemini quota on the Antigravity plan is plentiful but
     the model is weaker than Claude, and Anthropic quota is scarce. Route
@@ -921,7 +953,8 @@ def dispatch_agy(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     argv = [AGY_BIN, "--dangerously-skip-permissions", "--new-project",
             "--disable-slash-commands", "--print-timeout", PRINT_TIMEOUT,
             "--model", model, "--print", prompt]
-    return _dispatch(prompt, argv, cwd, model, wait_seconds, force)
+    return _dispatch(prompt, argv, cwd, model, wait_seconds, force,
+                     timeout_seconds, idle_seconds)
 
 
 @mcp.tool()

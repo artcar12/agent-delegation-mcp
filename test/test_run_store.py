@@ -237,6 +237,50 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(record["verdict"], "idle")
         self.assertFalse(mod._pid_exists(pid))
 
+    def test_per_run_deadlines_override_the_server_defaults(self):
+        """A caller who knows the run will sit in one long quiet command raises
+        the limits for that run; the record, reply and check_run all agree."""
+        mod = self.server("sleep 30\n", **{self.TIMEOUT_VAR: "60", self.IDLE_VAR: "5"})
+        out = self.dispatch(mod, timeout_seconds=7200, idle_seconds=1800)
+        self.assertIn("7200s wall clock, 1800s idle", out)
+        run_id = self.run_id_from(out)
+        record = mod._read_record(run_id)
+        self.assertEqual((record["timeout_seconds"], record["idle_seconds"]), (7200, 1800))
+        self.assertIn("limits:  7200s wall clock, 1800s idle", mod.check_run(run_id))
+        mod.cancel_run(run_id)
+
+        out = self.dispatch(mod, idle_seconds=0)
+        self.assertIn("60s wall clock, no idle limit", out)
+        run_id = self.run_id_from(out)
+        self.assertEqual(mod._read_record(run_id)["idle_seconds"], 0)
+        mod.cancel_run(run_id)
+
+    def test_omitted_deadlines_use_the_server_defaults(self):
+        mod = self.server("sleep 30\n", **{self.TIMEOUT_VAR: "60", self.IDLE_VAR: "5"})
+        run_id = self.run_id_from(self.dispatch(mod))
+        record = mod._read_record(run_id)
+        self.assertEqual((record["timeout_seconds"], record["idle_seconds"]), (60, 5))
+        mod.cancel_run(run_id)
+
+    def test_per_run_idle_limit_is_enforced(self):
+        mod = self.server("echo tick; sleep 300\n", **{self.IDLE_VAR: "0"})
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=2))
+        self.assertTrue(self.wait_until(
+            lambda: mod._read_record(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "idle")
+        self.assertIn("idle_seconds", mod.check_run(run_id))
+
+    def test_bad_deadlines_are_refused_and_start_nothing(self):
+        mod = self.server("sleep 30\n")
+        for kw in ({"timeout_seconds": 0}, {"timeout_seconds": -5},
+                   {"idle_seconds": -1}, {"timeout_seconds": True},
+                   {"idle_seconds": "600"}):
+            out = self.dispatch(mod, **kw)
+            self.assertTrue(out.startswith("Error:"), (kw, out))
+            self.assertIn("Nothing was started", out)
+        self.assertFalse(os.path.isdir(self.run_dir) and os.listdir(self.run_dir),
+                         "a refused dispatch left a run behind")
+
     def test_fatal_stderr_pattern_kills_the_run(self):
         phrase = self.FATAL_PHRASE
         mod = self.server(f"echo 'prefix: {phrase} here' >&2; sleep 300\n")

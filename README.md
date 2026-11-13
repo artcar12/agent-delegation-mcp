@@ -348,7 +348,7 @@ four that work on runs regardless of which CLI started them.
 
 | Tool | What it does |
 |---|---|
-| `dispatch_agy` / `dispatch_opencode` | Starts a delegate and **returns a run id in milliseconds**. `wait_seconds=N` blocks up to N seconds for a short task and returns the finished result inline instead; the run is unaffected when the wait expires, only the waiting stops. `force=True` overrides the refusal to start a second concurrent run on the same CLI. |
+| `dispatch_agy` / `dispatch_opencode` | Starts a delegate and **returns a run id in milliseconds**. `wait_seconds=N` blocks up to N seconds for a short task and returns the finished result inline instead; the run is unaffected when the wait expires, only the waiting stops. `force=True` overrides the refusal to start a second concurrent run on the same CLI. `timeout_seconds` and `idle_seconds` override the server's wall-clock and idle limits for that run only (`idle_seconds=0` turns the idle check off). |
 | `check_run(run_id)` | State, elapsed, how long it has been silent, the tail of both streams, and anything written under `.agent-runs/`. Cheap, and the intended way to follow a long dispatch. Calling it is also what applies the run's deadlines when no server is watching. |
 | `cancel_run(run_id)` | SIGTERM then SIGKILL to the whole process group, so an auto-approving delegate cannot keep mutating the repo afterwards. Verifies the pid is still the process it started before signalling anything. |
 | `list_runs()` | Every run on the machine, both CLIs, all sessions, reconciled and marked live or not. The answer to "did something get left behind?". |
@@ -814,7 +814,7 @@ reopening settled questions or rediscovering the same platform gotcha.
 | `Connection closed`, immediately | the MCP server went away; the delegate did **not** | reconnect, `list_runs`, then `check_run`. Never re-dispatch. See [§5.1](#51-never-trust-the-wrappers-return-value-in-either-direction) |
 | A delegate left over from a session that ended | nothing kills a run when its server dies, by design | `list_runs` finds it; `cancel_run` stops it; `check_run` applies its deadlines |
 | A run reports `lost` / `pid-recycled` | the record is old enough that its pid now belongs to something else | nothing was signalled — that is the point. The delegate ended long ago; read its output files |
-| Killed as hung, but the task was fine | idle timeout is below what that task quietly needs | raise `OPENCODE_MCP_IDLE_TIMEOUT`, or set it to `0` |
+| Killed as hung, but the task was fine | idle timeout is below what that task quietly needs | re-dispatch with a larger `idle_seconds` (per run), or raise `OPENCODE_MCP_IDLE_TIMEOUT` (every run); `0` turns it off. A long test suite run as `cmd \| tail` is silent until it ends |
 | A fix is committed but nothing changes | the running server is an older installed version | `delegation_status` for what is actually running; then `claude plugin update` and `/reload-plugins` |
 
 ---
@@ -837,6 +837,17 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.11.0 (2026-11-13)
+
+**Per-run deadlines.** `dispatch_opencode` and `dispatch_agy` take optional
+`timeout_seconds` and `idle_seconds`, overriding the server-wide limits for one
+run; `check_run` now shows the limits a run is under. Bad values are refused
+before anything starts. `dispatch_opencode`'s docstring gains a LONG COMMANDS
+section: opencode's bash tool stops a foreground command after 120 s unless the
+model passes a larger timeout, and a long command piped through `tail` looks
+hung to the idle watchdog. Brief delegates accordingly when a run includes a
+long test suite or build.
 
 ### 1.10.0 (2026-10-29)
 
