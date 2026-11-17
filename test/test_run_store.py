@@ -322,7 +322,7 @@ class RunStoreTests(unittest.TestCase):
         mod = self.server(
             f"mkdir -p '{logs}'; i=0\n"
             f"while [ $i -lt 8 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
-        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
         self.assertTrue(self.wait_until(
             lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
         self.assertEqual(mod._read_record(run_id)["verdict"], "exited")
@@ -349,7 +349,7 @@ class RunStoreTests(unittest.TestCase):
         mod = self.server(
             f"mkdir -p '{logs}'; i=0\n"
             f"while [ $i -lt 8 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
-        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
         mod._live.pop(run_id, None)             # only the sibling is watching now
         sibling = _load("opencode_mcp_server.py", "srv_sib_oc",
                         {"AGENT_MCP_RUN_DIR": self.run_dir,
@@ -648,7 +648,7 @@ class CodexRunStoreTests(RunStoreTests):
             f"""echo '{{"type":"thread.started","thread_id":"{tid}"}}'\n"""
             f"mkdir -p '{day}'; i=0\n"
             f"while [ $i -lt 8 ]; do echo x >> '{day}/rollout-2026-01-01T00-00-00-{tid}.jsonl'; sleep 1; i=$((i+1)); done\n")
-        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
         self.assertTrue(self.wait_until(
             lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
         record = mod._read_record(run_id)
@@ -694,13 +694,27 @@ class CodexRunStoreTests(RunStoreTests):
             f"""echo '{{"type":"thread.started","thread_id":"{tid}"}}'\n"""
             f"mkdir -p '{day}'; i=0\n"
             f"while [ $i -lt 8 ]; do echo x >> '{day}/rollout-x-{tid}.jsonl'; sleep 1; i=$((i+1)); done\n")
-        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
         mod._live.pop(run_id, None)
         sibling = _load("agy_mcp_server.py", "srv_sib_agy", {"AGENT_MCP_RUN_DIR": self.run_dir})
         self.assertTrue(self.wait_until(
             lambda: sibling._reconcile(run_id)["state"] != "running", timeout=20))
         self.assertEqual(sibling._read_record(run_id)["verdict"], "exited")
         self.assertIn("hit your usage limit", sibling._fatal_patterns({"cli": "codex"}))
+
+    def test_sibling_fails_a_dead_owners_codex_run_fast(self):
+        mod = self.server("echo \"You've hit your usage limit.\" >&2; sleep 60\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        mod._live.pop(run_id, None)
+        time.sleep(1.2)
+        record = mod._read_record(run_id)
+        record["server_pid"] = 0                # the dispatching server is gone
+        mod._write_record(record)
+        sibling = _load("agy_mcp_server.py", "srv_sib_fatal", {"AGENT_MCP_RUN_DIR": self.run_dir})
+        self.assertTrue(self.wait_until(
+            lambda: sibling._reconcile(run_id)["state"] not in ("running", "stopping"),
+            timeout=20))
+        self.assertEqual(sibling._read_record(run_id)["verdict"], "fatal")
 
     def test_prune_removes_orphan_sidecars(self):
         mod = self.server(AGENT_MCP_RUN_RETENTION_DAYS="1")
@@ -724,6 +738,19 @@ class CodexRunStoreTests(RunStoreTests):
         mod._prune()
         self.assertFalse(os.path.exists(last))
         self.assertIsNone(mod._read_record(run_id))
+
+
+class CrossServerTests(unittest.TestCase):
+    """The per-CLI copies that let any server judge any run must agree."""
+
+    def test_builtin_pattern_tables_agree_with_each_server(self):
+        _stub_mcp()
+        mods = [_load(n, f"srv_pat_{i}", {}) for i, n in enumerate(
+            ("agy_mcp_server.py", "opencode_mcp_server.py", "codex_mcp_server.py"))]
+        for m in mods:
+            self.assertEqual(m._BUILTIN_FATAL, mods[0]._BUILTIN_FATAL, m.SERVER_NAME)
+            self.assertEqual(set(m.FATAL_PATTERNS), set(m._BUILTIN_FATAL[m.CLI_LABEL]),
+                             m.SERVER_NAME)
 
 
 class QuotaToolTests(unittest.TestCase):

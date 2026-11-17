@@ -318,6 +318,11 @@ def _scan_fatal(record: dict) -> None:
     patterns = _fatal_patterns(record)
     if record.get("fatal_line") or not patterns:
         return
+    if record.get("cli", CLI_LABEL) != CLI_LABEL and _pid_exists(record.get("server_pid", 0)):
+        # Its own server is alive and scanning with that CLI's full list,
+        # env extras included. Scanning here would advance the shared offset
+        # past lines only those extras catch.
+        return
     start = record.get("scan_offset", 0)
     try:
         with open(record["stderr_path"], "rb") as fh:
