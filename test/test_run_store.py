@@ -720,7 +720,7 @@ class CodexRunStoreTests(RunStoreTests):
         self.assertEqual(sibling._read_record(run_id)["verdict"], "fatal")
 
     def test_sibling_leaves_scanning_to_a_live_owner(self):
-        mod = self.server("echo \"You've hit your usage limit.\" >&2; sleep 60\n")
+        mod = self.server("sleep 3; echo \"You've hit your usage limit.\" >&2; sleep 60\n")
         run_id = self.run_id_from(self.dispatch(mod))
         mod._live.pop(run_id, None)
         time.sleep(1.2)
@@ -731,8 +731,9 @@ class CodexRunStoreTests(RunStoreTests):
                           fatal_line=None, scan_offset=0)
             mod._write_record(record)
             sibling = _load("agy_mcp_server.py", "srv_sib_live", {"AGENT_MCP_RUN_DIR": self.run_dir})
-            time.sleep(0.5)
+            time.sleep(3)                       # the fatal line is on stderr by now
             after = sibling._reconcile(run_id)
+            self.assertEqual(after["state"], "running")
             self.assertEqual(after["scan_offset"], 0)
             self.assertIsNone(after["fatal_line"])
             # A recycled pid (identity mismatch) is not a live owner.

@@ -409,7 +409,8 @@ location is the one the dispatching server saw (stored in the run record), and
 fail-fast patterns are the run's CLI's. While the server that dispatched a run
 is alive, only it scans that run's stderr, with its full list including any
 `*_MCP_FATAL_PATTERNS` extras; once it has died, whichever server looks next
-scans with that CLI's built-in list. `AGY_BRAIN_DIR` and `CODEX_HOME` matter to the server that
+scans: a server of the same CLI with its own list, a server of another CLI with
+that CLI's built-in list. `AGY_BRAIN_DIR` and `CODEX_HOME` matter to the server that
 dispatches the run; others use the location recorded with it.
 
 The idle limit is on by default: agy 900 s, Codex 900 s, opencode 600 s. Change
