@@ -1,5 +1,5 @@
 ---
-id: ADM-10
+id: ADM-14
 title: Per-run deadlines and long-command guidance for delegated runs
 status: Done
 assignee:
