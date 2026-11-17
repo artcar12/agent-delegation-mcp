@@ -20,6 +20,7 @@ only quota_status uses and whose absence degrades that one tool. Every knob is
 an environment variable; the full list is in the README.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -309,14 +310,24 @@ def _scan_fatal(record: dict) -> None:
 
 
 def _newest_mtime(root: str) -> float:
-    """Newest file mtime anywhere under root, 0 when there is none."""
+    """Newest mtime among root's files and its immediate subdirectories'
+    files. Shallow on purpose: this runs once a second per live run, and a
+    deliverable or progress log sits at the top of .agent-runs/."""
     newest = 0.0
-    for dirpath, _dirs, files in os.walk(root):
-        for name in files:
-            try:
-                newest = max(newest, os.stat(os.path.join(dirpath, name)).st_mtime)
-            except OSError:
-                pass
+    try:
+        top = list(os.scandir(root))
+    except OSError:
+        return 0.0
+    for entry in top:
+        try:
+            if entry.is_file(follow_symlinks=False):
+                newest = max(newest, entry.stat().st_mtime)
+            elif entry.is_dir(follow_symlinks=False):
+                for sub in os.scandir(entry.path):
+                    if sub.is_file(follow_symlinks=False):
+                        newest = max(newest, sub.stat().st_mtime)
+        except OSError:
+            pass
     return newest
 
 
@@ -344,52 +355,114 @@ def _last_output(record: dict) -> float:
     return max(newest, _cli_activity(record))
 
 
-# agy keeps a per-conversation transcript at
-# <brain>/<conversation id>/.system_generated/logs/transcript_full.jsonl and
-# rewrites it on every step (checked on agy 1.5.9: its mtime moved at each step
-# of a five-step run, and stood still only while one shell command ran). Its
-# stdout, by contrast, is empty until the end. So the transcript is this
-# wrapper's heartbeat for agy. Which conversation is ours is not known up
-# front: the run latches the one transcript written since it started, in a
-# directory created since it started where the filesystem records creation
-# time. Two candidates at once (another agy session started alongside) means
-# no latch, and the run falls back to its other signals.
+# Per-CLI transcripts, used as a heartbeat. Chosen by the RUN's cli, not by
+# which server is looking: every server reconciles every run in the shared
+# store, and judging an agy run by opencode's rules would kill it as idle.
+# Only mtimes are read, and only a codex stdout's first event, never a
+# transcript's content.
+#
+# agy rewrites <brain>/<conversation>/.system_generated/logs/transcript_full.jsonl
+# on every step (checked on agy 1.5.9), while its stdout stays empty until
+# the end. Which conversation is ours is not knowable up front, so dispatch
+# snapshots the brain directory's entries into <run>.brain, and the heartbeat
+# is the newest transcript among conversations that appeared since. Another
+# agy conversation started during the run can only make it look MORE alive,
+# never kill it.
+#
+# codex writes <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread id>.jsonl as
+# it goes, and --json prints the thread id as its first event, so the run's
+# own file is found exactly and remembered in the record.
+#
+# opencode has none: its log file is shared by every opencode process, so it
+# would keep a hung run alive whenever anything else uses opencode; and
+# --print-logs already copies this run's log lines onto its stderr.
 AGY_BRAIN_DIR = os.path.expanduser(_env("AGY_BRAIN_DIR", "~/.gemini/antigravity-cli/brain"))
+CODEX_HOME = os.path.expanduser(_env("CODEX_HOME", "~/.codex"))
 
 
-def _find_transcript(started: float) -> str:
+def _brain_snapshot_path(run_id: str) -> str:
+    return os.path.join(RUN_DIR, run_id) + ".brain"
+
+
+def _snapshot_brain(run_id: str) -> None:
+    """Record which agy conversations existed before this run started."""
     try:
         names = os.listdir(AGY_BRAIN_DIR)
     except OSError:
-        return ""
-    found = []
+        names = []
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(_brain_snapshot_path(run_id), "w") as fh:
+            fh.write("\n".join(names))
+    except OSError:
+        pass
+
+
+def _agy_activity(record: dict) -> float:
+    try:
+        with open(_brain_snapshot_path(record["run_id"])) as fh:
+            before = set(fh.read().split("\n"))
+        names = os.listdir(AGY_BRAIN_DIR)
+    except (OSError, KeyError):
+        return 0.0
+    newest = 0.0
     for name in names:
-        top = os.path.join(AGY_BRAIN_DIR, name)
-        path = os.path.join(top, ".system_generated", "logs", "transcript_full.jsonl")
-        try:
-            if os.stat(path).st_mtime < started:
-                continue
-            born = getattr(os.stat(top), "st_birthtime", None)
-        except OSError:
+        if name in before:
             continue
-        if born is not None and born < started - 2:
-            continue                    # an older conversation, still being written
-        found.append(path)
-    return found[0] if len(found) == 1 else ""
+        try:
+            newest = max(newest, os.stat(os.path.join(
+                AGY_BRAIN_DIR, name, ".system_generated", "logs",
+                "transcript_full.jsonl")).st_mtime)
+        except OSError:
+            pass
+    return newest
 
 
-def _cli_activity(record: dict) -> float:
-    """mtime of this run's agy transcript, 0 until one is identified."""
+def _thread_id(stdout_path: str) -> str:
+    try:
+        with open(stdout_path, "rb") as fh:
+            first = fh.readline(4096)
+        ev = json.loads(first)
+    except (OSError, ValueError):
+        return ""
+    if isinstance(ev, dict) and ev.get("type") == "thread.started":
+        tid = str(ev.get("thread_id") or "")
+        if tid and all(c.isalnum() or c == "-" for c in tid):
+            return tid
+    return ""
+
+
+def _codex_activity(record: dict) -> float:
     path = record.get("activity_path")
     if not path:
-        path = _find_transcript(record.get("started_at", 0.0))
-        if not path:
+        tid = _thread_id(record.get("stdout_path", ""))
+        if not tid:
             return 0.0
-        record["activity_path"] = path
+        # Only the day folders the run can have started in (local and UTC
+        # dates either side of midnight), not the whole history.
+        started = record.get("started_at", time.time())
+        days = {time.strftime("%Y/%m/%d", fn(t)) for fn in (time.localtime, time.gmtime)
+                for t in (started, time.time())}
+        for day in days:
+            hits = glob.glob(os.path.join(CODEX_HOME, "sessions", day, f"*-{tid}.jsonl"))
+            if hits:
+                path = record["activity_path"] = hits[0]
+                break
+        else:
+            return 0.0
     try:
         return os.stat(path).st_mtime
     except OSError:
         return 0.0
+
+
+def _cli_activity(record: dict) -> float:
+    cli = record.get("cli")
+    if cli == "agy":
+        return _agy_activity(record)
+    if cli == "codex":
+        return _codex_activity(record)
+    return 0.0
 
 
 def _terminate(record: dict, verdict: str) -> None:
@@ -459,6 +532,7 @@ def _reconcile(run_id: str):
         if not _pid_exists(record.get("pid", 0)):
             record["state"] = "killed"
             record["ended_at"] = record.get("ended_at") or time.time()
+            _seal_git_guard(record)
             _write_record(record)
         return record
     if record.get("state") != "running":
@@ -480,6 +554,7 @@ def _reconcile(run_id: str):
             record["state"] = "finished"
             record["verdict"] = "exited"
             record["ended_at"] = time.time()
+            _seal_git_guard(record)
             _write_record(record)
             return record
         running = True
@@ -515,6 +590,7 @@ def _reconcile(run_id: str):
 
     # A live run is reconciled once a second; rewriting an unchanged record
     # that often would be pure filesystem churn.
+    _seal_git_guard(record)
     if json.dumps(record, sort_keys=True) != before:
         _write_record(record)
     return record
@@ -542,7 +618,7 @@ def _prune() -> None:
             continue
         if (record.get("ended_at") or record.get("started_at") or 0) > cutoff:
             continue
-        for path in _run_paths(run_id) + (_last_path(run_id),):
+        for path in _run_paths(run_id) + (_last_path(run_id), _brain_snapshot_path(run_id)):
             try:
                 os.unlink(path)
             except OSError:
@@ -799,11 +875,22 @@ def _git_fingerprint(git_dirs: list) -> dict:
     return out
 
 
+def _seal_git_guard(record: dict) -> None:
+    """Fingerprint the git dirs once, when the run ends, so later git use by
+    the parent (a push setting upstream, a config change) is not blamed on
+    the delegate."""
+    if (record.get("git_guard") is not None and record.get("state") != "running"
+            and record.get("git_guard_after") is None):
+        record["git_guard_after"] = _git_fingerprint(record.get("git_dirs"))
+
+
 def _git_guard_note(record: dict) -> str:
     before = record.get("git_guard")
     if before is None:
         return ""
-    after = _git_fingerprint(record.get("git_dirs"))
+    after = record.get("git_guard_after")
+    if after is None:
+        after = _git_fingerprint(record.get("git_dirs"))
     changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
     if not changed:
         return ""
@@ -942,6 +1029,8 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
 
     run_id = _new_run_id()
     _rec_path, out_path, err_path = _run_paths(run_id)
+    if CLI_LABEL == "agy":
+        _snapshot_brain(run_id)         # before the child can create its conversation
     try:
         os.makedirs(RUN_DIR, exist_ok=True)
         out_fh = open(out_path, "wb")
@@ -1199,6 +1288,7 @@ def cancel_run(run_id: str) -> str:
     if record.get("state") != "running":
         return "Already ended - nothing to cancel.\n\n" + _report(record, tail_lines=20)
     _terminate(record, "cancelled")
+    _seal_git_guard(record)
     _write_record(record)
     _live.pop(run_id, None)
     return _report(record, tail_lines=40)

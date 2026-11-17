@@ -314,6 +314,8 @@ class RunStoreTests(unittest.TestCase):
     def test_agy_transcript_counts_as_activity(self):
         if self.SERVER != "agy_mcp_server.py":
             self.skipTest("agy only")
+        old = os.path.join(self.tmp, "brain", "older-conv", ".system_generated", "logs")
+        os.makedirs(old)
         logs = os.path.join(self.tmp, "brain", "conv-1", ".system_generated", "logs")
         mod = self.server(
             f"mkdir -p '{logs}'; i=0\n"
@@ -321,20 +323,38 @@ class RunStoreTests(unittest.TestCase):
         run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
         self.assertTrue(self.wait_until(
             lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
-        record = mod._read_record(run_id)
-        self.assertEqual(record["verdict"], "exited")
-        self.assertTrue(record["activity_path"].endswith("conv-1/.system_generated/logs/transcript_full.jsonl"))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "exited")
 
-    def test_agy_two_new_transcripts_latch_neither(self):
+    def test_agy_ignores_conversations_older_than_the_run(self):
         if self.SERVER != "agy_mcp_server.py":
             self.skipTest("agy only")
-        mod = self.server()
-        started = time.time() - 1
-        for conv in ("a", "b"):
-            logs = os.path.join(self.tmp, "brain", conv, ".system_generated", "logs")
-            os.makedirs(logs)
-            open(os.path.join(logs, "transcript_full.jsonl"), "w").close()
-        self.assertEqual(mod._find_transcript(started), "")
+        logs = os.path.join(self.tmp, "brain", "older-conv", ".system_generated", "logs")
+        os.makedirs(logs)
+        mod = self.server(
+            f"i=0\nwhile [ $i -lt 30 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=3))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] not in ("running", "stopping"), timeout=20))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "idle")
+
+    def test_a_sibling_server_judges_a_run_by_its_own_cli(self):
+        """Every server reconciles every run. A healthy agy run whose only
+        heartbeat is its transcript must survive a codex or opencode server
+        looking at it."""
+        if self.SERVER != "agy_mcp_server.py":
+            self.skipTest("agy only")
+        logs = os.path.join(self.tmp, "brain", "conv-1", ".system_generated", "logs")
+        mod = self.server(
+            f"mkdir -p '{logs}'; i=0\n"
+            f"while [ $i -lt 8 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        mod._live.pop(run_id, None)             # only the sibling is watching now
+        sibling = _load("opencode_mcp_server.py", "srv_sib_oc",
+                        {"AGENT_MCP_RUN_DIR": self.run_dir,
+                         "AGY_BRAIN_DIR": os.path.join(self.tmp, "brain")})
+        self.assertTrue(self.wait_until(
+            lambda: sibling._reconcile(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(sibling._read_record(run_id)["verdict"], "exited")
 
     def test_per_run_idle_limit_is_enforced(self):
         mod = self.server("echo tick; sleep 300\n", **{self.IDLE_VAR: "0"})
@@ -621,7 +641,7 @@ class CodexRunStoreTests(RunStoreTests):
 
     def test_session_file_counts_as_activity(self):
         tid = "0000aaaa-bbbb-cccc-dddd-eeeeffff0000"
-        day = os.path.join(self.tmp, "codex-home", "sessions", "2026", "01", "01")
+        day = os.path.join(self.tmp, "codex-home", "sessions", *time.strftime("%Y/%m/%d").split("/"))
         mod = self.server(
             f"""echo '{{"type":"thread.started","thread_id":"{tid}"}}'\n"""
             f"mkdir -p '{day}'; i=0\n"
@@ -638,6 +658,14 @@ class CodexRunStoreTests(RunStoreTests):
         out = self.dispatch(mod, wait_seconds=10)
         self.assertIn("WARNING: the delegate changed git configuration or hooks", out)
         self.assertIn("post-commit", out)
+
+    def test_parent_git_changes_after_the_run_are_not_blamed(self):
+        mod = self.server("true\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running"))
+        subprocess.run(["git", "-C", self.project, "config", "user.name", "someone"], check=True)
+        self.assertNotIn("WARNING", mod.check_run(run_id))
 
     def test_clean_run_has_no_git_warning(self):
         mod = self.server("true\n")

@@ -320,7 +320,7 @@ environment Claude Code itself inherits. All are optional.
 | `OPENCODE_MCP_TIMEOUT` | opencode | `3600` | Outer subprocess cap, in seconds. |
 | `CODEX_MCP_TIMEOUT` | codex | `3600` | Outer subprocess cap, in seconds. `codex exec` has no run timeout of its own. |
 | `CODEX_MCP_IDLE_TIMEOUT` | codex | `900` | Same knob. `--json` prints nothing while the model reasons or one command runs; the run's own session file fills those gaps (see [Liveness](#liveness-and-the-idle-limit)). |
-| `OPENCODE_MCP_IDLE_TIMEOUT` | opencode | `600` | Kill a run that produces no output on either stream for this long, in seconds; `0` disables. Distinct from the wall clock, and reported distinctly: a wall clock cannot tell "thinking hard" from "dead". Safe as a default here only because `--print-logs` gives a per-step heartbeat. Raise it if a task legitimately runs silent for longer. |
+| `OPENCODE_MCP_IDLE_TIMEOUT` | opencode | `600` | Kill a run that shows no activity (output on either stream, or a write under `.agent-runs/`) for this long, in seconds; `0` disables. Distinct from the wall clock, and reported distinctly: a wall clock cannot tell "thinking hard" from "dead". Safe as a default here only because `--print-logs` gives a per-step heartbeat. Raise it if a task legitimately runs silent for longer. |
 | `AGY_MCP_IDLE_TIMEOUT` | agy | `900` | Kill a run with no sign of life for this long; `0` disables. On since 1.12.0: agy's stdout is empty until the end, but its per-conversation transcript moves on every step, so that is the heartbeat (see [Liveness](#liveness-and-the-idle-limit)). A single command quieter than this is killed: raise it per dispatch with `idle_seconds` when you know one will be. |
 | `AGY_BRAIN_DIR` | agy | `~/.gemini/antigravity-cli/brain` | Where agy keeps per-conversation transcripts, read for their mtime only. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
@@ -362,7 +362,7 @@ Every one cost a debugging session.
 | `--agent build` | Mandatory whenever `~/.config/opencode/opencode.json` sets `"default_agent": "plan"`, which is read-only. Without the override the tool returns a plan, edits nothing, and looks like it worked. |
 | `--print-logs` | What makes opencode's failures *visible*. Its stream errors — including the provider quota wall — go to `~/.local/share/opencode/log/opencode.log` and **never to stdout**. 1.x then did not exit: it sat at 0% CPU until something else killed it, so without this flag the wrapper blocked for the full hour on a failure the CLI knew about in twenty seconds. 2.x exits 1 within seconds (`Error: Go usage limit exceeded`), and the logged line is what tells you why. The per-step log lines double as the heartbeat that makes the idle timeout safe to enable. Server logs only reach stderr with `--standalone`. |
 | `--json` (codex) | `codex exec` writes the whole transcript, agent messages and command output included, to **stderr**, where the fail-fast patterns would match any discussion of quotas. With `--json` the transcript goes to stdout as one event per line and stderr carries only the CLI's own complaints. A quota wall or auth failure arrives as an `error` or `turn.failed` event, which `check_run` quotes. Verified on codex-cli 0.167.0-alpha.4.1. |
-| `--add-dir <git dir>` (codex) | `workspace-write` makes the repo's `.git` read-only, so the delegate edits files and then every `git add` fails on `.git/index.lock`. Verified both ways. In a linked worktree both the worktree git dir and the common dir are added. The cost: a writable git dir also lets the delegate plant a hook or a `core.fsmonitor` / `core.hooksPath` setting, which would run **outside** the sandbox the next time anyone uses git there. So the wrapper fingerprints each git dir's `config` and live hooks at dispatch, and `check_run` leads with a WARNING naming any that changed. Read them before running git in that repo. (agy and opencode run with no sandbox at all, so this is still the tighter of the three.) |
+| `--add-dir <git dir>` (codex) | `workspace-write` makes the repo's `.git` read-only, so the delegate edits files and then every `git add` fails on `.git/index.lock`. Verified both ways. In a linked worktree both the worktree git dir and the common dir are added. The cost: a writable git dir also lets the delegate plant a hook or a `core.fsmonitor` / `core.hooksPath` setting, which would run **outside** the sandbox the next time anyone uses git there. So the wrapper fingerprints each git dir's `config` and live hooks at dispatch and again when the run ends, and `check_run` leads with a WARNING naming any that changed in between. Read them before running git in that repo. (agy and opencode run with no sandbox at all, so this is still the tighter of the three.) |
 | `--sandbox workspace-write` + `approval_policy="never"` (codex) | Codex's own unattended mode: the model's commands may write only inside `cwd`, its git dir and the temp dirs, with no network, and nothing waits for approval. So unlike the other two, a Codex delegate cannot `npm install`, fetch or push. `cwd` must be in a git repo; the tool refuses otherwise. No `--ephemeral`: session files carry the rate-limit snapshot `quota_status` reads, so each run refreshes it. |
 | `--auto` / `--dangerously-skip-permissions` | Nothing fails — this is what makes the run unattended, and it is the entire risk surface. See the warning at the top. |
 
@@ -386,17 +386,25 @@ A run is idle when nothing shows it is alive. The evidence is the newest
 **mtime** (never content) among:
 
 - its stdout and stderr files,
-- any file under `.agent-runs/` in the dispatch `cwd`, which is where the
-  delegate is briefed to write its deliverable and progress log,
+- any file at the top of `.agent-runs/` in the dispatch `cwd` or one folder
+  down, which is where the delegate is briefed to write its deliverable and
+  progress log. The folder is shared, so anything else writing there (another
+  delegate in the same repo, the parent's plan files) also counts,
 - the CLI's own per-run transcript. For agy that is
   `<AGY_BRAIN_DIR>/<conversation>/.system_generated/logs/transcript_full.jsonl`,
-  which it rewrites on every step (checked on agy 1.5.9). The run latches the
-  one transcript created since it started, and falls back to the other signals
-  if two appeared at once. For Codex it is the session file
+  which it rewrites on every step (checked on agy 1.5.9), while its stdout
+  stays empty until the end. Which conversation is the run's is not knowable
+  up front, so dispatch records the conversations that already exist, and the
+  heartbeat is the newest transcript among those created since. Another agy
+  conversation started during the run can only make it look more alive. For
+  Codex it is the session file
   `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread id>.jsonl`, matched
   exactly by the thread id `--json` prints first. opencode has none: its log
   file is shared by every opencode process, so it would keep a hung run looking
   alive, and `--print-logs` already copies this run's lines onto its stderr.
+
+The detector follows the run's CLI, not the server doing the looking: every
+server reconciles every run in the shared store.
 
 The idle limit is on by default: agy 900 s, Codex 900 s, opencode 600 s. Change
 it per dispatch with `idle_seconds` (`0` turns it off) or per server with the
