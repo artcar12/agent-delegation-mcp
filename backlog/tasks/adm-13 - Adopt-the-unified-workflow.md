@@ -46,4 +46,6 @@ Reviews: nine fresh-context subagent rounds on CLAUDE.md; findings were wording 
 Gate: python3 -m unittest discover -s test, 139 OK (6 skipped); claude plugin validate . passes with the two expected warnings.
 PENDING (Latitude, AC #3): check the Latitude's Claude memory dir for this project (~/.claude/projects/*agent-delegation-mcp*/memory) for load-bearing rules; move any into CLAUDE.md or a backlog decision, delete the file, then check AC #3.
 Follow-ups not done: README section 2 (around line 212) says the root .mcp.json is gone and servers always run from the installed copy; .mcp.json is tracked and loads the working-tree servers. agent-delegation--v1.12.0 tag not made (needs Arthur's go). Commits in this repo carry the work email although the repo is public (pre-existing, 71 of 73 commits on main).
+
+README section 2 follow-up done on this branch at Arthur's request (7191355): it now says the root .mcp.json starts the working-tree servers next to the installed plugin and shares the run store.
 <!-- SECTION:NOTES:END -->
