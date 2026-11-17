@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-11-16 23:37'
-updated_date: '2026-11-17 04:04'
+updated_date: '2026-11-17 04:14'
 labels: []
 dependencies: []
 ordinal: 13000
@@ -22,7 +22,7 @@ Bring this repo onto the unified workflow (claude-skills: skills/working-standar
 - [x] #1 CLAUDE.md, AGENTS.md, .gitignore and backlog config match the template
 - [x] #2 Any spec or plan is Backlog doc-1 and the file is gone; ADRs are decisions; no handoff file
 - [ ] #3 No load-bearing project rules left in Claude memory on either machine
-- [ ] #4 Gate green, merged and pushed
+- [x] #4 Gate green, merged and pushed
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -48,4 +48,6 @@ PENDING (Latitude, AC #3): check the Latitude's Claude memory dir for this proje
 Follow-ups not done: README section 2 (around line 212) says the root .mcp.json is gone and servers always run from the installed copy; .mcp.json is tracked and loads the working-tree servers. agent-delegation--v1.12.0 tag not made (needs Arthur's go). Commits in this repo carry the work email although the repo is public (pre-existing, 71 of 73 commits on main).
 
 README section 2 follow-up done on this branch at Arthur's request (7191355): it now says the root .mcp.json starts the working-tree servers next to the installed plugin and shares the run store.
+
+Merged to main as 3c28a7a (--no-ff) and pushed 2026-11-16 (push made by the parent session after Arthur approved it). Ticket stays In Progress until the Latitude memory check (AC #3).
 <!-- SECTION:NOTES:END -->
