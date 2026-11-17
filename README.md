@@ -210,11 +210,16 @@ out as `.`, and both servers die instantly with `Connection closed` because the
 path is resolved against whatever project is open. Version 1.1.0 shipped with
 that form and was broken for every plugin install; see the release notes.
 
-`.claude-plugin/plugin.json` is the only place the servers are registered. This
-repo used to carry a root `.mcp.json` with plain `./` paths so that opening it as
-a project loaded the working-tree servers too; that file is gone, and with the
-plugin installed the servers always run from the installed copy. To exercise
-uncommitted changes, point Claude at the working tree by hand:
+`.claude-plugin/plugin.json` is the only place the plugin registers the
+servers. The repo also carries a root `.mcp.json` with plain `./` paths, which
+the plugin does not load: opening this repo (or a worktree of it) as a project
+starts the working-tree servers as `agy-wrapper`, `opencode-wrapper` and
+`codex-wrapper`, next to the installed plugin's `plugin:agent-delegation:*`
+servers. Tell them apart by the tool prefix; each reads the version from its own
+`plugin.json`. Both sets share the run store (`AGENT_MCP_RUN_DIR`), so a session
+whose working tree changes how runs are judged should point that variable at a
+scratch directory. To exercise uncommitted changes from another project, point
+Claude at the working tree by hand:
 
 ```bash
 claude mcp add agy-dev -- uv run --script ./agy_mcp_server.py

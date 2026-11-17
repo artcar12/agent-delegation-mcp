@@ -3,6 +3,11 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
-.agent-runs/
 REVIEW-*.md
 .claude/settings.local.json
+# Delegate output (agy, opencode, Codex)
+.agent-runs/
+# Desktop session worktrees
+.claude/worktrees/
+# Local Codex project config (not wrapper state)
+.codex/
