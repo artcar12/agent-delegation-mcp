@@ -22,3 +22,26 @@ Do not edit Backlog task, draft, document, decision, or milestone markdown files
 
 </CRITICAL_INSTRUCTION>
 <!-- BACKLOG.MD GUIDELINES END -->
+
+<!-- working-standard START -->
+## Working method
+
+Arthur's `working-standard` skill applies to every session in this project. It's manual-only, so read `~/.claude/skills/working-standard/SKILL.md` at session start (and `references/lifecycle.md` for phase work) unless he has run `/working-standard`.
+<!-- working-standard END -->
+
+## Project rules
+
+The `agent-delegation` Claude Code plugin: three MCP servers (`agy_mcp_server.py`, `opencode_mcp_server.py`, `codex_mcp_server.py`) that dispatch work to the agy, opencode and Codex CLIs, plus `quota_sources.py` and the `gemini-ask` skill. There is no doc-1: `README.md` is the design and user documentation, `MODEL-ROSTER.md` the model routing reference. Public GitHub repo (`artcar12/agent-delegation-mcp`).
+
+Gate (all must pass before a merge):
+
+```bash
+python3 -m unittest discover -s test   # ~4 min; run in the background
+claude plugin validate .               # passes; CLAUDE.md-at-plugin-root and missing-icon warnings are expected
+```
+
+Tests use fake CLIs and invented fixtures only. Never copy, trim or quote a real agy, opencode or Codex session file into a fixture.
+
+The three servers each carry their own copy of the run store (dispatch, `check_run`, `cancel_run`, `list_runs`, liveness, idle limit, fail-fast pattern tables) and the same `quota_status`. A change to shared behaviour goes into all three; `test/test_run_store.py` loads every server and checks the pattern tables are equal.
+
+Releases: any shipped change to a server, skill or manifest bumps `version` in `.claude-plugin/plugin.json` and the matching entry in `.claude-plugin/marketplace.json` together (servers read the version from `plugin.json` at runtime), and adds a `README.md` section 9 entry when users have something to act on. Tags (`claude plugin tag . --push`, `agent-delegation--v<version>`) need Arthur's go. To run a merged release locally: `claude plugin marketplace update agent-delegation-mcp`, `claude plugin update agent-delegation`, then `/reload-plugins`.

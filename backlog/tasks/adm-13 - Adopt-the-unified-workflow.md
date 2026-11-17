@@ -1,9 +1,11 @@
 ---
 id: ADM-13
 title: Adopt the unified workflow
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-16 23:37'
+updated_date: '2026-11-17 03:24'
 labels: []
 dependencies: []
 ordinal: 13000
@@ -22,3 +24,14 @@ Bring this repo onto the unified workflow (claude-skills: skills/working-standar
 - [ ] #3 No load-bearing project rules left in Claude memory on either machine
 - [ ] #4 Gate green, merged and pushed
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Backlog config already matches (prefix adm, statuses, remote_operations, check_active_branches); refresh the Backlog block.
+2. CLAUDE.md: Backlog block + working-standard block + project rules (gate, release/version rules, wrapper rules).
+3. AGENTS.md one-line pointer; .gitignore template lines (+ .codex/); .claude/worktrees/ out of .git/info/exclude.
+4. Knowledge: no spec/plan/ADR/handoff files exist; Mac memory dir empty. Latitude memory check left pending.
+5. Main checkout: untracked AGENTS.md (Backlog block only) removed so the merge can land; .codex/config.toml (project-scoped Codex MCP config) kept and gitignored.
+6. Gate, fresh-context review, merge --no-ff, push.
+<!-- SECTION:PLAN:END -->
