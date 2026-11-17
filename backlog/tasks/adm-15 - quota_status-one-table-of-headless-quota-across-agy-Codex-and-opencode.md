@@ -1,10 +1,10 @@
 ---
 id: ADM-15
 title: 'quota_status: one table of headless quota across agy, Codex and opencode'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-17 00:20'
-updated_date: '2026-11-17 00:20'
+updated_date: '2026-11-17 01:50'
 labels: []
 dependencies: []
 ordinal: 14000
@@ -18,12 +18,12 @@ The coordinator routes work across Claude, agy, opencode and Codex by remaining 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A quota_status tool is exposed by every wrapper from one shared module and returns a table, or JSON with format='json', with source, pool, window, percent used and left, and reset time per window
-- [ ] #2 agy pools come from /usage JSON, falling back to its tab-separated text lines
-- [ ] #3 Codex windows come from the newest session file with a non-null payload.rate_limits; only rate_limits fields are read; as-of is the file mtime; a window whose resets_at has passed is marked reset
-- [ ] #4 opencode reports a stats summary and the time of the last usage-limit line in its log, if any
-- [ ] #5 Each source fails soft as 'unavailable: reason' and never raises
-- [ ] #6 Parser tests use synthetic fixtures only
+- [x] #1 A quota_status tool is exposed by every wrapper from one shared module and returns a table, or JSON with format='json', with source, pool, window, percent used and left, and reset time per window
+- [x] #2 agy pools come from /usage JSON, falling back to its tab-separated text lines
+- [x] #3 Codex windows come from the newest session file with a non-null payload.rate_limits; only rate_limits fields are read; as-of is the file mtime; a window whose resets_at has passed is marked reset
+- [x] #4 opencode reports a stats summary and the time of the last usage-limit line in its log, if any
+- [x] #5 Each source fails soft as 'unavailable: reason' and never raises
+- [x] #6 Parser tests use synthetic fixtures only
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -34,3 +34,15 @@ The coordinator routes work across Claude, agy, opencode and Codex by remaining 
 3. Each server imports it and registers quota_status(format); ImportError degrades to an 'unavailable' answer.
 4. test/test_quota_sources.py with synthetic fixtures; README section.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Verified live 2026-11-16: quota_status over MCP from all three servers (uv run --script); agy 5 windows, codex 2, opencode summary; 2.3 s. Review fixes: codex collector skips a malformed newest snapshot. Tests: test/test_quota_sources.py 20 OK.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+quota_sources.py, shared by all three wrappers' quota_status: agy /usage JSON (text fallback), Codex rate_limits from the newest session file (only that field decoded), opencode stats today/7d plus last usage-limit time. Table or schema-1 JSON. Verified live over MCP and with 20 synthetic-fixture tests.
+<!-- SECTION:FINAL_SUMMARY:END -->
