@@ -125,6 +125,28 @@ FATAL_PATTERNS = tuple(
     ) if p
 )
 
+# Built-in patterns per CLI, for judging a run some OTHER server dispatched:
+# every server reconciles every run, and a codex quota line must still fail a
+# codex run fast when the agy server is the one that scans it. A run of this
+# server's own CLI also gets the env-configured extras above.
+_BUILTIN_FATAL = {
+    "agy": ("ai_apicallerror", "usage limit reached", "quota exceeded",
+            "insufficient credit", "invalid api key", "authentication failed"),
+    "opencode": ("ai_apicallerror", "usage limit reached", "usage limit exceeded",
+                 "quota exceeded", "insufficient credit", "invalid api key",
+                 "authentication failed"),
+    "codex": ("hit your usage limit", "usage limit reached", "quota exceeded",
+              "insufficient credit", "invalid api key", "authentication failed"),
+}
+
+
+def _fatal_patterns(record: dict) -> tuple:
+    cli = record.get("cli", CLI_LABEL)
+    if cli == CLI_LABEL:
+        return FATAL_PATTERNS
+    return _BUILTIN_FATAL.get(cli, FATAL_PATTERNS)
+
+
 # Where the delegate's DELIVERABLE belongs, inside the target project. Distinct
 # from RUN_DIR below, which holds this wrapper's own bookkeeping and raw logs.
 # Reported on every exit path. Matches the convention in README 5.2.
@@ -292,7 +314,8 @@ def _scan_fatal(record: dict) -> None:
     last newline keeps a fatal message that happens to straddle two reads from
     being split down the middle and missed by both.
     """
-    if record.get("fatal_line") or not FATAL_PATTERNS:
+    patterns = _fatal_patterns(record)
+    if record.get("fatal_line") or not patterns:
         return
     start = record.get("scan_offset", 0)
     try:
@@ -307,7 +330,7 @@ def _scan_fatal(record: dict) -> None:
     record["scan_offset"] = start + cut + 1
     for line in chunk[:cut].decode("utf-8", "replace").splitlines():
         low = line.lower()
-        for p in FATAL_PATTERNS:
+        for p in patterns:
             if p in low:
                 record["fatal_line"] = line.strip()
                 return
@@ -406,7 +429,8 @@ def _agy_activity(record: dict) -> float:
     try:
         with open(_brain_snapshot_path(record["run_id"])) as fh:
             before = set(fh.read().split("\n"))
-        names = os.listdir(AGY_BRAIN_DIR)
+        root = record.get("transcript_root") or AGY_BRAIN_DIR
+        names = os.listdir(root)
     except (OSError, KeyError):
         return 0.0
     newest = 0.0
@@ -415,7 +439,7 @@ def _agy_activity(record: dict) -> float:
             continue
         try:
             newest = max(newest, os.stat(os.path.join(
-                AGY_BRAIN_DIR, name, ".system_generated", "logs",
+                root, name, ".system_generated", "logs",
                 "transcript_full.jsonl")).st_mtime)
         except OSError:
             pass
@@ -448,7 +472,8 @@ def _codex_activity(record: dict) -> float:
         days = {time.strftime("%Y/%m/%d", fn(t)) for fn in (time.localtime, time.gmtime)
                 for t in (started, time.time())}
         for day in days:
-            hits = glob.glob(os.path.join(CODEX_HOME, "sessions", day, f"*-{tid}.jsonl"))
+            home = record.get("transcript_root") or CODEX_HOME
+            hits = glob.glob(os.path.join(home, "sessions", day, f"*-{tid}.jsonl"))
             if hits:
                 path = record["activity_path"] = hits[0]
                 break
@@ -627,6 +652,22 @@ def _prune() -> None:
                 os.unlink(path)
             except OSError:
                 pass
+    # Sidecars whose record never got written (a dispatch that failed after
+    # the snapshot) or was removed by an older version that did not know them.
+    try:
+        names = os.listdir(RUN_DIR)
+    except OSError:
+        return
+    for name in names:
+        base, ext = os.path.splitext(name)
+        if ext not in (".brain", ".last") or os.path.exists(os.path.join(RUN_DIR, base + ".json")):
+            continue
+        path = os.path.join(RUN_DIR, name)
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                os.unlink(path)
+        except OSError:
+            pass
 
 
 def _startup() -> None:
@@ -1125,6 +1166,9 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "state": "running",
         "verdict": None,
         "server_pid": os.getpid(),
+        # Where this run's CLI keeps its transcripts, as THIS server saw it, so
+        # a sibling server with a different environment looks in the same place.
+        "transcript_root": {"agy": AGY_BRAIN_DIR, "codex": CODEX_HOME}.get(CLI_LABEL),
     }
     record.update(extra or {})
     _live[run_id] = proc

@@ -294,7 +294,9 @@ class RunStoreTests(unittest.TestCase):
         mod = self.server(
             "mkdir -p .agent-runs; i=0\n"
             "while [ $i -lt 8 ]; do echo $i >> .agent-runs/progress.log; sleep 1; i=$((i+1)); done\n")
-        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        # 6s against 1s writes: margin for a loaded machine, where one tick of
+        # the loop has been seen to take over 4s.
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
         self.assertTrue(self.wait_until(
             lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
         self.assertEqual(mod._read_record(run_id)["verdict"], "exited")
@@ -684,6 +686,30 @@ class CodexRunStoreTests(RunStoreTests):
         sibling._write_record(record)
         sibling._prune()
         self.assertFalse(os.path.exists(mod._last_path(run_id)))
+
+    def test_codex_run_judged_by_a_sibling_keeps_its_heartbeat_and_patterns(self):
+        tid = "1111aaaa-bbbb-cccc-dddd-eeeeffff1111"
+        day = os.path.join(self.tmp, "codex-home", "sessions", *time.strftime("%Y/%m/%d").split("/"))
+        mod = self.server(
+            f"""echo '{{"type":"thread.started","thread_id":"{tid}"}}'\n"""
+            f"mkdir -p '{day}'; i=0\n"
+            f"while [ $i -lt 8 ]; do echo x >> '{day}/rollout-x-{tid}.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=4))
+        mod._live.pop(run_id, None)
+        sibling = _load("agy_mcp_server.py", "srv_sib_agy", {"AGENT_MCP_RUN_DIR": self.run_dir})
+        self.assertTrue(self.wait_until(
+            lambda: sibling._reconcile(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(sibling._read_record(run_id)["verdict"], "exited")
+        self.assertIn("hit your usage limit", sibling._fatal_patterns({"cli": "codex"}))
+
+    def test_prune_removes_orphan_sidecars(self):
+        mod = self.server(AGENT_MCP_RUN_RETENTION_DAYS="1")
+        os.makedirs(self.run_dir, exist_ok=True)
+        orphan = os.path.join(self.run_dir, "20200101-000000-dead.brain")
+        open(orphan, "w").close()
+        os.utime(orphan, (time.time() - 3 * 86400,) * 2)
+        mod._prune()
+        self.assertFalse(os.path.exists(orphan))
 
     def test_prune_removes_the_last_message_file(self):
         mod = self.server(self.WRITE_LAST, AGENT_MCP_RUN_RETENTION_DAYS="1")
