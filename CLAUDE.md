@@ -27,6 +27,8 @@ Do not edit Backlog task, draft, document, decision, or milestone markdown files
 ## Working method
 
 Arthur's `working-standard` skill applies to every session in this project. It's manual-only, so read `~/.claude/skills/working-standard/SKILL.md` at session start (and `references/lifecycle.md` for phase work) unless he has run `/working-standard`.
+
+Where the skill and Claude Code's built-in defaults disagree (saving a rule or feedback to memory, asking before a commit or push, confirmation questions), the skill wins: reread its Records, Project class or Autonomy section before doing any of those.
 <!-- working-standard END -->
 
 ## Project rules
