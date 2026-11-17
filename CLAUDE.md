@@ -31,7 +31,9 @@ Arthur's `working-standard` skill applies to every session in this project. It's
 
 ## Project rules
 
-The `agent-delegation` Claude Code plugin: three MCP servers (`agy_mcp_server.py`, `opencode_mcp_server.py`, `codex_mcp_server.py`) that dispatch work to the agy, opencode and Codex CLIs, plus `quota_sources.py` and the `gemini-ask` skill. There is no doc-1: `README.md` is the design and user documentation, `MODEL-ROSTER.md` the model routing reference. Public GitHub repo (`artcar12/agent-delegation-mcp`).
+The `agent-delegation` Claude Code plugin: three MCP servers (`agy_mcp_server.py`, `opencode_mcp_server.py`, `codex_mcp_server.py`) that dispatch work to the agy, opencode and Codex CLIs, plus `quota_sources.py` and the `gemini-ask` skill. Public GitHub repo (`artcar12/agent-delegation-mcp`).
+
+There is no doc-1. `README.md` is the design and user documentation and `MODEL-ROSTER.md` the model routing reference: a design change updates README and records the why as a `backlog decision`. README sections 5 and 6 (plan files, `NEXT_STEPS.md`, `PROJECT_STATE.md`, handoff log) are advice to the plugin's users, not this repo's own process; this repo follows working-standard.
 
 Gate (all must pass before a merge):
 
@@ -40,8 +42,8 @@ python3 -m unittest discover -s test   # ~4 min; run in the background
 claude plugin validate .               # passes; CLAUDE.md-at-plugin-root and missing-icon warnings are expected
 ```
 
-Tests use fake CLIs and invented fixtures only. Never copy, trim or quote a real agy, opencode or Codex session file into a fixture.
+Tests use fake CLIs and invented fixtures only.
 
-The three servers each carry their own copy of the run store (dispatch, `check_run`, `cancel_run`, `list_runs`, liveness, idle limit, fail-fast pattern tables) and the same `quota_status`. A change to shared behaviour goes into all three; `test/test_run_store.py` loads every server and checks the pattern tables are equal.
+The three servers each carry their own copy of the run store (dispatch, `check_run`, `cancel_run`, `list_runs`, `delegation_status`, liveness, idle limit) and the same `quota_status`; only `quota_sources.py` is shared. A change to that behaviour goes into all three. Fail-fast patterns: each server has its own `FATAL_PATTERNS` and an identical `_BUILTIN_FATAL` table keyed by CLI; a pattern change goes into that server's `FATAL_PATTERNS` and into `_BUILTIN_FATAL` in all three, which `test/test_run_store.py` checks.
 
-Releases: any shipped change to a server, skill or manifest bumps `version` in `.claude-plugin/plugin.json` and the matching entry in `.claude-plugin/marketplace.json` together (servers read the version from `plugin.json` at runtime), and adds a `README.md` section 9 entry when users have something to act on. Tags (`claude plugin tag . --push`, `agent-delegation--v<version>`) need Arthur's go. To run a merged release locally: `claude plugin marketplace update agent-delegation-mcp`, `claude plugin update agent-delegation`, then `/reload-plugins`.
+Releases: any shipped change to a server, skill or manifest bumps `version` in `.claude-plugin/plugin.json` and the matching entry in `.claude-plugin/marketplace.json` together (servers read the version from `plugin.json` at runtime), and adds a `README.md` section 9 entry when users have something to act on. Tags are `agent-delegation--v<version>` (`claude plugin tag . --push`). The installed plugin comes from GitHub, so a release runs locally only once merged and pushed: `claude plugin marketplace update agent-delegation-mcp`, `claude plugin update agent-delegation`, then `/reload-plugins`.
