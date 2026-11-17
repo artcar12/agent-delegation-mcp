@@ -15,6 +15,14 @@
         "--script",
         "./agy_mcp_server.py"
       ]
+    },
+    "codex-wrapper": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--script",
+        "./codex_mcp_server.py"
+      ]
     }
   }
 }

@@ -4,6 +4,7 @@ title: Report agy quota from the agy wrapper
 status: To Do
 assignee: []
 created_date: '2026-11-10 15:16'
+updated_date: '2026-11-17 00:37'
 labels: []
 dependencies: []
 ordinal: 12000
@@ -28,4 +29,6 @@ The coordinator has no way to see agy quota, so it cannot pick a model or pace d
 
 <!-- SECTION:NOTES:BEGIN -->
 Found while coordinating block-walk on 2026-11-10: Argon was at 38 percent weekly and the coordinator only knew from screenshots. Check whether opencode has an equivalent for the opencode wrapper.
+
+2026-11-16: ADM-15 adds quota_status (shared quota_sources.py) to every wrapper, covering AC #1 (buckets with group, window, percent and reset), #4 (fails soft as unavailable, never blocks) and #5 (tests incl. a single-bucket group). Still open: #2 (dispatch_agy surfacing the chosen pool's remaining quota) and #3 (instructions naming which models share which pool; they now only point at quota_status).
 <!-- SECTION:NOTES:END -->

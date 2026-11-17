@@ -1,4 +1,4 @@
-# OpenCode model roster
+# Model roster (OpenCode in depth, Codex and cross-tool routing up top)
 
 **Research date: 2026-09-10.** Sourced from a deep-research pass over vendor
 docs, OpenCode's changelog and issue tracker, OpenRouter model pages, and
@@ -17,8 +17,34 @@ are gone: `opencode/mimo-v2.5-free` and `opencode/ling-3.0-flash-fin-free`.
 `opencode/glm-5.3-flash-free` passed a write-a-file probe on 2.2.1. In 2.x the
 quota error reads `AI.Error: Go usage limit exceeded`, not `AI_APICallError`.
 
+## Routing across tools
+
+Four tools, four separate quota pools: Claude, agy, opencode and Codex. Check
+`quota_status` (and Claude's own usage) before a fan-out or a long dispatch, and
+skip any tool that has hit its limit until its reset.
+
+- **Judgment-shaped work** (writing the plan, a tricky fix, a second-model
+  review): opencode with a Tier 1 model below, or Codex.
+- **Bulk mechanical work** (renames, boilerplate, test scaffolding from a
+  precise plan): agy with Gemini Flash. agy's "Claude and GPT models" pool is
+  extra Claude-class capacity on a quota separate from the Gemini pool.
+- Name the model explicitly on every dispatch; wrapper defaults lag.
+
+### Codex models
+
+Not researched like the OpenCode roster below; this is what is known locally.
+`dispatch_codex` with no `model` uses the default in `~/.codex/config.toml`,
+which on 2026-11-16 was `gpt-6.1-sol` (verified: an end-to-end dispatch wrote a
+file and committed in 34 s). Ids the CLI listed that day: `gpt-6.1-sol`,
+`gpt-6.1-terra`, `gpt-6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-5.6-sol`,
+`gpt-5.6-terra`, `gpt-5.6-luna`. Only the default has been tested here. All
+draw on the same ChatGPT-plan pool: a 5-hour and a weekly window, which
+`quota_status` reads from the last Codex session. Re-check ids in the `codex`
+TUI's `/model` picker.
+
 ## Contents
 
+- [Routing across tools](#routing-across-tools)
 - [Why tool-calling reliability dominates](#why-tool-calling-reliability-dominates)
 - [The roster](#the-roster)
 - [Per-model detail](#per-model-detail)

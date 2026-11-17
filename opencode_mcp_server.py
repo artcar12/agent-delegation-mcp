@@ -12,13 +12,15 @@ returns a run id; check_run, cancel_run and list_runs work on that record from
 any session, including one started after this server has been restarted. See
 the run-store comment below for why.
 
-Self-contained on purpose: nothing is imported from its sibling server, and the
-dependency is declared inline above, so `uv run --script` on this one file is a
-complete way to run it. The run store is therefore duplicated into both servers
-rather than factored out; they share RUN_DIR at runtime, not code. Every knob is
+Nothing is imported from the sibling servers, and the dependency is declared
+inline above, so `uv run --script` on this file runs it. The run store is
+duplicated into each server rather than factored out; they share RUN_DIR at
+runtime, not code. The one shared module is quota_sources.py beside it, which
+only quota_status uses and whose absence degrades that one tool. Every knob is
 an environment variable; the full list is in the README.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -123,6 +125,28 @@ FATAL_PATTERNS = tuple(
     ) if p
 )
 
+# Built-in patterns per CLI, for judging a run some OTHER server dispatched:
+# every server reconciles every run, and a codex quota line must still fail a
+# codex run fast when the agy server is the one that scans it. A run of this
+# server's own CLI also gets the env-configured extras above.
+_BUILTIN_FATAL = {
+    "agy": ("ai_apicallerror", "usage limit reached", "quota exceeded",
+            "insufficient credit", "invalid api key", "authentication failed"),
+    "opencode": ("ai_apicallerror", "usage limit reached", "usage limit exceeded",
+                 "quota exceeded", "insufficient credit", "invalid api key",
+                 "authentication failed"),
+    "codex": ("hit your usage limit", "usage limit reached", "quota exceeded",
+              "insufficient credit", "invalid api key", "authentication failed"),
+}
+
+
+def _fatal_patterns(record: dict) -> tuple:
+    cli = record.get("cli", CLI_LABEL)
+    if cli == CLI_LABEL:
+        return FATAL_PATTERNS
+    return _BUILTIN_FATAL.get(cli, FATAL_PATTERNS)
+
+
 # Where the delegate's DELIVERABLE belongs, inside the target project. Distinct
 # from RUN_DIR below, which holds this wrapper's own bookkeeping and raw logs.
 # Reported on every exit path. Matches the convention in README 5.2.
@@ -182,6 +206,15 @@ _live: dict = {}
 def _run_paths(run_id: str) -> tuple:
     base = os.path.join(RUN_DIR, run_id)
     return base + ".json", base + ".out", base + ".err"
+
+
+def _last_path(run_id: str) -> str:
+    """Where `codex exec -o` writes the agent's final message for a codex run.
+    Every server knows the name so any of them can report and prune it."""
+    return os.path.join(RUN_DIR, run_id) + ".last"
+
+
+_SERVER_IDENTITY = ""      # this process's start time, filled on first use
 
 
 def _new_run_id() -> str:
@@ -275,6 +308,17 @@ def _record_ids() -> list:
         return []
 
 
+def _owner_alive(record: dict) -> bool:
+    """Is the server that dispatched this run still the process running under
+    its pid? Start time guards against a recycled pid, as in _alive."""
+    pid = record.get("server_pid") or 0
+    state, start = _proc_info(pid) if pid else ("", "")
+    if not state or state.startswith("Z"):
+        return False
+    recorded = record.get("server_identity") or ""
+    return not recorded or start == recorded
+
+
 def _scan_fatal(record: dict) -> None:
     """Latch the first fatal stderr line, resuming from where the last scan
     stopped.
@@ -285,7 +329,13 @@ def _scan_fatal(record: dict) -> None:
     last newline keeps a fatal message that happens to straddle two reads from
     being split down the middle and missed by both.
     """
-    if record.get("fatal_line") or not FATAL_PATTERNS:
+    patterns = _fatal_patterns(record)
+    if record.get("fatal_line") or not patterns:
+        return
+    if record.get("server_pid") != os.getpid() and _owner_alive(record):
+        # The server that dispatched it is alive and scanning with its own
+        # full list, env extras included. Scanning here would advance the
+        # shared offset past lines only those extras catch.
         return
     start = record.get("scan_offset", 0)
     try:
@@ -300,27 +350,168 @@ def _scan_fatal(record: dict) -> None:
     record["scan_offset"] = start + cut + 1
     for line in chunk[:cut].decode("utf-8", "replace").splitlines():
         low = line.lower()
-        for p in FATAL_PATTERNS:
+        for p in patterns:
             if p in low:
                 record["fatal_line"] = line.strip()
                 return
 
 
+def _newest_mtime(root: str) -> float:
+    """Newest mtime among root's files and its immediate subdirectories'
+    files. Shallow on purpose: this runs once a second per live run, and a
+    deliverable or progress log sits at the top of .agent-runs/."""
+    newest = 0.0
+    try:
+        top = list(os.scandir(root))
+    except OSError:
+        return 0.0
+    for entry in top:
+        try:
+            if entry.is_file(follow_symlinks=False):
+                newest = max(newest, entry.stat().st_mtime)
+            elif entry.is_dir(follow_symlinks=False):
+                for sub in os.scandir(entry.path):
+                    if sub.is_file(follow_symlinks=False):
+                        newest = max(newest, sub.stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
 def _last_output(record: dict) -> float:
-    """When the delegate last wrote anything, on either stream.
+    """When the delegate last showed any sign of life.
+
+    The newest mtime among: its stdout and stderr, any file under the target
+    project's .agent-runs/ (where it is briefed to write its deliverable and
+    progress log), and the CLI's own per-run transcript (_cli_activity). Only
+    mtimes are read, never content.
 
     Taken from file mtimes rather than a timer in this process, which is what
     lets the idle rule survive a restart: the evidence is on disk, so a server
     that never saw the earlier output can still tell a thinking run from a hung
-    one.
+    one. Never earlier than the start, so an old file cannot age a new run.
     """
-    newest = 0.0
+    newest = record.get("started_at", 0.0)
     for key in ("stdout_path", "stderr_path"):
         try:
             newest = max(newest, os.stat(record[key]).st_mtime)
         except (OSError, KeyError):
             pass
-    return newest or record.get("started_at", 0.0)
+    if record.get("cwd"):
+        newest = max(newest, _newest_mtime(os.path.join(record["cwd"], ARTIFACT_DIR)))
+    return max(newest, _cli_activity(record))
+
+
+# Per-CLI transcripts, used as a heartbeat. Chosen by the RUN's cli, not by
+# which server is looking: every server reconciles every run in the shared
+# store, and judging an agy run by opencode's rules would kill it as idle.
+# Only mtimes are read, and only a codex stdout's first event, never a
+# transcript's content.
+#
+# agy rewrites <brain>/<conversation>/.system_generated/logs/transcript_full.jsonl
+# on every step (checked on agy 1.5.9), while its stdout stays empty until
+# the end. Which conversation is ours is not knowable up front, so dispatch
+# snapshots the brain directory's entries into <run>.brain, and the heartbeat
+# is the newest transcript among conversations that appeared since. Another
+# agy conversation started during the run can only make it look MORE alive,
+# never kill it.
+#
+# codex writes <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread id>.jsonl as
+# it goes, and --json prints the thread id as its first event, so the run's
+# own file is found exactly and remembered in the record.
+#
+# opencode has none: its log file is shared by every opencode process, so it
+# would keep a hung run alive whenever anything else uses opencode; and
+# --print-logs already copies this run's log lines onto its stderr.
+AGY_BRAIN_DIR = os.path.expanduser(_env("AGY_BRAIN_DIR", "~/.gemini/antigravity-cli/brain"))
+CODEX_HOME = os.path.expanduser(_env("CODEX_HOME", "~/.codex"))
+
+
+def _brain_snapshot_path(run_id: str) -> str:
+    return os.path.join(RUN_DIR, run_id) + ".brain"
+
+
+def _snapshot_brain(run_id: str) -> None:
+    """Record which agy conversations existed before this run started."""
+    try:
+        names = os.listdir(AGY_BRAIN_DIR)
+    except OSError:
+        names = []
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(_brain_snapshot_path(run_id), "w") as fh:
+            fh.write("\n".join(names))
+    except OSError:
+        pass
+
+
+def _agy_activity(record: dict) -> float:
+    try:
+        with open(_brain_snapshot_path(record["run_id"])) as fh:
+            before = set(fh.read().split("\n"))
+        root = record.get("transcript_root") or AGY_BRAIN_DIR
+        names = os.listdir(root)
+    except (OSError, KeyError):
+        return 0.0
+    newest = 0.0
+    for name in names:
+        if name in before:
+            continue
+        try:
+            newest = max(newest, os.stat(os.path.join(
+                root, name, ".system_generated", "logs",
+                "transcript_full.jsonl")).st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def _thread_id(stdout_path: str) -> str:
+    try:
+        with open(stdout_path, "rb") as fh:
+            first = fh.readline(4096)
+        ev = json.loads(first)
+    except (OSError, ValueError):
+        return ""
+    if isinstance(ev, dict) and ev.get("type") == "thread.started":
+        tid = str(ev.get("thread_id") or "")
+        if tid and all(c.isalnum() or c == "-" for c in tid):
+            return tid
+    return ""
+
+
+def _codex_activity(record: dict) -> float:
+    path = record.get("activity_path")
+    if not path:
+        tid = _thread_id(record.get("stdout_path", ""))
+        if not tid:
+            return 0.0
+        # Only the day folders the run can have started in (local and UTC
+        # dates either side of midnight), not the whole history.
+        started = record.get("started_at", time.time())
+        days = {time.strftime("%Y/%m/%d", fn(t)) for fn in (time.localtime, time.gmtime)
+                for t in (started, time.time())}
+        for day in days:
+            home = record.get("transcript_root") or CODEX_HOME
+            hits = glob.glob(os.path.join(home, "sessions", day, f"*-{tid}.jsonl"))
+            if hits:
+                path = record["activity_path"] = hits[0]
+                break
+        else:
+            return 0.0
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _cli_activity(record: dict) -> float:
+    cli = record.get("cli")
+    if cli == "agy":
+        return _agy_activity(record)
+    if cli == "codex":
+        return _codex_activity(record)
+    return 0.0
 
 
 def _terminate(record: dict, verdict: str) -> None:
@@ -390,6 +581,7 @@ def _reconcile(run_id: str):
         if not _pid_exists(record.get("pid", 0)):
             record["state"] = "killed"
             record["ended_at"] = record.get("ended_at") or time.time()
+            _seal_git_guard(record)
             _write_record(record)
         return record
     if record.get("state") != "running":
@@ -411,6 +603,7 @@ def _reconcile(run_id: str):
             record["state"] = "finished"
             record["verdict"] = "exited"
             record["ended_at"] = time.time()
+            _seal_git_guard(record)
             _write_record(record)
             return record
         running = True
@@ -446,6 +639,7 @@ def _reconcile(run_id: str):
 
     # A live run is reconciled once a second; rewriting an unchanged record
     # that often would be pure filesystem churn.
+    _seal_git_guard(record)
     if json.dumps(record, sort_keys=True) != before:
         _write_record(record)
     return record
@@ -473,11 +667,27 @@ def _prune() -> None:
             continue
         if (record.get("ended_at") or record.get("started_at") or 0) > cutoff:
             continue
-        for path in _run_paths(run_id):
+        for path in _run_paths(run_id) + (_last_path(run_id), _brain_snapshot_path(run_id)):
             try:
                 os.unlink(path)
             except OSError:
                 pass
+    # Sidecars whose record never got written (a dispatch that failed after
+    # the snapshot) or was removed by an older version that did not know them.
+    try:
+        names = os.listdir(RUN_DIR)
+    except OSError:
+        return
+    for name in names:
+        base, ext = os.path.splitext(name)
+        if ext not in (".brain", ".last") or os.path.exists(os.path.join(RUN_DIR, base + ".json")):
+            continue
+        path = os.path.join(RUN_DIR, name)
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                os.unlink(path)
+        except OSError:
+            pass
 
 
 def _startup() -> None:
@@ -600,7 +810,8 @@ def _verdict_note(record: dict) -> str:
                 "That message is the whole diagnosis, including any reset time: decide "
                 "whether to wait or switch provider before re-dispatching.")
     if verdict == "idle":
-        return (f"{cli} produced no output for {record.get('idle_seconds')}s (of {elapsed}s "
+        return (f"{cli} showed no activity (output, {ARTIFACT_DIR}/ files or its own "
+                f"transcript) for {record.get('idle_seconds')}s (of {elapsed}s "
                 f"total) and its process group was killed as hung. This is NOT the "
                 f"wall-clock timeout: the run went silent rather than running long. If the "
                 f"task legitimately runs silent that long (a long test suite, a build), "
@@ -655,9 +866,24 @@ def _report(record: dict, tail_lines: int = 80) -> str:
     ]
     if state in ("running", "stopping"):
         silent = int(time.time() - _last_output(record))
-        head.append(f"  silent:  {silent}s since the last line on either stream")
+        head.append(f"  silent:  {silent}s since the last activity (output, "
+                    f"{ARTIFACT_DIR}/, or the CLI's transcript)")
+        idle = record.get("idle_seconds")
+        if state == "running" and idle and silent > idle / 2:
+            head.append(f"  STALL:   no activity for {silent}s (idle limit {idle}s). It is "
+                        f"killed at the limit unless it writes something first.")
 
     body = [_verdict_note(record)] if state != "running" else []
+    if state != "running" and record.get("cli") == "codex":
+        err = _codex_error(out_path)
+        if err:
+            body.append(f"codex reported an error:\n  {err}")
+        last = _tail(_last_path(record["run_id"]), tail_lines)
+        if last:
+            body.append(f"--- final message (codex -o) ---\n{last}")
+    guard = _git_guard_note(record) if state != "running" else ""
+    if guard:
+        body.insert(0, guard)
 
 
     out = _tail(out_path, tail_lines)
@@ -675,6 +901,75 @@ def _report(record: dict, tail_lines: int = 80) -> str:
                     "`git log` / `git diff --stat` and by re-running the gate yourself.")
 
     return "\n".join(head) + "\n\n" + "\n\n".join(p for p in body if p)
+
+def _codex_error(out_path: str) -> str:
+    """The last `error` or `turn.failed` event in the --json stream, if any.
+    This is where a quota wall or auth failure shows up: in --json mode codex
+    reports them as events on stdout, not as text on stderr."""
+    found = ""
+    for line in _tail(out_path, 200).splitlines():
+        if '"error"' not in line and '"turn.failed"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "error":
+            found = str(ev.get("message") or "")
+        elif ev.get("type") == "turn.failed":
+            err = ev.get("error")
+            found = str(err.get("message") if isinstance(err, dict) else err or "")
+    return found[:1000]
+
+
+def _git_fingerprint(git_dirs: list) -> dict:
+    """sha256 of each git dir's config and of every live hook, by path. A
+    delegate allowed to write the git dir (so it can commit) could also plant
+    a hook or a core.fsmonitor/hooksPath setting that runs, unsandboxed, the
+    next time anyone uses git there. This makes that visible after the run."""
+    import hashlib
+    out = {}
+    for d in git_dirs or []:
+        paths = [os.path.join(d, "config")]
+        try:
+            paths += [os.path.join(d, "hooks", n) for n in sorted(os.listdir(os.path.join(d, "hooks")))
+                      if not n.endswith(".sample")]
+        except OSError:
+            pass
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    out[path] = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                pass
+    return out
+
+
+def _seal_git_guard(record: dict) -> None:
+    """Fingerprint the git dirs once, when the run ends, so later git use by
+    the parent (a push setting upstream, a config change) is not blamed on
+    the delegate."""
+    if (record.get("git_guard") is not None and record.get("state") != "running"
+            and record.get("git_guard_after") is None):
+        record["git_guard_after"] = _git_fingerprint(record.get("git_dirs"))
+
+
+def _git_guard_note(record: dict) -> str:
+    before = record.get("git_guard")
+    if before is None:
+        return ""
+    after = record.get("git_guard_after")
+    if after is None:
+        after = _git_fingerprint(record.get("git_dirs"))
+    changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+    if not changed:
+        return ""
+    return ("WARNING: the delegate changed git configuration or hooks, which run "
+            "outside its sandbox the next time git is used there. Read them before "
+            "running any git command in that repo:\n  " + "\n  ".join(changed))
+
 
 def _plugin_version() -> str:
     """The version Claude Code installed, read from the plugin manifest beside
@@ -729,7 +1024,9 @@ def _instructions() -> str:
         "- `Connection closed` means this connection dropped, NOT that the delegate "
         "died - it keeps running. Reconnect and call list_runs; do not re-dispatch.\n"
         "- The return value is not evidence in either direction. Verify with git and by "
-        "re-running the gate yourself.",
+        "re-running the gate yourself.\n"
+        "- quota_status reports agy, Codex and opencode quota in one table; check it "
+        "before a long dispatch.",
     ])
 
 
@@ -802,6 +1099,8 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
                     "these share a quota pool. check_run one of the above, cancel_run it, "
                     "or pass force=True if you have a reason to overlap them.")
 
+    global _SERVER_IDENTITY
+    _SERVER_IDENTITY = _SERVER_IDENTITY or _proc_identity(os.getpid())
     run_id = _new_run_id()
     _rec_path, out_path, err_path = _run_paths(run_id)
     try:
@@ -868,6 +1167,10 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "state": "running",
         "verdict": None,
         "server_pid": os.getpid(),
+        "server_identity": _SERVER_IDENTITY,
+        # Where this run's CLI keeps its transcripts, as THIS server saw it, so
+        # a sibling server with a different environment looks in the same place.
+        "transcript_root": {"agy": AGY_BRAIN_DIR, "codex": CODEX_HOME}.get(CLI_LABEL),
     }
     _live[run_id] = proc
     _write_record(record)
@@ -1130,6 +1433,7 @@ def cancel_run(run_id: str) -> str:
     if record.get("state") != "running":
         return "Already ended - nothing to cancel.\n\n" + _report(record, tail_lines=20)
     _terminate(record, "cancelled")
+    _seal_git_guard(record)
     _write_record(record)
     _live.pop(run_id, None)
     return _report(record, tail_lines=40)
@@ -1183,6 +1487,33 @@ def list_runs(cwd: str = "", include_finished: bool = True, limit: int = 20) -> 
     header = (f"{len(trimmed)} of {len(rows)} run(s), {live} still live "
               f"(* marks live). Store: {RUN_DIR}")
     return header + "\n" + "\n".join(lines)
+
+# ---------------------------------------------------------------------------
+# quota_status, shared by every wrapper through quota_sources.py beside this
+# file. A copy of this server without that module still runs; only this tool
+# degrades, to a sentence saying why.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+try:
+    import quota_sources as _quota
+    _QUOTA_MISSING = ""
+except ImportError as _exc:
+    _quota = None
+    _QUOTA_MISSING = str(_exc)
+
+
+def quota_status(format: str = "table") -> str:
+    _touch()
+    if _quota is None:
+        return (f"unavailable: quota_sources.py could not be imported from {_HERE} "
+                f"({_QUOTA_MISSING}). It ships beside the server files in the plugin.")
+    return _quota.report(format)
+
+
+quota_status.__doc__ = (_quota.QUOTA_DOC if _quota else
+                        "Headless quota table for agy, Codex and opencode (module missing).")
+mcp.tool()(quota_status)
 
 if __name__ == "__main__":
     # Off-thread so a slow or large store cannot delay the client's connect.

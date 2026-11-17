@@ -3,7 +3,8 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Exercises the run store in the agy and opencode servers against fake CLIs.
+"""Exercises the run store in the agy, opencode and codex servers against fake
+CLIs.
 
 The gemini-web server had a third copy until 1.7.0 removed dispatch_gemini;
 1.9.0 removed the server.
@@ -94,6 +95,7 @@ class RunStoreTests(unittest.TestCase):
     # patterns are not: a browser wrapper has no reason to watch for a provider
     # quota string, so the subclass names one of its own.
     FATAL_PHRASE = "usage limit reached"
+    DEFAULT_IDLE = 900
     counter = 0
 
     def setUp(self):
@@ -119,6 +121,9 @@ class RunStoreTests(unittest.TestCase):
             "AGENT_MCP_RUN_DIR": self.run_dir,
             self.BIN_VAR: _fake_cli(self.tmp, script_body),
             "AGENT_MCP_DEFAULT_CWD": self.project,
+            # Never latch onto a real CLI transcript on this machine.
+            "AGY_BRAIN_DIR": os.path.join(self.tmp, "brain"),
+            "CODEX_HOME": os.path.join(self.tmp, "codex-home"),
         }
         env.update(extra)
         return _load(self.SERVER, f"srv_{RunStoreTests.counter}", env)
@@ -261,6 +266,97 @@ class RunStoreTests(unittest.TestCase):
         record = mod._read_record(run_id)
         self.assertEqual((record["timeout_seconds"], record["idle_seconds"]), (60, 5))
         mod.cancel_run(run_id)
+
+    def test_idle_default_is_on(self):
+        mod = self.server()
+        self.assertEqual(mod.IDLE_SECONDS, self.DEFAULT_IDLE)
+
+    def test_silent_run_warns_at_half_the_limit_then_is_killed(self):
+        """The case that motivated idle-by-default: a delegate stuck on a hung
+        command. A parent following with check_run hears about it at half the
+        limit, and the run dies at the limit instead of at the wall clock."""
+        mod = self.server("echo started; sleep 120\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=20))
+        self.assertNotIn("STALL", mod.check_run(run_id))
+        self.assertTrue(self.wait_until(
+            lambda: "STALL:   no activity for" in mod.check_run(run_id), timeout=16))
+        report = mod.check_run(run_id)
+        self.assertIn("(idle limit 20s)", report)
+        self.assertIn("[running]", report)
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] not in ("running", "stopping"),
+            timeout=25))
+        record = mod._read_record(run_id)
+        self.assertEqual(record["verdict"], "idle")
+        self.assertLess(record["ended_at"] - record["started_at"], 35)
+
+    def test_writes_under_agent_runs_count_as_activity(self):
+        mod = self.server(
+            "mkdir -p .agent-runs; i=0\n"
+            "while [ $i -lt 8 ]; do echo $i >> .agent-runs/progress.log; sleep 1; i=$((i+1)); done\n")
+        # 6s against 1s writes: margin for a loaded machine, where one tick of
+        # the loop has been seen to take over 4s.
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "exited")
+
+    def test_old_agent_runs_files_do_not_age_a_new_run(self):
+        os.makedirs(os.path.join(self.project, ".agent-runs"))
+        old = os.path.join(self.project, ".agent-runs", "old.md")
+        open(old, "w").close()
+        os.utime(old, (time.time() - 86400, time.time() - 86400))
+        mod = self.server("sleep 30\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=10))
+        record = mod._read_record(run_id)
+        self.assertGreaterEqual(mod._last_output(record), record["started_at"])
+        self.assertEqual(mod._reconcile(run_id)["state"], "running")
+        mod.cancel_run(run_id)
+
+    def test_agy_transcript_counts_as_activity(self):
+        if self.SERVER != "agy_mcp_server.py":
+            self.skipTest("agy only")
+        old = os.path.join(self.tmp, "brain", "older-conv", ".system_generated", "logs")
+        os.makedirs(old)
+        logs = os.path.join(self.tmp, "brain", "conv-1", ".system_generated", "logs")
+        mod = self.server(
+            f"mkdir -p '{logs}'; i=0\n"
+            f"while [ $i -lt 8 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "exited")
+
+    def test_agy_ignores_conversations_older_than_the_run(self):
+        if self.SERVER != "agy_mcp_server.py":
+            self.skipTest("agy only")
+        logs = os.path.join(self.tmp, "brain", "older-conv", ".system_generated", "logs")
+        os.makedirs(logs)
+        mod = self.server(
+            f"i=0\nwhile [ $i -lt 30 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=3))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] not in ("running", "stopping"), timeout=20))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "idle")
+
+    def test_a_sibling_server_judges_a_run_by_its_own_cli(self):
+        """Every server reconciles every run. A healthy agy run whose only
+        heartbeat is its transcript must survive a codex or opencode server
+        looking at it."""
+        if self.SERVER != "agy_mcp_server.py":
+            self.skipTest("agy only")
+        logs = os.path.join(self.tmp, "brain", "conv-1", ".system_generated", "logs")
+        mod = self.server(
+            f"mkdir -p '{logs}'; i=0\n"
+            f"while [ $i -lt 8 ]; do echo x >> '{logs}/transcript_full.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
+        mod._live.pop(run_id, None)             # only the sibling is watching now
+        sibling = _load("opencode_mcp_server.py", "srv_sib_oc",
+                        {"AGENT_MCP_RUN_DIR": self.run_dir,
+                         "AGY_BRAIN_DIR": os.path.join(self.tmp, "brain")})
+        self.assertTrue(self.wait_until(
+            lambda: sibling._reconcile(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(sibling._read_record(run_id)["verdict"], "exited")
 
     def test_per_run_idle_limit_is_enforced(self):
         mod = self.server("echo tick; sleep 300\n", **{self.IDLE_VAR: "0"})
@@ -449,6 +545,7 @@ class OpenCodeRunStoreTests(RunStoreTests):
     BIN_VAR = "OPENCODE_BIN"
     TIMEOUT_VAR = "OPENCODE_MCP_TIMEOUT"
     IDLE_VAR = "OPENCODE_MCP_IDLE_TIMEOUT"
+    DEFAULT_IDLE = 600
 
     def test_argv_targets_opencode_2(self):
         # 2.x rejects --dir outright, and without --standalone the session runs
@@ -485,6 +582,221 @@ class OpenCodeRunStoreTests(RunStoreTests):
             mod.subprocess.Popen = real
         self.assertEqual(seen["env"]["PWD"], self.project)
         self.assertEqual(seen["cwd"], self.project)
+
+
+class CodexRunStoreTests(RunStoreTests):
+    SERVER = "codex_mcp_server.py"
+    BIN_VAR = "CODEX_BIN"
+    TIMEOUT_VAR = "CODEX_MCP_TIMEOUT"
+    IDLE_VAR = "CODEX_MCP_IDLE_TIMEOUT"
+
+    def setUp(self):
+        super().setUp()
+        # codex exec runs only inside a git repo, and the wrapper checks first.
+        subprocess.run(["git", "init", "-q", self.project], check=True)
+
+    # Writes the -o file the way codex does, so the report can be checked.
+    WRITE_LAST = (
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "--output-last-message" ]; then printf "final answer here" > "$2"; fi\n'
+        '  shift\n'
+        'done\n')
+
+    def test_argv_is_unattended_and_sandboxed_to_the_repo(self):
+        mod = self.server('echo "argv: $*"\n')
+        out = self.dispatch(mod, prompt="--help", wait_seconds=10)
+        gitdir = os.path.realpath(os.path.join(self.project, ".git"))
+        self.assertIn("argv: exec --json --sandbox workspace-write -c "
+                      "approval_policy=\"never\" --cd " + self.project, out)
+        self.assertIn(f"--add-dir {gitdir}", out)
+        self.assertIn("--color never --output-last-message ", out)
+        self.assertIn(".last -- --help", out)
+        self.assertNotIn("--model", out)
+        self.assertNotIn("--ephemeral", out)
+
+    def test_model_is_passed_when_named(self):
+        mod = self.server('echo "argv: $*"\n')
+        out = self.dispatch(mod, model="gpt-x", wait_seconds=10)
+        self.assertIn("--model gpt-x -- do the thing", out)
+
+    def test_cwd_outside_a_git_repo_is_refused(self):
+        mod = self.server()
+        bare = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(bare)
+        out = mod.dispatch_codex("x", cwd=bare)
+        self.assertIn("not inside a git repository", out)
+        self.assertEqual(mod._record_ids(), [])
+
+    def test_final_message_is_reported(self):
+        mod = self.server(self.WRITE_LAST)
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("--- final message (codex -o) ---\nfinal answer here", out)
+
+    def test_error_event_on_stdout_is_quoted(self):
+        mod = self.server(
+            """echo '{"type":"turn.started"}'\n"""
+            """echo '{"type":"error","message":"You have hit your usage limit. Try again later."}'\n"""
+            """echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'\n"""
+            "exit 1\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("codex reported an error:\n  You have hit your usage limit", out)
+
+    def test_session_file_counts_as_activity(self):
+        tid = "0000aaaa-bbbb-cccc-dddd-eeeeffff0000"
+        day = os.path.join(self.tmp, "codex-home", "sessions", *time.strftime("%Y/%m/%d").split("/"))
+        mod = self.server(
+            f"""echo '{{"type":"thread.started","thread_id":"{tid}"}}'\n"""
+            f"mkdir -p '{day}'; i=0\n"
+            f"while [ $i -lt 8 ]; do echo x >> '{day}/rollout-2026-01-01T00-00-00-{tid}.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running", timeout=20))
+        record = mod._read_record(run_id)
+        self.assertEqual(record["verdict"], "exited")
+        self.assertTrue(record["activity_path"].endswith(f"-{tid}.jsonl"))
+
+    def test_planted_git_hook_is_flagged(self):
+        mod = self.server("echo 'echo pwned' > .git/hooks/post-commit\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("WARNING: the delegate changed git configuration or hooks", out)
+        self.assertIn("post-commit", out)
+
+    def test_parent_git_changes_after_the_run_are_not_blamed(self):
+        mod = self.server("true\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running"))
+        subprocess.run(["git", "-C", self.project, "config", "user.name", "someone"], check=True)
+        self.assertNotIn("WARNING", mod.check_run(run_id))
+
+    def test_clean_run_has_no_git_warning(self):
+        mod = self.server("true\n")
+        self.assertNotIn("WARNING", self.dispatch(mod, wait_seconds=10))
+
+    def test_sibling_server_reports_and_prunes_codex_extras(self):
+        mod = self.server(self.WRITE_LAST)
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running"))
+        sibling = _load("agy_mcp_server.py", "srv_sibling",
+                        {"AGENT_MCP_RUN_DIR": self.run_dir, "AGENT_MCP_RUN_RETENTION_DAYS": "1"})
+        self.assertIn("final answer here", sibling.check_run(run_id))
+        record = sibling._read_record(run_id)
+        record["ended_at"] = time.time() - 3 * 86400
+        sibling._write_record(record)
+        sibling._prune()
+        self.assertFalse(os.path.exists(mod._last_path(run_id)))
+
+    def test_codex_run_judged_by_a_sibling_keeps_its_heartbeat_and_patterns(self):
+        tid = "1111aaaa-bbbb-cccc-dddd-eeeeffff1111"
+        day = os.path.join(self.tmp, "codex-home", "sessions", *time.strftime("%Y/%m/%d").split("/"))
+        mod = self.server(
+            f"""echo '{{"type":"thread.started","thread_id":"{tid}"}}'\n"""
+            f"mkdir -p '{day}'; i=0\n"
+            f"while [ $i -lt 8 ]; do echo x >> '{day}/rollout-x-{tid}.jsonl'; sleep 1; i=$((i+1)); done\n")
+        run_id = self.run_id_from(self.dispatch(mod, idle_seconds=6))
+        mod._live.pop(run_id, None)
+        sibling = _load("agy_mcp_server.py", "srv_sib_agy", {"AGENT_MCP_RUN_DIR": self.run_dir})
+        self.assertTrue(self.wait_until(
+            lambda: sibling._reconcile(run_id)["state"] != "running", timeout=20))
+        self.assertEqual(sibling._read_record(run_id)["verdict"], "exited")
+        self.assertIn("hit your usage limit", sibling._fatal_patterns({"cli": "codex"}))
+
+    def test_sibling_fails_a_dead_owners_codex_run_fast(self):
+        # The line comes after the owner has stopped watching, so only the
+        # sibling can be the one that catches it.
+        mod = self.server("sleep 3; echo \"You've hit your usage limit.\" >&2; sleep 60\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        mod._live.pop(run_id, None)
+        time.sleep(1.2)
+        record = mod._read_record(run_id)
+        self.assertIsNone(record["fatal_line"])
+        record["server_pid"] = 0                # the dispatching server is gone
+        mod._write_record(record)
+        sibling = _load("agy_mcp_server.py", "srv_sib_fatal", {"AGENT_MCP_RUN_DIR": self.run_dir})
+        self.assertTrue(self.wait_until(
+            lambda: sibling._reconcile(run_id)["state"] not in ("running", "stopping"),
+            timeout=20))
+        self.assertEqual(sibling._read_record(run_id)["verdict"], "fatal")
+
+    def test_sibling_leaves_scanning_to_a_live_owner(self):
+        mod = self.server("sleep 3; echo \"You've hit your usage limit.\" >&2; sleep 60\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        mod._live.pop(run_id, None)
+        time.sleep(1.2)
+        owner = subprocess.Popen(["sleep", "60"])    # stands in for a live owner server
+        try:
+            record = mod._read_record(run_id)
+            record.update(server_pid=owner.pid, server_identity=mod._proc_identity(owner.pid),
+                          fatal_line=None, scan_offset=0)
+            mod._write_record(record)
+            sibling = _load("agy_mcp_server.py", "srv_sib_live", {"AGENT_MCP_RUN_DIR": self.run_dir})
+            time.sleep(3)                       # the fatal line is on stderr by now
+            after = sibling._reconcile(run_id)
+            self.assertEqual(after["state"], "running")
+            self.assertEqual(after["scan_offset"], 0)
+            self.assertIsNone(after["fatal_line"])
+            # A recycled pid (identity mismatch) is not a live owner.
+            record = sibling._read_record(run_id)
+            record["server_identity"] = "not the same process"
+            sibling._write_record(record)
+            self.assertFalse(sibling._owner_alive(record))
+        finally:
+            owner.kill()
+            owner.wait()
+            mod.cancel_run(run_id)
+
+    def test_prune_removes_orphan_sidecars(self):
+        mod = self.server(AGENT_MCP_RUN_RETENTION_DAYS="1")
+        os.makedirs(self.run_dir, exist_ok=True)
+        orphan = os.path.join(self.run_dir, "20200101-000000-dead.brain")
+        open(orphan, "w").close()
+        os.utime(orphan, (time.time() - 3 * 86400,) * 2)
+        mod._prune()
+        self.assertFalse(os.path.exists(orphan))
+
+    def test_prune_removes_the_last_message_file(self):
+        mod = self.server(self.WRITE_LAST, AGENT_MCP_RUN_RETENTION_DAYS="1")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running"))
+        last = mod._last_path(run_id)
+        self.assertTrue(os.path.exists(last))
+        record = mod._read_record(run_id)
+        record["ended_at"] = time.time() - 3 * 86400
+        mod._write_record(record)
+        mod._prune()
+        self.assertFalse(os.path.exists(last))
+        self.assertIsNone(mod._read_record(run_id))
+
+
+class CrossServerTests(unittest.TestCase):
+    """The per-CLI copies that let any server judge any run must agree."""
+
+    def test_builtin_pattern_tables_agree_with_each_server(self):
+        _stub_mcp()
+        clean = {k: "" for k in ("AGY_MCP_FATAL_PATTERNS", "OPENCODE_MCP_FATAL_PATTERNS",
+                                 "CODEX_MCP_FATAL_PATTERNS")}
+        mods = [_load(n, f"srv_pat_{i}", clean) for i, n in enumerate(
+            ("agy_mcp_server.py", "opencode_mcp_server.py", "codex_mcp_server.py"))]
+        for m in mods:
+            self.assertEqual(m._BUILTIN_FATAL, mods[0]._BUILTIN_FATAL, m.SERVER_NAME)
+            self.assertEqual(set(m.FATAL_PATTERNS), set(m._BUILTIN_FATAL[m.CLI_LABEL]),
+                             m.SERVER_NAME)
+
+
+class QuotaToolTests(unittest.TestCase):
+    """Every wrapper exposes quota_status from the shared module."""
+
+    def test_each_server_exposes_quota_status(self):
+        _stub_mcp()
+        for i, name in enumerate(("agy_mcp_server.py", "opencode_mcp_server.py",
+                                  "codex_mcp_server.py")):
+            mod = _load(name, f"srv_quota_{i}", {})
+            self.assertIsNotNone(mod._quota, name)
+            self.assertIn("quota", (mod.quota_status.__doc__ or "").lower())
+            mod._quota = None
+            self.assertTrue(mod.quota_status().startswith("unavailable:"))
 
 
 if __name__ == "__main__":
