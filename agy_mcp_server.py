@@ -82,12 +82,13 @@ PRINT_TIMEOUT = _env("AGY_MCP_PRINT_TIMEOUT", "60m")
 # Outer cap. Keep it above PRINT_TIMEOUT so agy's own limit is the one that hits.
 TIMEOUT_SECONDS = _int_env("AGY_MCP_TIMEOUT", 3900)
 
-# Off by default, unlike the opencode server. Two reasons: PRINT_TIMEOUT above
-# is a real inner limit that agy honours, so a hung run here already fails on
-# its own; and agy has no verified per-step heartbeat on either stream, so a
-# healthy run that thinks quietly for long enough would be killed for it. Set a
-# value in seconds if you have watched a dispatch and know it streams steadily.
-IDLE_SECONDS = _int_env("AGY_MCP_IDLE_TIMEOUT", 0, allow_zero=True)
+# On by default since 1.12.0. agy's stdout is empty until the end, so the
+# heartbeat is its per-conversation transcript, which it rewrites every step
+# (see _cli_activity), plus anything under .agent-runs/. Without this a run
+# stuck on a hung command sat until PRINT_TIMEOUT (an hour) with nobody told.
+# A step that runs one command longer than this is killed: brief long commands
+# to log into .agent-runs/, or pass idle_seconds. 0 disables.
+IDLE_SECONDS = _int_env("AGY_MCP_IDLE_TIMEOUT", 900, allow_zero=True)
 
 # Caps what a tool RETURNS, not what the delegate writes: output goes straight
 # to a file on disk, so nothing is lost by keeping the response small.
@@ -177,6 +178,12 @@ _live: dict = {}
 def _run_paths(run_id: str) -> tuple:
     base = os.path.join(RUN_DIR, run_id)
     return base + ".json", base + ".out", base + ".err"
+
+
+def _last_path(run_id: str) -> str:
+    """Where `codex exec -o` writes the agent's final message for a codex run.
+    Every server knows the name so any of them can report and prune it."""
+    return os.path.join(RUN_DIR, run_id) + ".last"
 
 
 def _new_run_id() -> str:
@@ -301,21 +308,88 @@ def _scan_fatal(record: dict) -> None:
                 return
 
 
+def _newest_mtime(root: str) -> float:
+    """Newest file mtime anywhere under root, 0 when there is none."""
+    newest = 0.0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                newest = max(newest, os.stat(os.path.join(dirpath, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
 def _last_output(record: dict) -> float:
-    """When the delegate last wrote anything, on either stream.
+    """When the delegate last showed any sign of life.
+
+    The newest mtime among: its stdout and stderr, any file under the target
+    project's .agent-runs/ (where it is briefed to write its deliverable and
+    progress log), and the CLI's own per-run transcript (_cli_activity). Only
+    mtimes are read, never content.
 
     Taken from file mtimes rather than a timer in this process, which is what
     lets the idle rule survive a restart: the evidence is on disk, so a server
     that never saw the earlier output can still tell a thinking run from a hung
-    one.
+    one. Never earlier than the start, so an old file cannot age a new run.
     """
-    newest = 0.0
+    newest = record.get("started_at", 0.0)
     for key in ("stdout_path", "stderr_path"):
         try:
             newest = max(newest, os.stat(record[key]).st_mtime)
         except (OSError, KeyError):
             pass
-    return newest or record.get("started_at", 0.0)
+    if record.get("cwd"):
+        newest = max(newest, _newest_mtime(os.path.join(record["cwd"], ARTIFACT_DIR)))
+    return max(newest, _cli_activity(record))
+
+
+# agy keeps a per-conversation transcript at
+# <brain>/<conversation id>/.system_generated/logs/transcript_full.jsonl and
+# rewrites it on every step (checked on agy 1.5.9: its mtime moved at each step
+# of a five-step run, and stood still only while one shell command ran). Its
+# stdout, by contrast, is empty until the end. So the transcript is this
+# wrapper's heartbeat for agy. Which conversation is ours is not known up
+# front: the run latches the one transcript written since it started, in a
+# directory created since it started where the filesystem records creation
+# time. Two candidates at once (another agy session started alongside) means
+# no latch, and the run falls back to its other signals.
+AGY_BRAIN_DIR = os.path.expanduser(_env("AGY_BRAIN_DIR", "~/.gemini/antigravity-cli/brain"))
+
+
+def _find_transcript(started: float) -> str:
+    try:
+        names = os.listdir(AGY_BRAIN_DIR)
+    except OSError:
+        return ""
+    found = []
+    for name in names:
+        top = os.path.join(AGY_BRAIN_DIR, name)
+        path = os.path.join(top, ".system_generated", "logs", "transcript_full.jsonl")
+        try:
+            if os.stat(path).st_mtime < started:
+                continue
+            born = getattr(os.stat(top), "st_birthtime", None)
+        except OSError:
+            continue
+        if born is not None and born < started - 2:
+            continue                    # an older conversation, still being written
+        found.append(path)
+    return found[0] if len(found) == 1 else ""
+
+
+def _cli_activity(record: dict) -> float:
+    """mtime of this run's agy transcript, 0 until one is identified."""
+    path = record.get("activity_path")
+    if not path:
+        path = _find_transcript(record.get("started_at", 0.0))
+        if not path:
+            return 0.0
+        record["activity_path"] = path
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
 
 
 def _terminate(record: dict, verdict: str) -> None:
@@ -468,7 +542,7 @@ def _prune() -> None:
             continue
         if (record.get("ended_at") or record.get("started_at") or 0) > cutoff:
             continue
-        for path in _run_paths(run_id):
+        for path in _run_paths(run_id) + (_last_path(run_id),):
             try:
                 os.unlink(path)
             except OSError:
@@ -595,7 +669,8 @@ def _verdict_note(record: dict) -> str:
                 "That message is the whole diagnosis, including any reset time: decide "
                 "whether to wait or switch provider before re-dispatching.")
     if verdict == "idle":
-        return (f"{cli} produced no output for {record.get('idle_seconds')}s (of {elapsed}s "
+        return (f"{cli} showed no activity (output, {ARTIFACT_DIR}/ files or its own "
+                f"transcript) for {record.get('idle_seconds')}s (of {elapsed}s "
                 f"total) and its process group was killed as hung. This is NOT the "
                 f"wall-clock timeout: the run went silent rather than running long. If the "
                 f"task legitimately runs silent that long (a long test suite, a build), "
@@ -643,9 +718,24 @@ def _report(record: dict, tail_lines: int = 80) -> str:
     ]
     if state in ("running", "stopping"):
         silent = int(time.time() - _last_output(record))
-        head.append(f"  silent:  {silent}s since the last line on either stream")
+        head.append(f"  silent:  {silent}s since the last activity (output, "
+                    f"{ARTIFACT_DIR}/, or the CLI's transcript)")
+        idle = record.get("idle_seconds")
+        if state == "running" and idle and silent > idle / 2:
+            head.append(f"  STALL:   no activity for {silent}s (idle limit {idle}s). It is "
+                        f"killed at the limit unless it writes something first.")
 
     body = [_verdict_note(record)] if state != "running" else []
+    if state != "running" and record.get("cli") == "codex":
+        err = _codex_error(out_path)
+        if err:
+            body.append(f"codex reported an error:\n  {err}")
+        last = _tail(_last_path(record["run_id"]), tail_lines)
+        if last:
+            body.append(f"--- final message (codex -o) ---\n{last}")
+    guard = _git_guard_note(record) if state != "running" else ""
+    if guard:
+        body.insert(0, guard)
 
 
     out = _tail(out_path, tail_lines)
@@ -663,6 +753,64 @@ def _report(record: dict, tail_lines: int = 80) -> str:
                     "`git log` / `git diff --stat` and by re-running the gate yourself.")
 
     return "\n".join(head) + "\n\n" + "\n\n".join(p for p in body if p)
+
+def _codex_error(out_path: str) -> str:
+    """The last `error` or `turn.failed` event in the --json stream, if any.
+    This is where a quota wall or auth failure shows up: in --json mode codex
+    reports them as events on stdout, not as text on stderr."""
+    found = ""
+    for line in _tail(out_path, 200).splitlines():
+        if '"error"' not in line and '"turn.failed"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "error":
+            found = str(ev.get("message") or "")
+        elif ev.get("type") == "turn.failed":
+            err = ev.get("error")
+            found = str(err.get("message") if isinstance(err, dict) else err or "")
+    return found[:1000]
+
+
+def _git_fingerprint(git_dirs: list) -> dict:
+    """sha256 of each git dir's config and of every live hook, by path. A
+    delegate allowed to write the git dir (so it can commit) could also plant
+    a hook or a core.fsmonitor/hooksPath setting that runs, unsandboxed, the
+    next time anyone uses git there. This makes that visible after the run."""
+    import hashlib
+    out = {}
+    for d in git_dirs or []:
+        paths = [os.path.join(d, "config")]
+        try:
+            paths += [os.path.join(d, "hooks", n) for n in sorted(os.listdir(os.path.join(d, "hooks")))
+                      if not n.endswith(".sample")]
+        except OSError:
+            pass
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    out[path] = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                pass
+    return out
+
+
+def _git_guard_note(record: dict) -> str:
+    before = record.get("git_guard")
+    if before is None:
+        return ""
+    after = _git_fingerprint(record.get("git_dirs"))
+    changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+    if not changed:
+        return ""
+    return ("WARNING: the delegate changed git configuration or hooks, which run "
+            "outside its sandbox the next time git is used there. Read them before "
+            "running any git command in that repo:\n  " + "\n  ".join(changed))
+
 
 def _plugin_version() -> str:
     """The version Claude Code installed, read from the plugin manifest beside

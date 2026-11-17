@@ -175,6 +175,13 @@ class CodexTests(unittest.TestCase):
         table = q.render_table({"generated_at": q._iso(NOW), "sources": [src]})
         self.assertIn("reset since snapshot (was 20% used)", table)
 
+    def test_bad_newest_snapshot_falls_back_to_an_older_file(self):
+        self.write("a.jsonl", [RATE_LIMITS], NOW - 7200)
+        self.write("b.jsonl", [{"primary": None, "secondary": None}], NOW - 60)
+        src = q.collect_codex(NOW, home=self.home)
+        self.assertEqual(src["status"], "ok")
+        self.assertEqual(src["as_of"], q._iso(NOW - 7200))
+
     def test_no_sessions_dir_is_unavailable(self):
         src = q.collect_codex(NOW, home=os.path.join(self.home, "nope"))
         self.assertEqual(src["status"], "unavailable")

@@ -309,7 +309,7 @@ environment Claude Code itself inherits. All are optional.
 | `AGENT_MCP_DEFAULT_CWD` | all | the session's working directory | Pin every dispatch to one project regardless of where Claude was started. The `cwd` tool argument always wins. |
 | `AGY_BIN` | agy | `agy` on PATH | PATH is not reliably inherited by an MCP subprocess. |
 | `OPENCODE_BIN` | opencode | `opencode` on PATH | Same, and more urgent: `opencode` usually lives under an nvm node dir whose path carries the node version, so it moves on every node upgrade. Point this at a stable symlink such as `/usr/local/bin/opencode`. |
-| `CODEX_BIN` | codex, `quota_status` | `codex` on PATH, else the ChatGPT.app copy on macOS | Same PATH problem. |
+| `CODEX_BIN` | codex | `codex` on PATH, else the ChatGPT.app copy on macOS | Same PATH problem. |
 | `AGY_MCP_MODEL` | agy | `gemini-3.8-flash-high` | Model ids go stale. Check `agy models`. |
 | `OPENCODE_MCP_MODEL` | opencode | `opencode-go/glm-5.2` | Check `opencode models`. |
 | `CODEX_MCP_MODEL` | codex | empty: the default in `~/.codex/config.toml` | Pin one model for every dispatch; the `model` argument wins. |
@@ -319,13 +319,14 @@ environment Claude Code itself inherits. All are optional.
 | `AGY_MCP_TIMEOUT` | agy | `3900` | Outer subprocess cap, in seconds. Keep it above `AGY_MCP_PRINT_TIMEOUT` so agy's own limit is the one that hits. |
 | `OPENCODE_MCP_TIMEOUT` | opencode | `3600` | Outer subprocess cap, in seconds. |
 | `CODEX_MCP_TIMEOUT` | codex | `3600` | Outer subprocess cap, in seconds. `codex exec` has no run timeout of its own. |
-| `CODEX_MCP_IDLE_TIMEOUT` | codex | `0` (off) | Same knob as opencode's. Off because `--json` prints one event per item and nothing while the model reasons or a single command runs. |
+| `CODEX_MCP_IDLE_TIMEOUT` | codex | `900` | Same knob. `--json` prints nothing while the model reasons or one command runs; the run's own session file fills those gaps (see [Liveness](#liveness-and-the-idle-limit)). |
 | `OPENCODE_MCP_IDLE_TIMEOUT` | opencode | `600` | Kill a run that produces no output on either stream for this long, in seconds; `0` disables. Distinct from the wall clock, and reported distinctly: a wall clock cannot tell "thinking hard" from "dead". Safe as a default here only because `--print-logs` gives a per-step heartbeat. Raise it if a task legitimately runs silent for longer. |
-| `AGY_MCP_IDLE_TIMEOUT` | agy | `0` (off) | Same knob, off by default: `--print-timeout` is already a working inner limit for agy, and no per-step heartbeat has been verified on either of its streams, so a quiet-but-healthy run would be killed for nothing. Set it only if you have watched a dispatch and know it streams. |
+| `AGY_MCP_IDLE_TIMEOUT` | agy | `900` | Kill a run with no sign of life for this long; `0` disables. On since 1.12.0: agy's stdout is empty until the end, but its per-conversation transcript moves on every step, so that is the heartbeat (see [Liveness](#liveness-and-the-idle-limit)). A single command quieter than this is killed: raise it per dispatch with `idle_seconds` when you know one will be. |
+| `AGY_BRAIN_DIR` | agy | `~/.gemini/antigravity-cli/brain` | Where agy keeps per-conversation transcripts, read for their mtime only. |
 | `OPENCODE_MCP_FATAL_PATTERNS` | opencode | — | Extra comma-separated strings that mark a provider-side failure, matched case-insensitively against **stderr only**. Added to the built-in list, which is deliberately narrow. |
 | `AGY_MCP_FATAL_PATTERNS` | agy | — | Same, for agy. |
 | `CODEX_MCP_FATAL_PATTERNS` | codex | — | Same, for codex. |
-| `CODEX_HOME` | `quota_status` | `~/.codex` | Where Codex keeps its session files. |
+| `CODEX_HOME` | codex, `quota_status` | `~/.codex` | Where Codex keeps its session files: the run's liveness signal, and the rate-limit snapshot. |
 | `XDG_DATA_HOME` | `quota_status` | `~/.local/share` | Parent of `opencode/log/opencode.log`. |
 | `AGENT_MCP_MAX_OUTPUT` | all | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
 | `AGENT_MCP_RUN_DIR` | all | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. All three share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
@@ -361,7 +362,7 @@ Every one cost a debugging session.
 | `--agent build` | Mandatory whenever `~/.config/opencode/opencode.json` sets `"default_agent": "plan"`, which is read-only. Without the override the tool returns a plan, edits nothing, and looks like it worked. |
 | `--print-logs` | What makes opencode's failures *visible*. Its stream errors — including the provider quota wall — go to `~/.local/share/opencode/log/opencode.log` and **never to stdout**. 1.x then did not exit: it sat at 0% CPU until something else killed it, so without this flag the wrapper blocked for the full hour on a failure the CLI knew about in twenty seconds. 2.x exits 1 within seconds (`Error: Go usage limit exceeded`), and the logged line is what tells you why. The per-step log lines double as the heartbeat that makes the idle timeout safe to enable. Server logs only reach stderr with `--standalone`. |
 | `--json` (codex) | `codex exec` writes the whole transcript, agent messages and command output included, to **stderr**, where the fail-fast patterns would match any discussion of quotas. With `--json` the transcript goes to stdout as one event per line and stderr carries only the CLI's own complaints. A quota wall or auth failure arrives as an `error` or `turn.failed` event, which `check_run` quotes. Verified on codex-cli 0.167.0-alpha.4.1. |
-| `--add-dir <git dir>` (codex) | `workspace-write` makes the repo's `.git` read-only, so the delegate edits files and then every `git add` fails on `.git/index.lock`. Verified both ways. In a linked worktree both the worktree git dir and the common dir are added. |
+| `--add-dir <git dir>` (codex) | `workspace-write` makes the repo's `.git` read-only, so the delegate edits files and then every `git add` fails on `.git/index.lock`. Verified both ways. In a linked worktree both the worktree git dir and the common dir are added. The cost: a writable git dir also lets the delegate plant a hook or a `core.fsmonitor` / `core.hooksPath` setting, which would run **outside** the sandbox the next time anyone uses git there. So the wrapper fingerprints each git dir's `config` and live hooks at dispatch, and `check_run` leads with a WARNING naming any that changed. Read them before running git in that repo. (agy and opencode run with no sandbox at all, so this is still the tighter of the three.) |
 | `--sandbox workspace-write` + `approval_policy="never"` (codex) | Codex's own unattended mode: the model's commands may write only inside `cwd`, its git dir and the temp dirs, with no network, and nothing waits for approval. So unlike the other two, a Codex delegate cannot `npm install`, fetch or push. `cwd` must be in a git repo; the tool refuses otherwise. No `--ephemeral`: session files carry the rate-limit snapshot `quota_status` reads, so each run refreshes it. |
 | `--auto` / `--dangerously-skip-permissions` | Nothing fails — this is what makes the run unattended, and it is the entire risk surface. See the warning at the top. |
 
@@ -378,6 +379,37 @@ that work on runs regardless of which CLI started them, and `quota_status`.
 | `list_runs()` | Every run on the machine, both CLIs, all sessions, reconciled and marked live or not. The answer to "did something get left behind?". |
 | `delegation_status()` | Version actually running, resolved CLI path, the deadlines a dispatch will use, and the run store's location and depth. |
 | `quota_status(format="table")` | One table of what agy, Codex and opencode report headlessly, read without spending a token. Identical in every server. See [Quota status](#quota-status). |
+
+### Liveness and the idle limit
+
+A run is idle when nothing shows it is alive. The evidence is the newest
+**mtime** (never content) among:
+
+- its stdout and stderr files,
+- any file under `.agent-runs/` in the dispatch `cwd`, which is where the
+  delegate is briefed to write its deliverable and progress log,
+- the CLI's own per-run transcript. For agy that is
+  `<AGY_BRAIN_DIR>/<conversation>/.system_generated/logs/transcript_full.jsonl`,
+  which it rewrites on every step (checked on agy 1.5.9). The run latches the
+  one transcript created since it started, and falls back to the other signals
+  if two appeared at once. For Codex it is the session file
+  `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread id>.jsonl`, matched
+  exactly by the thread id `--json` prints first. opencode has none: its log
+  file is shared by every opencode process, so it would keep a hung run looking
+  alive, and `--print-logs` already copies this run's lines onto its stderr.
+
+The idle limit is on by default: agy 900 s, Codex 900 s, opencode 600 s. Change
+it per dispatch with `idle_seconds` (`0` turns it off) or per server with the
+`*_IDLE_TIMEOUT` variables. It still kills a single command that runs silent for
+longer, such as a long test suite: brief the delegate to send that command's
+output to a log under `.agent-runs/`, which counts as activity, or raise
+`idle_seconds` for that run. Once a run has been quiet for half its limit,
+`check_run` adds `STALL: no activity for N s (idle limit M s)`, so a parent
+following the run hears about it before the kill.
+
+**Wait on a delegate with `check_run`, not `pgrep` or `ps`.** A process that
+exists is not a run making progress, and only `check_run` applies the deadlines
+and reports the stall.
 
 Records live under `AGENT_MCP_RUN_DIR` (`~/.agent-delegation-mcp/runs` by
 default) as `<run-id>.json` with the captured streams beside them as
@@ -911,6 +943,14 @@ after updating to get it.
 opencode usage, read without spending a token; `format="json"` for scripts. See
 [Quota status](#quota-status). The old note that agy's `/usage` does not work
 headless was wrong and is gone.
+
+**Silent runs fail fast.** The idle limit is now on for every wrapper (agy and
+Codex 900 s, opencode 600 s), measured against the run's output, its
+`.agent-runs/` files and the CLI's own per-run transcript, and `check_run`
+warns at half the limit. Before this, an agy run stuck on a hung command sat
+for the full hour of `--print-timeout`. If you rely on a delegate running one
+quiet command for longer than that, pass `idle_seconds`. See
+[Liveness](#liveness-and-the-idle-limit).
 
 ### 1.11.0 (2026-11-13)
 

@@ -20,6 +20,7 @@ only quota_status uses and whose absence degrades that one tool. Every knob is
 an environment variable; the full list is in the README.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -85,11 +86,12 @@ SANDBOX = _env("CODEX_MCP_SANDBOX", "workspace-write")
 
 TIMEOUT_SECONDS = _int_env("CODEX_MCP_TIMEOUT", 3600)
 
-# Off by default, like agy. `codex exec` has no run timeout of its own, but with
-# --json it prints one event per item (message, command, file change) and
-# nothing while the model reasons or one command runs, so a healthy run can go
-# quiet for many minutes. Set a value in seconds once you have watched a run.
-IDLE_SECONDS = _int_env("CODEX_MCP_IDLE_TIMEOUT", 0, allow_zero=True)
+# --json prints one event per item and nothing while the model reasons or one
+# command runs, so stdout alone is a poor heartbeat. The run's own session file
+# (see _cli_activity) and .agent-runs/ fill the gaps. A single command quieter
+# than this is killed: brief long commands to log into .agent-runs/, or pass
+# idle_seconds. 0 disables.
+IDLE_SECONDS = _int_env("CODEX_MCP_IDLE_TIMEOUT", 900, allow_zero=True)
 
 # Caps what a tool RETURNS, not what the delegate writes: output goes straight
 # to a file on disk, so nothing is lost by keeping the response small.
@@ -311,21 +313,79 @@ def _scan_fatal(record: dict) -> None:
                 return
 
 
+def _newest_mtime(root: str) -> float:
+    """Newest file mtime anywhere under root, 0 when there is none."""
+    newest = 0.0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                newest = max(newest, os.stat(os.path.join(dirpath, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
 def _last_output(record: dict) -> float:
-    """When the delegate last wrote anything, on either stream.
+    """When the delegate last showed any sign of life.
+
+    The newest mtime among: its stdout and stderr, any file under the target
+    project's .agent-runs/ (where it is briefed to write its deliverable and
+    progress log), and the CLI's own per-run transcript (_cli_activity). Only
+    mtimes are read, never content.
 
     Taken from file mtimes rather than a timer in this process, which is what
     lets the idle rule survive a restart: the evidence is on disk, so a server
     that never saw the earlier output can still tell a thinking run from a hung
-    one.
+    one. Never earlier than the start, so an old file cannot age a new run.
     """
-    newest = 0.0
+    newest = record.get("started_at", 0.0)
     for key in ("stdout_path", "stderr_path"):
         try:
             newest = max(newest, os.stat(record[key]).st_mtime)
         except (OSError, KeyError):
             pass
-    return newest or record.get("started_at", 0.0)
+    if record.get("cwd"):
+        newest = max(newest, _newest_mtime(os.path.join(record["cwd"], ARTIFACT_DIR)))
+    return max(newest, _cli_activity(record))
+
+
+# codex writes its session to <CODEX_HOME>/sessions/YYYY/MM/DD/
+# rollout-<time>-<thread id>.jsonl as the run goes, and --json prints the
+# thread id as the first event on stdout. So the run's own session file is
+# found exactly, and its mtime is a heartbeat even while stdout is quiet.
+CODEX_HOME = os.path.expanduser(_env("CODEX_HOME", "~/.codex"))
+
+
+def _thread_id(stdout_path: str) -> str:
+    try:
+        with open(stdout_path, "rb") as fh:
+            first = fh.readline(4096)
+        ev = json.loads(first)
+    except (OSError, ValueError):
+        return ""
+    if isinstance(ev, dict) and ev.get("type") == "thread.started":
+        tid = str(ev.get("thread_id") or "")
+        if tid and all(c.isalnum() or c == "-" for c in tid):
+            return tid
+    return ""
+
+
+def _cli_activity(record: dict) -> float:
+    """mtime of this run's codex session file, 0 until it exists."""
+    path = record.get("activity_path")
+    if not path:
+        tid = _thread_id(record.get("stdout_path", ""))
+        if not tid:
+            return 0.0
+        hits = glob.glob(os.path.join(CODEX_HOME, "sessions", "*", "*", "*",
+                                      f"*-{tid}.jsonl"))
+        if not hits:
+            return 0.0
+        path = record["activity_path"] = hits[0]
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
 
 
 def _terminate(record: dict, verdict: str) -> None:
@@ -605,7 +665,8 @@ def _verdict_note(record: dict) -> str:
                 "That message is the whole diagnosis, including any reset time: decide "
                 "whether to wait or switch provider before re-dispatching.")
     if verdict == "idle":
-        return (f"{cli} produced no output for {record.get('idle_seconds')}s (of {elapsed}s "
+        return (f"{cli} showed no activity (output, {ARTIFACT_DIR}/ files or its own "
+                f"transcript) for {record.get('idle_seconds')}s (of {elapsed}s "
                 f"total) and its process group was killed as hung. This is NOT the "
                 f"wall-clock timeout: the run went silent rather than running long. If the "
                 f"task legitimately runs silent that long (a long test suite, a build), "
@@ -653,16 +714,24 @@ def _report(record: dict, tail_lines: int = 80) -> str:
     ]
     if state in ("running", "stopping"):
         silent = int(time.time() - _last_output(record))
-        head.append(f"  silent:  {silent}s since the last line on either stream")
+        head.append(f"  silent:  {silent}s since the last activity (output, "
+                    f"{ARTIFACT_DIR}/, or the CLI's transcript)")
+        idle = record.get("idle_seconds")
+        if state == "running" and idle and silent > idle / 2:
+            head.append(f"  STALL:   no activity for {silent}s (idle limit {idle}s). It is "
+                        f"killed at the limit unless it writes something first.")
 
     body = [_verdict_note(record)] if state != "running" else []
-    if state != "running":
+    if state != "running" and record.get("cli") == "codex":
         err = _codex_error(out_path)
         if err:
             body.append(f"codex reported an error:\n  {err}")
         last = _tail(_last_path(record["run_id"]), tail_lines)
         if last:
             body.append(f"--- final message (codex -o) ---\n{last}")
+    guard = _git_guard_note(record) if state != "running" else ""
+    if guard:
+        body.insert(0, guard)
 
     out = _tail(out_path, tail_lines)
     err = _tail(err_path, max(tail_lines // 4, 20))
@@ -700,6 +769,42 @@ def _codex_error(out_path: str) -> str:
             err = ev.get("error")
             found = str(err.get("message") if isinstance(err, dict) else err or "")
     return found[:1000]
+
+
+def _git_fingerprint(git_dirs: list) -> dict:
+    """sha256 of each git dir's config and of every live hook, by path. A
+    delegate allowed to write the git dir (so it can commit) could also plant
+    a hook or a core.fsmonitor/hooksPath setting that runs, unsandboxed, the
+    next time anyone uses git there. This makes that visible after the run."""
+    import hashlib
+    out = {}
+    for d in git_dirs or []:
+        paths = [os.path.join(d, "config")]
+        try:
+            paths += [os.path.join(d, "hooks", n) for n in sorted(os.listdir(os.path.join(d, "hooks")))
+                      if not n.endswith(".sample")]
+        except OSError:
+            pass
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    out[path] = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                pass
+    return out
+
+
+def _git_guard_note(record: dict) -> str:
+    before = record.get("git_guard")
+    if before is None:
+        return ""
+    after = _git_fingerprint(record.get("git_dirs"))
+    changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+    if not changed:
+        return ""
+    return ("WARNING: the delegate changed git configuration or hooks, which run "
+            "outside its sandbox the next time git is used there. Read them before "
+            "running any git command in that repo:\n  " + "\n  ".join(changed))
 
 
 def _git_dirs(cwd: str) -> list:
@@ -835,7 +940,7 @@ LAST_MESSAGE = object()
 
 def _dispatch(prompt: str, argv: list, cwd: str, model: str,
               wait_seconds: int, force: bool,
-              timeout_seconds=None, idle_seconds=None) -> str:
+              timeout_seconds=None, idle_seconds=None, extra=None) -> str:
     timeout, idle, bad = _deadlines(timeout_seconds, idle_seconds)
     if bad:
         return bad
@@ -926,6 +1031,7 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "verdict": None,
         "server_pid": os.getpid(),
     }
+    record.update(extra or {})
     _live[run_id] = proc
     _write_record(record)
     threading.Thread(target=_monitor, args=(run_id,), daemon=True).start()
@@ -988,7 +1094,9 @@ def dispatch_codex(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_C
         dir and the temp dirs, with no network. Without the --add-dir the git
         dir is read-only and every commit fails (verified, codex-cli 0.167).
         It still self-approves edits, shell commands and commits inside the
-        repo, so calling this tool IS the confirmation step.
+        repo, so calling this tool IS the confirmation step. A writable git
+        dir also allows planting a hook or git config that runs unsandboxed
+        later; check_run warns if either changed during the run.
       - `cwd` must be inside a git repository; codex exec refuses otherwise,
         and this tool refuses first with a clearer message.
       - --json keeps the transcript on stdout as one event per line. Without
@@ -1041,7 +1149,8 @@ def dispatch_codex(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_C
         argv += ["--model", model]
     argv += ["--", prompt]
     return _dispatch(prompt, argv, target, model or "(codex default)", wait_seconds,
-                     force, timeout_seconds, idle_seconds)
+                     force, timeout_seconds, idle_seconds,
+                     extra={"git_dirs": git_dirs, "git_guard": _git_fingerprint(git_dirs)})
 
 
 @mcp.tool()

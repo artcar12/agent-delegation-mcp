@@ -56,7 +56,6 @@ import time
 SCHEMA = 1
 CMD_TIMEOUT = 30
 CODEX_MAX_FILES = 300
-MAC_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +309,7 @@ def collect_codex(now: float, home: str = ""):
     if not files:
         return _source("codex", reason="no Codex session files yet")
     files.sort(reverse=True)
+    bad = ""
     for mtime, path in files[:CODEX_MAX_FILES]:
         rl = last_rate_limits(path)
         if rl is None:
@@ -317,8 +317,11 @@ def collect_codex(now: float, home: str = ""):
         try:
             windows, extra = parse_codex_rate_limits(rl, now)
         except ValueError as exc:
-            return _source("codex", reason=f"unexpected rate_limits shape ({exc})")
+            bad = bad or str(exc)       # e.g. an API-key session with null windows:
+            continue                    # an older file may still have real ones
         return _source("codex", windows=windows, extra=extra, as_of=_iso(mtime))
+    if bad:
+        return _source("codex", reason=f"unexpected rate_limits shape ({bad})")
     return _source("codex", reason=f"no rate_limits in the newest {min(len(files), CODEX_MAX_FILES)} session files")
 
 
