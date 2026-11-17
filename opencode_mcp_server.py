@@ -214,6 +214,9 @@ def _last_path(run_id: str) -> str:
     return os.path.join(RUN_DIR, run_id) + ".last"
 
 
+_SERVER_IDENTITY = ""      # this process's start time, filled on first use
+
+
 def _new_run_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
 
@@ -305,6 +308,17 @@ def _record_ids() -> list:
         return []
 
 
+def _owner_alive(record: dict) -> bool:
+    """Is the server that dispatched this run still the process running under
+    its pid? Start time guards against a recycled pid, as in _alive."""
+    pid = record.get("server_pid") or 0
+    state, start = _proc_info(pid) if pid else ("", "")
+    if not state or state.startswith("Z"):
+        return False
+    recorded = record.get("server_identity") or ""
+    return not recorded or start == recorded
+
+
 def _scan_fatal(record: dict) -> None:
     """Latch the first fatal stderr line, resuming from where the last scan
     stopped.
@@ -318,10 +332,10 @@ def _scan_fatal(record: dict) -> None:
     patterns = _fatal_patterns(record)
     if record.get("fatal_line") or not patterns:
         return
-    if record.get("cli", CLI_LABEL) != CLI_LABEL and _pid_exists(record.get("server_pid", 0)):
-        # Its own server is alive and scanning with that CLI's full list,
-        # env extras included. Scanning here would advance the shared offset
-        # past lines only those extras catch.
+    if record.get("server_pid") != os.getpid() and _owner_alive(record):
+        # The server that dispatched it is alive and scanning with its own
+        # full list, env extras included. Scanning here would advance the
+        # shared offset past lines only those extras catch.
         return
     start = record.get("scan_offset", 0)
     try:
@@ -1085,6 +1099,8 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
                     "these share a quota pool. check_run one of the above, cancel_run it, "
                     "or pass force=True if you have a reason to overlap them.")
 
+    global _SERVER_IDENTITY
+    _SERVER_IDENTITY = _SERVER_IDENTITY or _proc_identity(os.getpid())
     run_id = _new_run_id()
     _rec_path, out_path, err_path = _run_paths(run_id)
     try:
@@ -1151,6 +1167,7 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         "state": "running",
         "verdict": None,
         "server_pid": os.getpid(),
+        "server_identity": _SERVER_IDENTITY,
         # Where this run's CLI keeps its transcripts, as THIS server saw it, so
         # a sibling server with a different environment looks in the same place.
         "transcript_root": {"agy": AGY_BRAIN_DIR, "codex": CODEX_HOME}.get(CLI_LABEL),

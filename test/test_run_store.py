@@ -703,11 +703,14 @@ class CodexRunStoreTests(RunStoreTests):
         self.assertIn("hit your usage limit", sibling._fatal_patterns({"cli": "codex"}))
 
     def test_sibling_fails_a_dead_owners_codex_run_fast(self):
-        mod = self.server("echo \"You've hit your usage limit.\" >&2; sleep 60\n")
+        # The line comes after the owner has stopped watching, so only the
+        # sibling can be the one that catches it.
+        mod = self.server("sleep 3; echo \"You've hit your usage limit.\" >&2; sleep 60\n")
         run_id = self.run_id_from(self.dispatch(mod))
         mod._live.pop(run_id, None)
         time.sleep(1.2)
         record = mod._read_record(run_id)
+        self.assertIsNone(record["fatal_line"])
         record["server_pid"] = 0                # the dispatching server is gone
         mod._write_record(record)
         sibling = _load("agy_mcp_server.py", "srv_sib_fatal", {"AGENT_MCP_RUN_DIR": self.run_dir})
@@ -715,6 +718,32 @@ class CodexRunStoreTests(RunStoreTests):
             lambda: sibling._reconcile(run_id)["state"] not in ("running", "stopping"),
             timeout=20))
         self.assertEqual(sibling._read_record(run_id)["verdict"], "fatal")
+
+    def test_sibling_leaves_scanning_to_a_live_owner(self):
+        mod = self.server("echo \"You've hit your usage limit.\" >&2; sleep 60\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        mod._live.pop(run_id, None)
+        time.sleep(1.2)
+        owner = subprocess.Popen(["sleep", "60"])    # stands in for a live owner server
+        try:
+            record = mod._read_record(run_id)
+            record.update(server_pid=owner.pid, server_identity=mod._proc_identity(owner.pid),
+                          fatal_line=None, scan_offset=0)
+            mod._write_record(record)
+            sibling = _load("agy_mcp_server.py", "srv_sib_live", {"AGENT_MCP_RUN_DIR": self.run_dir})
+            time.sleep(0.5)
+            after = sibling._reconcile(run_id)
+            self.assertEqual(after["scan_offset"], 0)
+            self.assertIsNone(after["fatal_line"])
+            # A recycled pid (identity mismatch) is not a live owner.
+            record = sibling._read_record(run_id)
+            record["server_identity"] = "not the same process"
+            sibling._write_record(record)
+            self.assertFalse(sibling._owner_alive(record))
+        finally:
+            owner.kill()
+            owner.wait()
+            mod.cancel_run(run_id)
 
     def test_prune_removes_orphan_sidecars(self):
         mod = self.server(AGENT_MCP_RUN_RETENTION_DAYS="1")
@@ -745,7 +774,9 @@ class CrossServerTests(unittest.TestCase):
 
     def test_builtin_pattern_tables_agree_with_each_server(self):
         _stub_mcp()
-        mods = [_load(n, f"srv_pat_{i}", {}) for i, n in enumerate(
+        clean = {k: "" for k in ("AGY_MCP_FATAL_PATTERNS", "OPENCODE_MCP_FATAL_PATTERNS",
+                                 "CODEX_MCP_FATAL_PATTERNS")}
+        mods = [_load(n, f"srv_pat_{i}", clean) for i, n in enumerate(
             ("agy_mcp_server.py", "opencode_mcp_server.py", "codex_mcp_server.py"))]
         for m in mods:
             self.assertEqual(m._BUILTIN_FATAL, mods[0]._BUILTIN_FATAL, m.SERVER_NAME)

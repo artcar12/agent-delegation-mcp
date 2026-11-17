@@ -406,9 +406,10 @@ A run is idle when nothing shows it is alive. The evidence is the newest
 The detector follows the run's CLI, not the server doing the looking: every
 server reconciles every run in the shared store. Likewise the transcript
 location is the one the dispatching server saw (stored in the run record), and
-fail-fast patterns are the run's CLI's. The `*_MCP_FATAL_PATTERNS` extras apply
-only while that CLI's own server is scanning; once it has died, a sibling uses
-the built-in list. `AGY_BRAIN_DIR` and `CODEX_HOME` matter to the server that
+fail-fast patterns are the run's CLI's. While the server that dispatched a run
+is alive, only it scans that run's stderr, with its full list including any
+`*_MCP_FATAL_PATTERNS` extras; once it has died, whichever server looks next
+scans with that CLI's built-in list. `AGY_BRAIN_DIR` and `CODEX_HOME` matter to the server that
 dispatches the run; others use the location recorded with it.
 
 The idle limit is on by default: agy 900 s, Codex 900 s, opencode 600 s. Change
