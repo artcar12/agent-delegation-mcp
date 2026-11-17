@@ -3,7 +3,8 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Exercises the run store in the agy and opencode servers against fake CLIs.
+"""Exercises the run store in the agy, opencode and codex servers against fake
+CLIs.
 
 The gemini-web server had a third copy until 1.7.0 removed dispatch_gemini;
 1.9.0 removed the server.
@@ -485,6 +486,92 @@ class OpenCodeRunStoreTests(RunStoreTests):
             mod.subprocess.Popen = real
         self.assertEqual(seen["env"]["PWD"], self.project)
         self.assertEqual(seen["cwd"], self.project)
+
+
+class CodexRunStoreTests(RunStoreTests):
+    SERVER = "codex_mcp_server.py"
+    BIN_VAR = "CODEX_BIN"
+    TIMEOUT_VAR = "CODEX_MCP_TIMEOUT"
+    IDLE_VAR = "CODEX_MCP_IDLE_TIMEOUT"
+
+    def setUp(self):
+        super().setUp()
+        # codex exec runs only inside a git repo, and the wrapper checks first.
+        subprocess.run(["git", "init", "-q", self.project], check=True)
+
+    # Writes the -o file the way codex does, so the report can be checked.
+    WRITE_LAST = (
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "--output-last-message" ]; then printf "final answer here" > "$2"; fi\n'
+        '  shift\n'
+        'done\n')
+
+    def test_argv_is_unattended_and_sandboxed_to_the_repo(self):
+        mod = self.server('echo "argv: $*"\n')
+        out = self.dispatch(mod, prompt="--help", wait_seconds=10)
+        gitdir = os.path.realpath(os.path.join(self.project, ".git"))
+        self.assertIn("argv: exec --json --sandbox workspace-write -c "
+                      "approval_policy=\"never\" --cd " + self.project, out)
+        self.assertIn(f"--add-dir {gitdir}", out)
+        self.assertIn("--color never --output-last-message ", out)
+        self.assertIn(".last -- --help", out)
+        self.assertNotIn("--model", out)
+        self.assertNotIn("--ephemeral", out)
+
+    def test_model_is_passed_when_named(self):
+        mod = self.server('echo "argv: $*"\n')
+        out = self.dispatch(mod, model="gpt-x", wait_seconds=10)
+        self.assertIn("--model gpt-x -- do the thing", out)
+
+    def test_cwd_outside_a_git_repo_is_refused(self):
+        mod = self.server()
+        bare = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(bare)
+        out = mod.dispatch_codex("x", cwd=bare)
+        self.assertIn("not inside a git repository", out)
+        self.assertEqual(mod._record_ids(), [])
+
+    def test_final_message_is_reported(self):
+        mod = self.server(self.WRITE_LAST)
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("--- final message (codex -o) ---\nfinal answer here", out)
+
+    def test_error_event_on_stdout_is_quoted(self):
+        mod = self.server(
+            """echo '{"type":"turn.started"}'\n"""
+            """echo '{"type":"error","message":"You have hit your usage limit. Try again later."}'\n"""
+            """echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'\n"""
+            "exit 1\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("codex reported an error:\n  You have hit your usage limit", out)
+
+    def test_prune_removes_the_last_message_file(self):
+        mod = self.server(self.WRITE_LAST, AGENT_MCP_RUN_RETENTION_DAYS="1")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._reconcile(run_id)["state"] != "running"))
+        last = mod._last_path(run_id)
+        self.assertTrue(os.path.exists(last))
+        record = mod._read_record(run_id)
+        record["ended_at"] = time.time() - 3 * 86400
+        mod._write_record(record)
+        mod._prune()
+        self.assertFalse(os.path.exists(last))
+        self.assertIsNone(mod._read_record(run_id))
+
+
+class QuotaToolTests(unittest.TestCase):
+    """Every wrapper exposes quota_status from the shared module."""
+
+    def test_each_server_exposes_quota_status(self):
+        _stub_mcp()
+        for i, name in enumerate(("agy_mcp_server.py", "opencode_mcp_server.py",
+                                  "codex_mcp_server.py")):
+            mod = _load(name, f"srv_quota_{i}", {})
+            self.assertIsNotNone(mod._quota, name)
+            self.assertIn("quota", (mod.quota_status.__doc__ or "").lower())
+            mod._quota = None
+            self.assertTrue(mod.quota_status().startswith("unavailable:"))
 
 
 if __name__ == "__main__":

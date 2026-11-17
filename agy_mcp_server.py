@@ -12,10 +12,11 @@ returns a run id; check_run, cancel_run and list_runs work on that record from
 any session, including one started after this server has been restarted. See
 the run-store comment below for why.
 
-Self-contained on purpose: nothing is imported from its sibling server, and the
-dependency is declared inline above, so `uv run --script` on this one file is a
-complete way to run it. The run store is therefore duplicated into both servers
-rather than factored out; they share RUN_DIR at runtime, not code. Every knob is
+Nothing is imported from the sibling servers, and the dependency is declared
+inline above, so `uv run --script` on this file runs it. The run store is
+duplicated into each server rather than factored out; they share RUN_DIR at
+runtime, not code. The one shared module is quota_sources.py beside it, which
+only quota_status uses and whose absence degrades that one tool. Every knob is
 an environment variable; the full list is in the README.
 """
 
@@ -716,7 +717,9 @@ def _instructions() -> str:
         "- `Connection closed` means this connection dropped, NOT that the delegate "
         "died - it keeps running. Reconnect and call list_runs; do not re-dispatch.\n"
         "- The return value is not evidence in either direction. Verify with git and by "
-        "re-running the gate yourself.",
+        "re-running the gate yourself.\n"
+        "- quota_status reports agy, Codex and opencode quota in one table; check it "
+        "before a long dispatch.",
     ])
 
 
@@ -1101,6 +1104,33 @@ def list_runs(cwd: str = "", include_finished: bool = True, limit: int = 20) -> 
     header = (f"{len(trimmed)} of {len(rows)} run(s), {live} still live "
               f"(* marks live). Store: {RUN_DIR}")
     return header + "\n" + "\n".join(lines)
+
+# ---------------------------------------------------------------------------
+# quota_status, shared by every wrapper through quota_sources.py beside this
+# file. A copy of this server without that module still runs; only this tool
+# degrades, to a sentence saying why.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+try:
+    import quota_sources as _quota
+    _QUOTA_MISSING = ""
+except ImportError as _exc:
+    _quota = None
+    _QUOTA_MISSING = str(_exc)
+
+
+def quota_status(format: str = "table") -> str:
+    _touch()
+    if _quota is None:
+        return (f"unavailable: quota_sources.py could not be imported from {_HERE} "
+                f"({_QUOTA_MISSING}). It ships beside the server files in the plugin.")
+    return _quota.report(format)
+
+
+quota_status.__doc__ = (_quota.QUOTA_DOC if _quota else
+                        "Headless quota table for agy, Codex and opencode (module missing).")
+mcp.tool()(quota_status)
 
 if __name__ == "__main__":
     # Off-thread so a slow or large store cannot delay the client's connect.
