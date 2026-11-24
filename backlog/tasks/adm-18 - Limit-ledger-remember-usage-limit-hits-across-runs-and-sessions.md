@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-11-24T17:24:00Z'
-updated_date: '2026-11-24T17:25:00Z'
+updated_date: '2026-11-24T17:34:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -39,3 +39,9 @@ When a delegate hits a provider usage limit, the wrapper fails the run fast (fat
 4. quota_status: extra.limit_hits per source (schema 1 compatible), table note shows active and stale hits.
 5. Tests in test_quota_sources.py and test_run_store.py; README quota section; version bump 1.13.0 with ADM-19.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-11-24: implemented on claude/ADM-18-limit-ledger. Full suite 163 tests OK (6 agy-only skips), plugin validate passes, real ~/.agent-delegation-mcp ledger untouched by tests. Merges together with ADM-19 as 1.13.0.
+<!-- SECTION:NOTES:END -->
