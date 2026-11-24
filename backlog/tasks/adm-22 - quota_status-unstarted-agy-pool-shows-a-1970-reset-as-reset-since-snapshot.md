@@ -1,9 +1,11 @@
 ---
 id: ADM-22
 title: 'quota_status: unstarted agy pool shows a 1970 reset as "reset since snapshot"'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-24T17:24:00Z'
+updated_date: '2026-11-24T17:37:00Z'
 labels: []
 dependencies: []
 priority: low

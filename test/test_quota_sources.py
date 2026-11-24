@@ -112,6 +112,18 @@ class AgyTests(unittest.TestCase):
         self.assertTrue(row["reset_passed"])
         self.assertEqual(row["used_percent"], 0.0)
 
+    def test_unstarted_pool_has_no_reset(self):
+        doc = {"command": {"data": {"groups": [{"name": "Pool C", "buckets": [
+            {"window": "weekly", "remaining_fraction": 1,
+             "reset_time": "1970-01-01T00:00:00Z"}]}]}}}
+        w = q.parse_agy_usage(json.dumps(doc), NOW)[0]
+        self.assertEqual((w["resets_at"], w["reset_passed"], w["left_percent"]),
+                         (None, False, 100.0))
+        table = q.render_table({"generated_at": q._iso(NOW), "sources": [
+            q._source("agy", windows=[w], as_of=q._iso(NOW))]})
+        self.assertNotIn("1970", table)
+        self.assertNotIn("reset since snapshot", table)
+
     def test_missing_cli_is_unavailable(self):
         saved = os.environ.get("AGY_BIN")
         os.environ["AGY_BIN"] = "/nonexistent/agy"

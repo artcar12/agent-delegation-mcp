@@ -94,6 +94,10 @@ def _window(pool, window, used, resets_at, now):
     window whose reset time has passed is shown as reset (0 used), with the
     stale reading kept in the caller's extra if it wants it."""
     used = max(0.0, min(100.0, round(used, 1)))
+    if resets_at is not None and resets_at <= 0:
+        # agy reports the Unix epoch for a pool whose window has not started:
+        # there is no reset to show, and nothing has reset.
+        resets_at = None
     passed = resets_at is not None and resets_at <= now
     if passed:
         used = 0.0
