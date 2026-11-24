@@ -12,6 +12,7 @@ made-up chatter around the rate_limits lines to prove it is never read back.
 Runs with plain `python3 test/test_quota_sources.py`.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -26,6 +27,11 @@ sys.path.insert(0, ROOT)
 import quota_sources as q  # noqa: E402
 
 NOW = q._parse_iso("2026-01-10T12:00:00Z")
+
+# collect() reads the limit ledger; never the real one.
+_STORE = tempfile.mkdtemp(prefix="quota-store-")
+os.environ["AGENT_MCP_RUN_DIR"] = _STORE
+atexit.register(shutil.rmtree, _STORE, True)
 
 AGY_JSON = {
     "command": {"name": "usage", "data": {"groups": [
@@ -105,6 +111,19 @@ class AgyTests(unittest.TestCase):
         row = q.parse_agy_usage(text, NOW)[0]
         self.assertTrue(row["reset_passed"])
         self.assertEqual(row["used_percent"], 0.0)
+
+    def test_unstarted_pool_has_no_reset(self):
+        doc = {"command": {"data": {"groups": [{"name": "Pool C", "buckets": [
+            {"window": "weekly", "remaining_fraction": 1,
+             "reset_time": "1970-01-01T00:00:00Z"}]}]}}}
+        w = q.parse_agy_usage(json.dumps(doc), NOW)[0]
+        self.assertEqual((w["resets_at"], w["reset_passed"], w["left_percent"],
+                          w["not_started"]), (None, False, 100.0, True))
+        table = q.render_table({"generated_at": q._iso(NOW), "sources": [
+            q._source("agy", windows=[w], as_of=q._iso(NOW))]})
+        self.assertNotIn("1970", table)
+        self.assertNotIn("reset since snapshot", table)
+        self.assertIn("window not started", table)
 
     def test_missing_cli_is_unavailable(self):
         saved = os.environ.get("AGY_BIN")
@@ -263,7 +282,181 @@ class ReportTests(unittest.TestCase):
         src = doc["sources"][0]
         self.assertEqual(set(src), {"source", "status", "reason", "as_of", "windows", "extra"})
         self.assertEqual(set(src["windows"][0]), {"pool", "window", "used_percent", "left_percent",
-                                                  "resets_at", "reset_passed"})
+                                                  "resets_at", "reset_passed", "not_started"})
+
+
+class LedgerTests(unittest.TestCase):
+    """The limit ledger, under a temporary run store. Every error line is
+    invented."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ledger-")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def hit(self, cli="codex", model="", line="usage limit reached", now=NOW):
+        return q.record_limit_hit(cli, model, line, "run-1", now=now, root=self.root)
+
+    def test_pools(self):
+        self.assertEqual(q.pool_for("codex", "(codex default)"), "codex")
+        self.assertEqual(q.pool_for("agy", "claude-sonnet-5-5-high"), q.AGY_CLAUDE_GPT)
+        self.assertEqual(q.pool_for("agy", "gpt-oss-120b-medium"), q.AGY_CLAUDE_GPT)
+        self.assertEqual(q.pool_for("agy", "gemini-4-argon-high"), q.AGY_ARGON)
+        self.assertEqual(q.pool_for("agy", "gemini-3.8-flash-high"), q.AGY_GEMINI)
+        self.assertEqual(q.pool_for("opencode", "opencode-go/kimi-k3"), "opencode-go")
+        self.assertEqual(q.pool_for("opencode", "opencode-go/longcat-2.0"), "opencode-go")
+        self.assertEqual(q.pool_for("opencode", "opencode/big-pickle"), "opencode/big-pickle")
+        self.assertEqual(q.pool_for("opencode", ""), "default model")
+
+    def test_limit_lines_exclude_auth(self):
+        for line in ("AI.Error: Go usage limit exceeded", "You have hit your usage limit.",
+                     "quota exceeded for model", "You exceeded your current quota.",
+                     "insufficient credit balance"):
+            self.assertTrue(q.is_limit_line(line), line)
+        # Per-minute rate limits clear in seconds and must not block a pool.
+        for line in ("invalid api key", "authentication failed", "AI_APICallError: bad request",
+                     "429 RESOURCE_EXHAUSTED", "Rate limit reached, try again in 1.5s",
+                     "RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'Generate "
+                     "requests' and limit 'requests per minute'",
+                     "", None):
+            self.assertFalse(q.is_limit_line(line), line)
+
+    def test_reset_parsing(self):
+        self.assertEqual(q.parse_reset("try again in 2 hours 5 minutes", NOW), NOW + 7500)
+        self.assertEqual(q.parse_reset("resets in 1h 30m", NOW), NOW + 5400)
+        self.assertEqual(q.parse_reset("try again in 3 days, 4 hours and 1 minute.", NOW),
+                         NOW + 3 * 86400 + 4 * 3600 + 60)
+        self.assertEqual(q.parse_reset("limit resets at 2026-01-10T15:00:00Z", NOW),
+                         q._parse_iso("2026-01-10T15:00:00Z"))
+        # Clock times are local, as the CLIs print them.
+        base = q._dt.datetime.fromtimestamp(NOW).astimezone()
+        later = (base + q._dt.timedelta(hours=2)).replace(second=0, microsecond=0)
+        text = later.strftime("try again at %I:%M %p")
+        self.assertEqual(q.parse_reset(text, NOW), later.timestamp())
+        earlier = (base - q._dt.timedelta(hours=2)).replace(second=0, microsecond=0)
+        self.assertEqual(q.parse_reset(earlier.strftime("try again at %H:%M"), NOW),
+                         (earlier + q._dt.timedelta(days=1)).timestamp())
+        dated = (base + q._dt.timedelta(days=2)).replace(second=0, microsecond=0)
+        self.assertEqual(q.parse_reset(dated.strftime("try again at %b %d, %Y %I:%M %p"), NOW),
+                         dated.timestamp())
+        self.assertEqual(q.parse_reset("try again in 1.5s", NOW), NOW + 1.5)
+        # A leading log timestamp (past) must not hide the stated reset.
+        self.assertEqual(q.parse_reset("2026-01-10T10:00:00Z ERROR usage limit reached, "
+                                       "resets in 2 hours", NOW), NOW + 7200)
+        # An ISO time without an offset is local, as the CLIs print it.
+        local = (q._dt.datetime.fromtimestamp(NOW) + q._dt.timedelta(hours=3)).replace(
+            microsecond=0)
+        self.assertEqual(q.parse_reset("resets at " + local.strftime("%Y-%m-%d %H:%M:%S"), NOW),
+                         local.timestamp())
+        # Times before the reset phrase are log stamps or event times.
+        stamp = q._dt.datetime.fromtimestamp(NOW + 3600).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertIsNone(q.parse_reset(f"ERROR {stamp} Go usage limit exceeded", NOW))
+        self.assertIsNone(q.parse_reset("request failed at 23:59: usage limit reached", NOW))
+        for text in ("usage limit reached", "try again in 2 months",
+                     "resets at 2025-01-01T00:00:00Z",          # past
+                     "try again in 400 days"):                  # too far
+            self.assertIsNone(q.parse_reset(text, NOW), text)
+
+    def test_hit_with_reset_blocks_until_then(self):
+        e = self.hit(line="You have hit your usage limit. Try again in 2 hours.")
+        self.assertEqual(e["resets_at"], q._iso(NOW + 7200))
+        self.assertEqual(q.active_limit("codex", "x", now=NOW + 7000, root=self.root)["run_id"],
+                         "run-1")
+        self.assertIsNone(q.active_limit("codex", "x", now=NOW + 7300, root=self.root))
+        self.assertEqual(q.limit_hits(NOW + 7300, root=self.root), [])
+
+    def test_hit_without_reset_goes_stale_then_ages_out(self):
+        self.hit()
+        ttl = q.limit_ttl()
+        self.assertEqual(q.limit_hits(NOW + ttl - 1, root=self.root)[0]["state"], "active")
+        self.assertEqual(q.limit_hits(NOW + ttl + 1, root=self.root)[0]["state"], "stale")
+        self.assertIsNone(q.active_limit("codex", "", now=NOW + ttl + 1, root=self.root))
+        self.assertEqual(q.limit_hits(NOW + q.STALE_SECONDS + 1, root=self.root), [])
+
+    def test_ttl_is_configurable(self):
+        os.environ["AGENT_MCP_LIMIT_TTL"] = "60"
+        try:
+            self.hit()
+            self.assertEqual(q.limit_hits(NOW + 61, root=self.root)[0]["state"], "stale")
+            # A TTL longer than the stale period still blocks for all of it.
+            os.environ["AGENT_MCP_LIMIT_TTL"] = str(2 * q.STALE_SECONDS)
+            self.assertEqual(q.limit_hits(NOW + q.STALE_SECONDS + 60,
+                                          root=self.root)[0]["state"], "active")
+        finally:
+            del os.environ["AGENT_MCP_LIMIT_TTL"]
+
+    def test_newer_hit_replaces_older_and_pools_are_separate(self):
+        self.hit(cli="agy", model="gemini-3.8-flash-high", now=NOW - 100)
+        self.hit(cli="agy", model="gemini-3.8-flash-low", now=NOW)
+        self.hit(cli="agy", model="claude-opus-5-5-high", now=NOW)
+        hits = q.limit_hits(NOW, root=self.root)
+        self.assertEqual(sorted(h["pool"] for h in hits), [q.AGY_CLAUDE_GPT, q.AGY_GEMINI])
+        gem = [h for h in hits if h["pool"] == q.AGY_GEMINI][0]
+        self.assertEqual(gem["model"], "gemini-3.8-flash-low")
+
+    def test_late_older_hit_does_not_replace_a_newer_one(self):
+        self.hit(line="usage limit reached, resets in 3 days", now=NOW)
+        self.hit(line="usage limit reached", now=NOW - 600)
+        hits = q.limit_hits(NOW, root=self.root)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["resets_at"], q._iso(NOW + 3 * 86400))
+
+    def test_non_limit_line_is_not_recorded(self):
+        self.assertIsNone(self.hit(line="invalid api key"))
+        self.assertFalse(os.path.exists(q.ledger_path(self.root)))
+
+    def test_clear_only_removes_hits_before_the_clean_run(self):
+        self.hit(now=NOW)
+        q.clear_limit_hit("codex", "", before=NOW - 10, now=NOW, root=self.root)
+        self.assertEqual(len(q.limit_hits(NOW, root=self.root)), 1)
+        q.clear_limit_hit("codex", "", before=NOW + 10, now=NOW, root=self.root)
+        self.assertEqual(q.limit_hits(NOW, root=self.root), [])
+
+    def test_clear_without_a_ledger_creates_nothing(self):
+        self.assertFalse(q.clear_limit_hit("codex", "", before=NOW, now=NOW, root=self.root))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "quota")))
+
+    def test_corrupt_ledger_reads_empty_and_is_rewritten(self):
+        os.makedirs(os.path.dirname(q.ledger_path(self.root)))
+        for junk in ("{not json", '["a list"]', '{"entries": [{"cli": "codex"}]}'):
+            with open(q.ledger_path(self.root), "w") as fh:
+                fh.write(junk)
+            self.assertEqual(q.limit_hits(NOW, root=self.root), [])
+        self.assertIsNotNone(self.hit())
+        self.assertEqual(len(q.limit_hits(NOW, root=self.root)), 1)
+
+    def test_unwritable_ledger_never_raises(self):
+        blocker = os.path.join(self.root, "quota")
+        with open(blocker, "w") as fh:
+            fh.write("a file where the directory should be")
+        self.assertIsNone(self.hit())
+        self.assertEqual(q.limit_hits(NOW, root=self.root), [])
+
+    def test_line_is_cut_and_nothing_else_kept(self):
+        e = self.hit(line="usage limit reached " + "x" * 1000)
+        self.assertEqual(len(e["line"]), q.LINE_MAX)
+        self.assertEqual(set(e), {"cli", "pool", "model", "hit_at", "resets_at", "line", "run_id"})
+
+    def test_collect_and_table_show_hits(self):
+        self.hit(line="usage limit reached, try again in 1 hour")
+        self.hit(cli="opencode", model="opencode-go/kimi-k3", line="Go usage limit exceeded",
+                 now=NOW - q.limit_ttl() - 5)
+        saved = q.COLLECTORS
+        q.COLLECTORS = (("codex", lambda now: q._source("codex", reason="no session files")),
+                        ("opencode", lambda now: q._source("opencode", as_of=q._iso(now))))
+        try:
+            doc = q.collect(NOW, root=self.root)
+        finally:
+            q.COLLECTORS = saved
+        by = {s["source"]: s for s in doc["sources"]}
+        self.assertEqual(by["codex"]["extra"]["limit_hits"][0]["state"], "active")
+        self.assertEqual(by["opencode"]["extra"]["limit_hits"][0]["state"], "stale")
+        table = q.render_table(doc)
+        self.assertIn("LIMIT HIT, blocked until reset", table)
+        self.assertIn("unavailable: no session files", table)
+        self.assertIn("opencode-go ", table)
+        self.assertIn("stale, not blocking", table)
 
 
 if __name__ == "__main__":

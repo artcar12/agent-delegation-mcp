@@ -124,6 +124,9 @@ class RunStoreTests(unittest.TestCase):
             # Never latch onto a real CLI transcript on this machine.
             "AGY_BRAIN_DIR": os.path.join(self.tmp, "brain"),
             "CODEX_HOME": os.path.join(self.tmp, "codex-home"),
+            # The fake CLI would otherwise be asked for agy /usage on every
+            # dispatch. Guard tests turn the live reading back on.
+            "AGENT_MCP_QUOTA_CHECK_TIMEOUT": "0",
         }
         env.update(extra)
         return _load(self.SERVER, f"srv_{RunStoreTests.counter}", env)
@@ -339,6 +342,33 @@ class RunStoreTests(unittest.TestCase):
             lambda: mod._reconcile(run_id)["state"] not in ("running", "stopping"), timeout=20))
         self.assertEqual(mod._read_record(run_id)["verdict"], "idle")
 
+    # agy /usage as the fake CLI answers it; anything else sleeps like a run.
+    @staticmethod
+    def usage_script(gemini_left):
+        doc = {"command": {"data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"window": "weekly", "remaining_fraction": gemini_left,
+                 "reset_time": "2099-01-01T00:00:00Z"}]},
+            {"name": "Claude and GPT models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 1,
+                 "reset_time": "2099-01-01T00:00:00Z"}]}]}}}
+        return (f"if [ \"$2\" = /usage ]; then echo '{json.dumps(doc)}'; exit 0; fi\n"
+                "sleep 30\n")
+
+    def test_agy_live_reading_refuses_warns_and_passes_by_pool(self):
+        if self.SERVER != "agy_mcp_server.py":
+            self.skipTest("agy only")
+        mod = self.server(self.usage_script(0), AGENT_MCP_QUOTA_CHECK_TIMEOUT="5")
+        out = self.dispatch(mod, model="gemini-3.8-flash-high")
+        self.assertTrue(out.startswith("Refusing to dispatch: agy pool 'Gemini Models': 0% left"),
+                        out[:300])
+        out = self.dispatch(mod, model="claude-sonnet-5-5-high")
+        self.assertIn("Quota: agy pool 'Claude and GPT models': 100% left", out)
+        self.run_id_from(out)
+        mod = self.server(self.usage_script(0.05), AGENT_MCP_QUOTA_CHECK_TIMEOUT="5")
+        out = self.dispatch(mod, model="gemini-3.8-flash-high", force=True)
+        self.assertIn("Quota: LOW. agy pool 'Gemini Models': 5% left", out)
+
     def test_a_sibling_server_judges_a_run_by_its_own_cli(self):
         """Every server reconciles every run. A healthy agy run whose only
         heartbeat is its transcript must survive a codex or opencode server
@@ -508,6 +538,155 @@ class RunStoreTests(unittest.TestCase):
 
     # -- server idle exit ---------------------------------------------------
 
+    # ------------------------------------------------------ limit ledger
+
+    def ledger(self):
+        sys.path.insert(0, ROOT)
+        import quota_sources
+        return quota_sources
+
+    def test_limit_hit_is_recorded_in_the_ledger(self):
+        q = self.ledger()
+        mod = self.server(f"echo 'Error: {self.FATAL_PHRASE}; try again in 2 hours' >&2; "
+                          "sleep 300\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._read_record(run_id)["state"] not in ("running", "stopping")))
+        record = mod._read_record(run_id)
+        hits = q.limit_hits(root=self.run_dir)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["cli"], mod.CLI_LABEL)
+        self.assertEqual(hits[0]["pool"], q.pool_for(mod.CLI_LABEL, record["model"]))
+        self.assertEqual(hits[0]["run_id"], run_id)
+        self.assertIsNotNone(hits[0]["resets_at"])
+        self.assertTrue(record["limit_noted"])
+        self.assertIn("Recorded as a usage-limit hit", mod.check_run(run_id))
+        # Beside the run store, invisible to its listing and pruning.
+        self.assertEqual(mod._record_ids(), [run_id])
+        record["ended_at"] = time.time() - 30 * 86400
+        mod._write_record(record)
+        mod._prune()
+        self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
+        self.assertIn("LIMIT HIT", mod.quota_status())
+
+    def test_auth_failure_is_not_a_limit_hit(self):
+        q = self.ledger()
+        mod = self.server("echo 'Error: invalid api key' >&2; sleep 300\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._read_record(run_id)["state"] not in ("running", "stopping")))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "fatal")
+        self.assertEqual(q.limit_hits(root=self.run_dir), [])
+
+    def test_clean_exit_clears_an_older_hit_on_the_same_pool(self):
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        model = mod.DEFAULT_MODEL or "(codex default)"
+        q.record_limit_hit(mod.CLI_LABEL, model, "usage limit reached",
+                           now=time.time() - 60, root=self.run_dir)
+        other = {"agy": "claude-opus-5-5-high"}.get(mod.CLI_LABEL, "opencode/big-pickle")
+        q.record_limit_hit(mod.CLI_LABEL, other, "usage limit reached",
+                           now=time.time() - 60, root=self.run_dir)
+        # The hit blocks the pool, so only a forced run can prove it is clear.
+        out = self.dispatch(mod, wait_seconds=10, force=True)
+        self.assertIn("exited 0", out)
+        pools = [h["pool"] for h in q.limit_hits(root=self.run_dir)]
+        self.assertNotIn(q.pool_for(mod.CLI_LABEL, model), pools)
+        if mod.CLI_LABEL != "codex":            # codex has one pool for every model
+            self.assertEqual(len(pools), 1)
+
+
+    # ------------------------------------------------------ dispatch guard
+
+    def default_model(self, mod):
+        return mod.DEFAULT_MODEL or "(codex default)"
+
+    def test_every_dispatch_result_leads_with_a_quota_line(self):
+        mod = self.server("sleep 30\n")
+        out = self.dispatch(mod)
+        self.assertTrue(out.startswith(f"Quota: {mod.CLI_LABEL} pool "), out[:200])
+        self.assertIn("quota unknown", out.splitlines()[0])
+
+    def test_recorded_hit_refuses_until_forced(self):
+        q = self.ledger()
+        mod = self.server("sleep 30\n")
+        q.record_limit_hit(mod.CLI_LABEL, self.default_model(mod),
+                           "usage limit reached, try again in 2 hours", root=self.run_dir)
+        out = self.dispatch(mod)
+        self.assertTrue(out.startswith("Refusing to dispatch:"), out[:300])
+        self.assertIn("resets 20", out)
+        self.assertIn("force=True", out)
+        self.assertEqual(mod._record_ids(), [])
+        out = self.dispatch(mod, force=True)
+        self.assertIn("Quota: EXHAUSTED, dispatched anyway (force=True)", out)
+        self.run_id_from(out)
+
+    def test_stale_hit_does_not_refuse(self):
+        q = self.ledger()
+        mod = self.server("sleep 30\n")
+        q.record_limit_hit(mod.CLI_LABEL, self.default_model(mod), "usage limit reached",
+                           now=time.time() - q.limit_ttl() - 60, root=self.run_dir)
+        self.run_id_from(self.dispatch(mod))
+
+    def test_unreadable_quota_never_blocks_and_stays_fast(self):
+        # agy's /usage hangs here (the fake CLI sleeps); codex has no session
+        # files; opencode has no live reading at all.
+        mod = self.server("sleep 30\n", AGENT_MCP_QUOTA_CHECK_TIMEOUT="1")
+        started = time.time()
+        out = self.dispatch(mod)
+        self.assertLess(time.time() - started, 5)
+        self.assertIn("quota unknown", out.splitlines()[0])
+        self.run_id_from(out)
+
+
+    def test_limit_line_missed_by_the_fatal_scan_is_still_recorded(self):
+        # A sibling server can finalize a run while its live owner is the one
+        # meant to scan stderr, leaving fatal_line unset.
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        err = os.path.join(self.tmp, "late.stderr")
+        with open(err, "w") as fh:
+            fh.write("step 1\nError: usage limit reached, try again in 1 hour\nbye\n")
+        record = {"run_id": "r-late", "cli": mod.CLI_LABEL, "model": self.default_model(mod),
+                  "state": "finished", "verdict": "exited", "exit_code": None,
+                  "fatal_line": None, "stderr_path": err,
+                  "stdout_path": os.path.join(self.tmp, "none.out")}
+        mod._note_limit(record)
+        self.assertEqual(record["limit_pool"],
+                         q.pool_for(mod.CLI_LABEL, self.default_model(mod)))
+        self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
+
+
+    def note(self, mod, stderr_text, mtime=None, **fields):
+        err = os.path.join(self.tmp, "noted.stderr")
+        with open(err, "w") as fh:
+            fh.write(stderr_text)
+        if mtime:
+            os.utime(err, (mtime, mtime))
+        record = {"run_id": "r-noted", "cli": mod.CLI_LABEL,
+                  "model": self.default_model(mod), "state": "finished",
+                  "verdict": "exited", "exit_code": None, "fatal_line": None,
+                  "stderr_path": err, "stdout_path": os.path.join(self.tmp, "none.out")}
+        record.update(fields)
+        mod._note_limit(record)
+        return record
+
+    def test_late_note_counts_the_reset_from_when_the_line_was_written(self):
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        written = time.time() - 1800
+        self.note(mod, "Error: usage limit reached, try again in 1 hour\n", mtime=written)
+        hit = q.limit_hits(root=self.run_dir)[0]
+        self.assertAlmostEqual(q._parse_iso(hit["resets_at"]), written + 3600, delta=2)
+        self.assertAlmostEqual(q._parse_iso(hit["hit_at"]), written, delta=2)
+
+    def test_clean_exit_after_a_limit_fatal_line_still_records(self):
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        self.note(mod, "", exit_code=0, fatal_line="Error: usage limit reached")
+        self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
+
+
     def test_idle_exit_after_limit_without_calls(self):
         mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
         now = mod._last_call
@@ -640,6 +819,46 @@ class CodexRunStoreTests(RunStoreTests):
             "exit 1\n")
         out = self.dispatch(mod, wait_seconds=10)
         self.assertIn("codex reported an error:\n  You have hit your usage limit", out)
+
+    def test_stdout_limit_event_is_recorded_in_the_ledger(self):
+        sys.path.insert(0, ROOT)
+        import quota_sources as q
+        mod = self.server(
+            """echo '{"type":"turn.started"}'\n"""
+            """echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 3 hours."}}'\n"""
+            "exit 1\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("Recorded as a usage-limit hit on the 'codex' pool", out)
+        hits = q.limit_hits(root=self.run_dir)
+        self.assertEqual([(h["cli"], h["pool"]) for h in hits], [("codex", "codex")])
+
+    def test_codex_snapshot_at_the_limit_refuses(self):
+        day = os.path.join(self.tmp, "codex-home", "sessions", "2026", "01", "01")
+        os.makedirs(day)
+        rl = {"limit_id": "codex",
+              "primary": {"used_percent": 100.0, "window_minutes": 300,
+                          "resets_at": int(time.time()) + 3600},
+              "secondary": {"used_percent": 40.0, "window_minutes": 10080,
+                            "resets_at": int(time.time()) + 86400}}
+        with open(os.path.join(day, "rollout-x.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "token_count", "rate_limits": rl}}) + "\n")
+        mod = self.server("sleep 30\n", AGENT_MCP_QUOTA_CHECK_TIMEOUT="5")
+        out = self.dispatch(mod)
+        self.assertTrue(out.startswith("Refusing to dispatch: codex pool 'codex': 0% left "
+                                       "of the 5h window"), out[:300])
+        self.assertIn("reading 0m old", out)
+
+    def test_recovered_error_event_with_a_clean_exit_records_nothing(self):
+        sys.path.insert(0, ROOT)
+        import quota_sources as q
+        mod = self.server(
+            """echo '{"type":"error","message":"You have hit your usage limit. Retrying."}'\n"""
+            """echo '{"type":"turn.completed"}'\n"""
+            "exit 0\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("exited 0", out)
+        self.assertEqual(q.limit_hits(root=self.run_dir), [])
 
     def test_session_file_counts_as_activity(self):
         tid = "0000aaaa-bbbb-cccc-dddd-eeeeffff0000"

@@ -576,6 +576,7 @@ def _reconcile(run_id: str):
         if not _pid_exists(record.get("pid", 0)):
             record["state"] = "killed"
             record["ended_at"] = record.get("ended_at") or time.time()
+            _note_limit(record)
             _seal_git_guard(record)
             _write_record(record)
         return record
@@ -598,6 +599,7 @@ def _reconcile(run_id: str):
             record["state"] = "finished"
             record["verdict"] = "exited"
             record["ended_at"] = time.time()
+            _note_limit(record)
             _seal_git_guard(record)
             _write_record(record)
             return record
@@ -634,10 +636,60 @@ def _reconcile(run_id: str):
 
     # A live run is reconciled once a second; rewriting an unchanged record
     # that often would be pure filesystem churn.
+    _note_limit(record)
     _seal_git_guard(record)
     if json.dumps(record, sort_keys=True) != before:
         _write_record(record)
     return record
+
+
+def _note_limit(record: dict) -> None:
+    """Tell the shared limit ledger (quota_sources.py) about a run that has
+    just ended: a usage-limit failure blocks its pool until the reset, and a
+    clean exit clears an older hit on the same pool. Once per run, latched in
+    the record so a sibling server reconciling it later does not repeat it.
+    Never raises and never changes the verdict."""
+    quota = globals().get("_quota")
+    if (quota is None or record.get("limit_noted")
+            or record.get("state") in ("running", "stopping")):
+        return
+    record["limit_noted"] = True
+    try:
+        cli = record.get("cli", CLI_LABEL)
+        model = record.get("model", "")
+        if (record.get("verdict") == "exited" and record.get("exit_code") == 0
+                and not quota.is_limit_line(record.get("fatal_line") or "")):
+            # A clean exit proves the pool works, whatever errors the run
+            # recovered from on the way (codex logs retries as error events).
+            quota.clear_limit_hit(cli, model, record.get("started_at") or 0, root=RUN_DIR)
+            return
+        line, src = record.get("fatal_line") or "", record.get("stderr_path", "")
+        if not quota.is_limit_line(line):
+            # The fatal scan can miss a line: a sibling server may finalize
+            # the run while its live owner is the one meant to scan stderr.
+            for cand in reversed(_tail(record.get("stderr_path", ""), 50).splitlines()):
+                if quota.is_limit_line(cand):
+                    line = cand.strip()
+                    break
+        if not quota.is_limit_line(line) and cli == "codex":
+            # codex reports its quota wall as a JSON event on stdout.
+            src = record.get("stdout_path", "")
+            line = _codex_error(src)
+        if quota.is_limit_line(line):
+            # When the message was written, not when this server got round to
+            # it: a run finalized hours later must not push "try again at
+            # 1:07 PM" to tomorrow, or start its TTL late.
+            try:
+                written = os.path.getmtime(src)
+            except (OSError, TypeError):
+                written = record.get("ended_at") or time.time()
+            entry = quota.record_limit_hit(cli, model, line, record.get("run_id", ""),
+                                           now=min(written, time.time()), root=RUN_DIR)
+            if entry:
+                record["limit_pool"] = entry["pool"]
+                record["limit_resets_at"] = entry["resets_at"]
+    except Exception:
+        pass
 
 
 def _monitor(run_id: str) -> None:
@@ -869,6 +921,11 @@ def _report(record: dict, tail_lines: int = 80) -> str:
         last = _tail(_last_path(record["run_id"]), tail_lines)
         if last:
             body.append(f"--- final message (codex -o) ---\n{last}")
+    if record.get("limit_pool"):
+        body.append(f"Recorded as a usage-limit hit on the {record['limit_pool']!r} pool"
+                    + (f", reset {record['limit_resets_at']}" if record.get("limit_resets_at")
+                       else ", reset time not stated")
+                    + ". quota_status lists it until then.")
     guard = _git_guard_note(record) if state != "running" else ""
     if guard:
         body.insert(0, guard)
@@ -1014,7 +1071,12 @@ def _instructions() -> str:
         "- The return value is not evidence in either direction. Verify with git and by "
         "re-running the gate yourself.\n"
         "- quota_status reports agy, Codex and opencode quota in one table; check it "
-        "before a long dispatch.",
+        "before a long dispatch. Each dispatch also checks the pool its model draws "
+        "on and refuses one that is exhausted or recently hit its limit (force=True "
+        "overrides). Pools: agy has three (Gemini Models; Gemini 4 Argon; Claude and "
+        "GPT models, shared by every claude-* and gpt-* id); every Codex model shares "
+        "one ChatGPT-plan pool; every opencode-go/ model shares the OpenCode Go "
+        "plan pool.",
     ])
 
 
@@ -1060,6 +1122,38 @@ def _deadlines(timeout_seconds, idle_seconds):
     return timeout, idle, None
 
 
+# Seconds the dispatch guard may spend on agy's /usage. The Codex snapshot is
+# a local file read and is not bounded by it. 0 skips both live readings;
+# recorded limit hits are still honoured.
+QUOTA_CHECK_TIMEOUT = _int_env("AGENT_MCP_QUOTA_CHECK_TIMEOUT", 5, allow_zero=True)
+
+
+def _quota_gate(model: str, force: bool) -> tuple:
+    """(note, refusal) for the quota pool this dispatch draws on. A pool with
+    an active limit-ledger hit, or a live window at 0% left, is refused unless
+    force=True. An unreadable quota never blocks: it becomes an "unknown"
+    note. Only this server's CLI is read."""
+    quota = globals().get("_quota")
+    if quota is None:
+        return "", ""
+    try:
+        check = quota.pool_check(CLI_LABEL, model, root=RUN_DIR,
+                                 timeout=QUOTA_CHECK_TIMEOUT,
+                                 agy=globals().get("AGY_BIN"), codex_home=CODEX_HOME)
+    except Exception:
+        return "Quota: unknown (the check failed).", ""
+    status, note = check["status"], check["note"]
+    if status == "exhausted" and not force:
+        return "", (f"Refusing to dispatch: {note}\n\nNothing was started. Wait for the "
+                    "reset, pick a model on another pool or another tool (quota_status "
+                    "shows them all), or pass force=True to dispatch anyway.")
+    if status == "exhausted":
+        return f"Quota: EXHAUSTED, dispatched anyway (force=True). {note}", ""
+    if status == "low":
+        return f"Quota: LOW. {note}", ""
+    return f"Quota: {note}", ""
+
+
 def _dispatch(prompt: str, argv: list, cwd: str, model: str,
               wait_seconds: int, force: bool,
               timeout_seconds=None, idle_seconds=None) -> str:
@@ -1070,6 +1164,14 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
     if not os.path.isdir(cwd):
         return (f"Error: cwd {cwd!r} is not an existing directory. Create it first or "
                 "pass an absolute path to an existing project.")
+
+    # Quota first: reading it can take seconds (agy /usage), and doing that
+    # between the busy check and the start would widen the window in which
+    # two sessions can both pass the check.
+    quota_note, refusal = _quota_gate(model, force)
+    if refusal:
+        return refusal
+    lead = f"{quota_note}\n\n" if quota_note else ""
 
     # The "one dispatch at a time" rule has been in the docs since the start
     # and was unenforceable while a run existed only as a local variable. The
@@ -1086,6 +1188,7 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
                     "Concurrent load on one provider is a common reason a run dies, and "
                     "these share a quota pool. check_run one of the above, cancel_run it, "
                     "or pass force=True if you have a reason to overlap them.")
+
 
     global _SERVER_IDENTITY
     _SERVER_IDENTITY = _SERVER_IDENTITY or _proc_identity(os.getpid())
@@ -1169,12 +1272,12 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
             time.sleep(min(POLL_SECONDS, max(deadline - time.time(), 0.05)))
             current = _read_record(run_id)
             if current and current.get("state") != "running":
-                return _report(current)
+                return lead + _report(current)
         current = _read_record(run_id) or record
-        return (f"Still running after {wait_seconds}s - the run is unaffected, only the "
+        return lead + (f"Still running after {wait_seconds}s - the run is unaffected, only the "
                 f"waiting stopped.\n\n{_report(current, tail_lines=20)}")
 
-    return (
+    return lead + (
         f"Dispatched {CLI_LABEL} ({model}) in {cwd}.\n"
         f"  run id: {run_id}\n"
         f"  stdout: {out_path}\n\n"
@@ -1246,6 +1349,16 @@ def dispatch_agy(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_CWD
     it is no longer lost when this connection drops - but it is still whatever
     the CLI happened to print, and the .log is the progress signal worth
     reading while the run is going.
+
+    QUOTA GUARD: every dispatch first checks the pool its model draws on
+    (agy has three pools: Gemini Models (every Gemini id except Argon),
+    Gemini 4 Argon, and Claude and GPT models (every claude-* and gpt-*
+    id)), and the limit ledger of past usage-limit hits. A pool at 0%
+    left, or one that hit its limit and has not reset, is refused with the
+    reason and reset time; force=True dispatches anyway. Under
+    AGENT_MCP_QUOTA_WARN_PERCENT (default 10) percent left, the result
+    warns. A quota line heads every result; an unreadable quota never
+    blocks.
 
     ONE DISPATCH AT A TIME, and this is now enforced: a second concurrent agy
     run is refused, naming the live one, unless you pass force=True.
@@ -1354,6 +1467,7 @@ def cancel_run(run_id: str) -> str:
     if record.get("state") != "running":
         return "Already ended - nothing to cancel.\n\n" + _report(record, tail_lines=20)
     _terminate(record, "cancelled")
+    _note_limit(record)
     _seal_git_guard(record)
     _write_record(record)
     _live.pop(run_id, None)
@@ -1429,7 +1543,7 @@ def quota_status(format: str = "table") -> str:
     if _quota is None:
         return (f"unavailable: quota_sources.py could not be imported from {_HERE} "
                 f"({_QUOTA_MISSING}). It ships beside the server files in the plugin.")
-    return _quota.report(format)
+    return _quota.report(format, root=RUN_DIR)
 
 
 quota_status.__doc__ = (_quota.QUOTA_DOC if _quota else

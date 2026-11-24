@@ -334,7 +334,10 @@ environment Claude Code itself inherits. All are optional.
 | `CODEX_HOME` | all, `quota_status` | `~/.codex` | Where Codex keeps its session files: the run's liveness signal, and the rate-limit snapshot. |
 | `XDG_DATA_HOME` | `quota_status` | `~/.local/share` | Parent of `opencode/log/opencode.log`. |
 | `AGENT_MCP_MAX_OUTPUT` | all | `100000` | Character cap on the output a tool *returns*. Not a cap on what is captured: the delegate's streams go straight to files, so nothing is lost by keeping the response small. |
-| `AGENT_MCP_RUN_DIR` | all | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. All three share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. |
+| `AGENT_MCP_RUN_DIR` | all | `~/.agent-delegation-mcp/runs` | Where run records and captured output live. All three share it on purpose — one `list_runs` should show every delegate on the machine, whichever CLI started it. The [limit ledger](#limit-ledger) lives in its `quota/` subdirectory. |
+| `AGENT_MCP_QUOTA_CHECK_TIMEOUT` | all | `5` | Seconds the [dispatch guard](#dispatch-guard) may spend reading the target pool's live quota; `0` skips the reading and honours only recorded limit hits. |
+| `AGENT_MCP_QUOTA_WARN_PERCENT` | all | `10` | Under this much left in the target pool, a dispatch proceeds with a `Quota: LOW.` warning. |
+| `AGENT_MCP_LIMIT_TTL` | all | `3600` | How long, in seconds, a usage-limit hit whose message states no reset blocks its pool. See [Limit ledger](#limit-ledger). |
 | `AGENT_MCP_RUN_RETENTION_DAYS` | all | `7` | Finished records and their `.out`/`.err` files are pruned after this long, at server start. `0` keeps them forever. |
 | `AGENT_MCP_SERVER_IDLE_EXIT` | all | `1800` | The server exits after this many seconds with no tool call, so a session left open for hours stops holding it; Claude Code starts a fresh one on that session's next call. Never fires while a run the server started is still live. `0` keeps the server for the life of the session. |
 
@@ -817,7 +820,7 @@ stable shape (schema 1) for scripts such as a quota-check skill:
               "windows": [{"pool": "Gemini Models", "window": "weekly",
                            "used_percent": 1.1, "left_percent": 98.9,
                            "resets_at": "2026-11-23T23:11:27Z",
-                           "reset_passed": false}],
+                           "reset_passed": false, "not_started": false}],
               "extra": {}}]}
 ```
 
@@ -828,6 +831,56 @@ stable shape (schema 1) for scripts such as a quota-check skill:
 bumps it. The full contract is the docstring at the top of `quota_sources.py`.
 Claude's own usage and the web-only pages (opencode console, ChatGPT usage
 settings) are out of scope.
+
+#### Limit ledger
+
+A run that ends on a usage-limit failure is recorded in a small ledger,
+`<AGENT_MCP_RUN_DIR>/quota/limits.json`, shared by all three servers like the run
+store. The failure is the fail-fast stderr line, or for codex the `error` /
+`turn.failed` event on stdout, or a limit line further up stderr. Auth failures
+and per-minute rate limits (`rate limit reached`, a bare `RESOURCE_EXHAUSTED`, a
+quota error naming a per-minute or per-second metric) are not
+limit hits and are not recorded; agy's live reading still catches a real wall.
+A run that exits 0 records nothing, whatever errors it recovered from, unless
+its fail-fast line was itself a limit line. Each entry names the CLI and the **pool** the model draws on:
+
+| CLI | Pool |
+|---|---|
+| agy | `Claude and GPT models` for `claude-*` and `gpt-*` ids, `Gemini 4 Argon` for Argon, `Gemini Models` for every other Gemini id (the names match agy's `/usage` groups; Argon's group is listed only on accounts that have it) |
+| codex | `codex`: every model shares the ChatGPT-plan pool |
+| opencode | `opencode-go` for every `opencode-go/` model (one Go plan pool: the console reports one set of figures and a limit on one Go model has blocked the others); any other id is its own pool |
+
+A hit whose message states a reset (an ISO time, local when it has no offset;
+`in 2 hours 5 minutes`, `in 2h 5m`, `in 1.5s`; `at 3:05 PM`, `at Nov 25th, 2026
+1:07 PM`), after a phrase such as "resets" or "try again", blocks its pool until
+then, counted from when the message was written. One without a reset blocks it for
+`AGENT_MCP_LIMIT_TTL` seconds (default 3600), is then reported as stale until a day
+(or the TTL, if longer) has passed, and is dropped. A later run on the same pool that exits 0 clears an older
+hit. `check_run` says when a run was recorded, and `quota_status` lists every
+hit under its source, including sources that are otherwise unavailable; in JSON
+they are `extra.limit_hits`. An entry keeps only the matched error line, cut to
+300 characters.
+
+#### Dispatch guard
+
+Every `dispatch_*` call checks the pool its model draws on before starting
+anything, reading only its own CLI: agy's `/usage` for the matching group, the
+Codex snapshot (with its age), and for opencode only the ledger, since it has no
+headless figure. A dispatch that starts leads its result with one `Quota:` line
+(none if `quota_sources.py` is missing).
+
+| Finding | What happens |
+|---|---|
+| an active ledger hit on the pool, or a live window at 0% left whose reset has not passed | refused, naming the pool, the error line or window and the reset; nothing starts. `force=True` dispatches anyway and says so |
+| under `AGENT_MCP_QUOTA_WARN_PERCENT` (default 10) left | dispatched, with `Quota: LOW.` |
+| unreadable, timed out, or no figure | dispatched, with `quota unknown (<reason>)` |
+
+agy's `/usage` call is bounded by `AGENT_MCP_QUOTA_CHECK_TIMEOUT` (default 5 s; it
+takes about 2 s); the Codex snapshot is a local file read. `0` skips both live
+readings and leaves only the ledger. A pool `/usage` does not list (Argon, on an
+account without that group) reads as unknown and is never refused on a live
+figure. A pool the guard blocks on an unknown reset
+clears when a forced run on it exits 0.
 
 Rough request budget for the `opencode-go` tier, per 5 hours. Measured against
 the ids current in **2026-08**, and the roster is the newer document — where a
@@ -949,6 +1002,18 @@ claude mcp add opencode-wrapper -s user \
 
 Tags are `agent-delegation--v<version>`. Only versions with something a user has
 to act on are written up here; the rest is `git log` between tags.
+
+### 1.13.0 (2026-11-24)
+
+**Dispatches check quota first.** Each `dispatch_*` reads the pool its model
+draws on and refuses one that is at 0% or has hit its usage limit and not yet
+reset; `force=True` overrides. Every result now starts with a `Quota:` line. If
+you script around dispatch results, expect that line, and a refusal where you
+used to get a run that died in seconds. See [Dispatch guard](#dispatch-guard).
+
+**Limit hits are remembered.** A run that dies on a usage limit is recorded per
+pool in `<run dir>/quota/limits.json` until its reset, across sessions, and
+`quota_status` lists it. See [Limit ledger](#limit-ledger).
 
 ### 1.12.0 (2026-11-16)
 
