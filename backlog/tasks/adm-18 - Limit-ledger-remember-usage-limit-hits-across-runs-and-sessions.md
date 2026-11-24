@@ -1,11 +1,11 @@
 ---
 id: ADM-18
 title: 'Limit ledger: remember usage-limit hits across runs and sessions'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-24T17:24:00Z'
-updated_date: '2026-11-24T17:34:00Z'
+updated_date: '2026-11-24T17:54:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -21,13 +21,13 @@ When a delegate hits a provider usage limit, the wrapper fails the run fast (fat
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A run that ends on a usage-limit failure (any of the three CLIs, including codex quota errors reported only as stdout JSON events) adds a ledger entry with CLI, pool, hit time, the reset time when the message states one, and the run id; auth failures are not recorded as limit hits
-- [ ] #2 The pool is derived from the run model: agy by model family (Gemini, Argon, Claude and GPT), Codex as one pool, opencode per model with known shared pools grouped
-- [ ] #3 The ledger lives beside the run store, honours AGENT_MCP_RUN_DIR, is written atomically, and is never picked up as a run record or removed by pruning
-- [ ] #4 An entry with a known reset stops counting once that time passes; one without a reset counts for a fixed default period, then is reported as a stale hit until it ages out
-- [ ] #5 quota_status shows active ledger entries per source, in both table and JSON output, as a compatible schema 1 addition
-- [ ] #6 The ledger stores no prompt, transcript or output text beyond the single matched error line
-- [ ] #7 Tests cover recording from each CLI, reset parsing, expiry, a corrupt or missing ledger, and isolation from run listing and pruning
+- [x] #1 A run that ends on a usage-limit failure (any of the three CLIs, including codex quota errors reported only as stdout JSON events) adds a ledger entry with CLI, pool, hit time, the reset time when the message states one, and the run id; auth failures are not recorded as limit hits
+- [x] #2 The pool is derived from the run model: agy by model family (Gemini, Argon, Claude and GPT), Codex as one pool, opencode per model with known shared pools grouped
+- [x] #3 The ledger lives beside the run store, honours AGENT_MCP_RUN_DIR, is written atomically, and is never picked up as a run record or removed by pruning
+- [x] #4 An entry with a known reset stops counting once that time passes; one without a reset counts for a fixed default period, then is reported as a stale hit until it ages out
+- [x] #5 quota_status shows active ledger entries per source, in both table and JSON output, as a compatible schema 1 addition
+- [x] #6 The ledger stores no prompt, transcript or output text beyond the single matched error line
+- [x] #7 Tests cover recording from each CLI, reset parsing, expiry, a corrupt or missing ledger, and isolation from run listing and pruning
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -44,4 +44,14 @@ When a delegate hits a provider usage limit, the wrapper fails the run fast (fat
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-24: implemented on claude/ADM-18-limit-ledger. Full suite 163 tests OK (6 agy-only skips), plugin validate passes, real ~/.agent-delegation-mcp ledger untouched by tests. Merges together with ADM-19 as 1.13.0.
+
+Default (change if wrong): opencode-go/* is ONE pool (console shows one set of Go figures, error says 'Go usage limit', opencode docstring says siblings go out together), overriding MODEL-ROSTER's per-model note. Per-minute rate limits are not limit hits. Unknown-reset TTL 3600s (AGENT_MCP_LIMIT_TTL).
+Three fresh-context review rounds; fixes: clean exit wins over recovered codex error events, stderr-tail fallback when a sibling finalizes, cancel_run notes, reset read only after a reset phrase and counted from the line's write time, local naive ISO, older late hit never replaces a newer one.
+Known, left as is: a failed ledger write is not retried (latched before write); a 'retrying in 5s' line records a 5s reset that expires at once; the stderr fallback uses the broader limit regex.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Usage-limit hits are recorded per CLI and pool in <run dir>/quota/limits.json by whichever server finalizes the run (fatal stderr line, stderr tail, or codex stdout error event), with the stated reset parsed from the message. Hits expire at the reset, or after the TTL then a stale period; a clean exit on the pool clears older hits. quota_status shows them per source (extra.limit_hits). Tests: test_quota_sources LedgerTests and run-store ledger tests in all three servers.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -1,11 +1,11 @@
 ---
 id: ADM-22
 title: 'quota_status: unstarted agy pool shows a 1970 reset as "reset since snapshot"'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-24T17:24:00Z'
-updated_date: '2026-11-24T17:37:00Z'
+updated_date: '2026-11-24T17:54:00Z'
 labels: []
 dependencies: []
 priority: low
@@ -21,6 +21,12 @@ agy /usage returns reset_time 1970-01-01T00:00:00Z for a pool whose window has n
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A reset time at or before the Unix epoch (or missing) for an agy bucket is reported as window not started, with no reset date and no "reset since snapshot" note
-- [ ] #2 A test covers the unstarted-pool shape
+- [x] #1 A reset time at or before the Unix epoch (or missing) for an agy bucket is reported as window not started, with no reset date and no "reset since snapshot" note
+- [x] #2 A test covers the unstarted-pool shape
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+An agy bucket with an epoch reset has resets_at null, reset_passed false and not_started true; the table shows 'window not started' instead of a 1970 date and 'reset since snapshot'. Test: test_unstarted_pool_has_no_reset.
+<!-- SECTION:FINAL_SUMMARY:END -->
