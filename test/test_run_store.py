@@ -639,6 +639,24 @@ class RunStoreTests(unittest.TestCase):
         self.run_id_from(out)
 
 
+    def test_limit_line_missed_by_the_fatal_scan_is_still_recorded(self):
+        # A sibling server can finalize a run while its live owner is the one
+        # meant to scan stderr, leaving fatal_line unset.
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        err = os.path.join(self.tmp, "late.stderr")
+        with open(err, "w") as fh:
+            fh.write("step 1\nError: usage limit reached, try again in 1 hour\nbye\n")
+        record = {"run_id": "r-late", "cli": mod.CLI_LABEL, "model": self.default_model(mod),
+                  "state": "finished", "verdict": "exited", "exit_code": None,
+                  "fatal_line": None, "stderr_path": err,
+                  "stdout_path": os.path.join(self.tmp, "none.out")}
+        mod._note_limit(record)
+        self.assertEqual(record["limit_pool"],
+                         q.pool_for(mod.CLI_LABEL, self.default_model(mod)))
+        self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
+
+
     def test_idle_exit_after_limit_without_calls(self):
         mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
         now = mod._last_call
@@ -800,6 +818,17 @@ class CodexRunStoreTests(RunStoreTests):
         self.assertTrue(out.startswith("Refusing to dispatch: codex pool 'codex': 0% left "
                                        "of the 5h window"), out[:300])
         self.assertIn("reading 0m old", out)
+
+    def test_recovered_error_event_with_a_clean_exit_records_nothing(self):
+        sys.path.insert(0, ROOT)
+        import quota_sources as q
+        mod = self.server(
+            """echo '{"type":"error","message":"You have hit your usage limit. Retrying."}'\n"""
+            """echo '{"type":"turn.completed"}'\n"""
+            "exit 0\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("exited 0", out)
+        self.assertEqual(q.limit_hits(root=self.run_dir), [])
 
     def test_session_file_counts_as_activity(self):
         tid = "0000aaaa-bbbb-cccc-dddd-eeeeffff0000"

@@ -310,10 +310,12 @@ class LedgerTests(unittest.TestCase):
 
     def test_limit_lines_exclude_auth(self):
         for line in ("AI.Error: Go usage limit exceeded", "You have hit your usage limit.",
-                     "429 RESOURCE_EXHAUSTED", "quota exceeded for model",
+                     "quota exceeded for model",
                      "insufficient credit balance"):
             self.assertTrue(q.is_limit_line(line), line)
+        # Per-minute rate limits clear in seconds and must not block a pool.
         for line in ("invalid api key", "authentication failed", "AI_APICallError: bad request",
+                     "429 RESOURCE_EXHAUSTED", "Rate limit reached, try again in 1.5s",
                      "", None):
             self.assertFalse(q.is_limit_line(line), line)
 
@@ -335,6 +337,15 @@ class LedgerTests(unittest.TestCase):
         dated = (base + q._dt.timedelta(days=2)).replace(second=0, microsecond=0)
         self.assertEqual(q.parse_reset(dated.strftime("try again at %b %d, %Y %I:%M %p"), NOW),
                          dated.timestamp())
+        self.assertEqual(q.parse_reset("try again in 1.5s", NOW), NOW + 1.5)
+        # A leading log timestamp (past) must not hide the stated reset.
+        self.assertEqual(q.parse_reset("2026-01-10T10:00:00Z ERROR usage limit reached, "
+                                       "resets in 2 hours", NOW), NOW + 7200)
+        # An ISO time without an offset is local, as the CLIs print it.
+        local = (q._dt.datetime.fromtimestamp(NOW) + q._dt.timedelta(hours=3)).replace(
+            microsecond=0)
+        self.assertEqual(q.parse_reset("resets at " + local.strftime("%Y-%m-%d %H:%M:%S"), NOW),
+                         local.timestamp())
         for text in ("usage limit reached", "try again in 2 months",
                      "resets at 2025-01-01T00:00:00Z",          # past
                      "try again in 400 days"):                  # too far
@@ -361,6 +372,10 @@ class LedgerTests(unittest.TestCase):
         try:
             self.hit()
             self.assertEqual(q.limit_hits(NOW + 61, root=self.root)[0]["state"], "stale")
+            # A TTL longer than the stale period still blocks for all of it.
+            os.environ["AGENT_MCP_LIMIT_TTL"] = str(2 * q.STALE_SECONDS)
+            self.assertEqual(q.limit_hits(NOW + q.STALE_SECONDS + 60,
+                                          root=self.root)[0]["state"], "active")
         finally:
             del os.environ["AGENT_MCP_LIMIT_TTL"]
 

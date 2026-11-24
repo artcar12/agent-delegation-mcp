@@ -837,8 +837,10 @@ settings) are out of scope.
 A run that ends on a usage-limit failure is recorded in a small ledger,
 `<AGENT_MCP_RUN_DIR>/quota/limits.json`, shared by all three servers like the run
 store. The failure is the fail-fast stderr line, or for codex the `error` /
-`turn.failed` event on stdout. Auth failures are not limit hits and are not
-recorded. Each entry names the CLI and the **pool** the model draws on:
+`turn.failed` event on stdout, or a limit line further up stderr. Auth failures
+and per-minute rate limits (`rate limit reached`, `RESOURCE_EXHAUSTED`) are not
+limit hits and are not recorded; agy's live reading still catches a real wall.
+A run that exits 0 records nothing, whatever errors it recovered from. Each entry names the CLI and the **pool** the model draws on:
 
 | CLI | Pool |
 |---|---|
@@ -846,10 +848,11 @@ recorded. Each entry names the CLI and the **pool** the model draws on:
 | codex | `codex`: every model shares the ChatGPT-plan pool |
 | opencode | `opencode-go` for every `opencode-go/` model (one Go plan pool: the console reports one set of figures and a limit on one Go model has blocked the others); any other id is its own pool |
 
-A hit whose message states a reset (an ISO time, `in 2 hours 5 minutes`, `in 2h
-5m`, `at 3:05 PM`) blocks its pool until then. One without a reset blocks it for
-`AGENT_MCP_LIMIT_TTL` seconds (default 3600), is then reported as stale for up to
-a day, and is dropped. A later run on the same pool that exits 0 clears an older
+A hit whose message states a reset (an ISO time, local when it has no offset;
+`in 2 hours 5 minutes`, `in 2h 5m`, `in 1.5s`; `at 3:05 PM`) blocks its pool until
+then. One without a reset blocks it for
+`AGENT_MCP_LIMIT_TTL` seconds (default 3600), is then reported as stale until a day
+(or the TTL, if longer) has passed, and is dropped. A later run on the same pool that exits 0 clears an older
 hit. `check_run` says when a run was recorded, and `quota_status` lists every
 hit under its source, including sources that are otherwise unavailable; in JSON
 they are `extra.limit_hits`. An entry keeps only the matched error line, cut to

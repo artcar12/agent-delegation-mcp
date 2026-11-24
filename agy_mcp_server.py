@@ -657,7 +657,19 @@ def _note_limit(record: dict) -> None:
     try:
         cli = record.get("cli", CLI_LABEL)
         model = record.get("model", "")
+        if record.get("verdict") == "exited" and record.get("exit_code") == 0:
+            # A clean exit proves the pool works, whatever errors the run
+            # recovered from on the way (codex logs retries as error events).
+            quota.clear_limit_hit(cli, model, record.get("started_at") or 0, root=RUN_DIR)
+            return
         line = record.get("fatal_line") or ""
+        if not quota.is_limit_line(line):
+            # The fatal scan can miss a line: a sibling server may finalize
+            # the run while its live owner is the one meant to scan stderr.
+            for cand in reversed(_tail(record.get("stderr_path", ""), 50).splitlines()):
+                if quota.is_limit_line(cand):
+                    line = cand.strip()
+                    break
         if not quota.is_limit_line(line) and cli == "codex":
             # codex reports its quota wall as a JSON event on stdout.
             line = _codex_error(record.get("stdout_path", ""))
@@ -667,8 +679,6 @@ def _note_limit(record: dict) -> None:
             if entry:
                 record["limit_pool"] = entry["pool"]
                 record["limit_resets_at"] = entry["resets_at"]
-        elif record.get("verdict") == "exited" and record.get("exit_code") == 0:
-            quota.clear_limit_hit(cli, model, record.get("started_at") or 0, root=RUN_DIR)
     except Exception:
         pass
 
@@ -1103,9 +1113,9 @@ def _deadlines(timeout_seconds, idle_seconds):
     return timeout, idle, None
 
 
-# Seconds the dispatch guard may spend reading the target pool's live quota
-# (agy /usage, the Codex snapshot). 0 skips the live reading; recorded limit
-# hits are still honoured.
+# Seconds the dispatch guard may spend on agy's /usage. The Codex snapshot is
+# a local file read and is not bounded by it. 0 skips both live readings;
+# recorded limit hits are still honoured.
 QUOTA_CHECK_TIMEOUT = _int_env("AGENT_MCP_QUOTA_CHECK_TIMEOUT", 5, allow_zero=True)
 
 
@@ -1444,6 +1454,7 @@ def cancel_run(run_id: str) -> str:
     if record.get("state") != "running":
         return "Already ended - nothing to cancel.\n\n" + _report(record, tail_lines=20)
     _terminate(record, "cancelled")
+    _note_limit(record)
     _seal_git_guard(record)
     _write_record(record)
     _live.pop(run_id, None)

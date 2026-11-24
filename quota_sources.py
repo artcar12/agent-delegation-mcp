@@ -496,9 +496,12 @@ def pool_for(cli: str, model: str) -> str:
 
 # What counts as a quota wall, as opposed to the other fatal lines (auth, a
 # bad key), which are not limits and must never block a pool.
+# Per-minute rate limits ("rate limit reached", RESOURCE_EXHAUSTED) are left
+# out on purpose: they clear in seconds, and blocking a pool for the TTL on
+# one would cost far more than the run it lost. agy's live /usage reading
+# still shows a real wall as 0% left.
 _LIMIT_HIT = re.compile(
-    r"usage limit|quota exceeded|exceeded (?:your |the )?quota|insufficient credit"
-    r"|rate limit (?:reached|exceeded)|resource[_ ]exhausted", re.I)
+    r"usage limit|quota exceeded|exceeded (?:your |the )?quota|insufficient credit", re.I)
 
 
 def is_limit_line(line) -> bool:
@@ -509,8 +512,8 @@ _ISO_IN_TEXT = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _REL_UNIT = r"(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)"
-_REL = re.compile(r"\bin\s+((?:\d+\s*" + _REL_UNIT + r"\b[\s,]*(?:and\s+)?)+)", re.I)
-_REL_PART = re.compile(r"(\d+)\s*(" + _REL_UNIT + r")\b", re.I)
+_REL = re.compile(r"\bin\s+((?:\d+(?:\.\d+)?\s*" + _REL_UNIT + r"\b[\s,]*(?:and\s+)?)+)", re.I)
+_REL_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(" + _REL_UNIT + r")\b", re.I)
 _MONTHS = {m: i + 1 for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
 _CLOCK = re.compile(
@@ -520,33 +523,37 @@ _CLOCK = re.compile(
 
 def parse_reset(line: str, now: float):
     """Epoch seconds of the reset a limit message states, or None. Understands
-    an ISO time, "in 2 hours 5 minutes" / "in 2h 5m", and "at 3:05 PM" or
-    "at Nov 25th, 2026 1:07 PM" (local time, as the CLIs print it). Anything
-    in the past or more than MAX_RESET_AHEAD away is treated as unknown."""
+    ISO times ("2026-11-24T18:00:00Z"; one with no offset is local time, as
+    the CLIs print it), "in 2 hours 5 minutes" / "in 2h 5m" / "in 1.5s", and
+    "at 3:05 PM" or "at Nov 25th, 2026 1:07 PM" (local). Every candidate is
+    read, since a line can start with its own log timestamp; the earliest one
+    in the future and within MAX_RESET_AHEAD wins, else None."""
     if not isinstance(line, str):
         return None
-    ts = None
-    m = _ISO_IN_TEXT.search(line)
-    if m:
+    found = []
+    for m in _ISO_IN_TEXT.finditer(line):
         text = m.group(0).replace(" ", "T")
-        if not re.search(r"(Z|[+-]\d{2}:?\d{2})$", text):
-            text += "Z"
-        ts = _parse_iso(text)
-    if ts is None:
-        m = _REL.search(line)
-        if m:
-            ts = now + sum(int(n) * _UNIT_SECONDS[u[0].lower()]
-                           for n, u in _REL_PART.findall(m.group(1)))
-    if ts is None:
-        m = _CLOCK.search(line)
-        if m:
-            ts = _clock_time(m, now)
-    if ts is None or ts <= now or ts - now > MAX_RESET_AHEAD:
-        return None
-    return ts
+        if re.search(r"(Z|[+-]\d{2}:?\d{2})$", text):
+            found.append(_parse_iso(text))
+        else:
+            try:
+                found.append(_dt.datetime.fromisoformat(text).timestamp())  # naive: local
+            except ValueError:
+                pass
+    m = _REL.search(line)
+    if m:
+        found.append(now + sum(float(n) * _UNIT_SECONDS[u[0].lower()]
+                               for n, u in _REL_PART.findall(m.group(1))))
+    m = _CLOCK.search(line)
+    if m:
+        found.append(_clock_time(m, now))
+    good = [t for t in found if t is not None and now < t <= now + MAX_RESET_AHEAD]
+    return min(good) if good else None
 
 
 def _clock_time(m, now):
+    """Local wall-clock time -> epoch seconds. Naive datetimes throughout, so
+    .timestamp() applies the offset in force on that date (DST included)."""
     mon, day, year, hour, minute, ampm = m.groups()
     hour, minute = int(hour), int(minute)
     if ampm:
@@ -555,7 +562,7 @@ def _clock_time(m, now):
         hour = hour % 12 + (12 if ampm.lower() == "p" else 0)
     if hour > 23 or minute > 59:
         return None
-    base = _dt.datetime.fromtimestamp(now).astimezone()
+    base = _dt.datetime.fromtimestamp(now)
     try:
         if mon:
             month = _MONTHS.get(mon[:3].lower())
@@ -593,7 +600,7 @@ def _expired(entry, now):
     reset = _parse_iso(entry.get("resets_at"))
     if reset is not None:
         return reset <= now
-    return now - hit > STALE_SECONDS
+    return now - hit > max(STALE_SECONDS, limit_ttl())
 
 
 def _ledger_update(fn, now, root=None):
