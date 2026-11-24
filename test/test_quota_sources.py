@@ -291,9 +291,9 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(q.pool_for("agy", "gpt-oss-120b-medium"), q.AGY_CLAUDE_GPT)
         self.assertEqual(q.pool_for("agy", "gemini-4-argon-high"), q.AGY_ARGON)
         self.assertEqual(q.pool_for("agy", "gemini-3.8-flash-high"), q.AGY_GEMINI)
-        self.assertEqual(q.pool_for("opencode", "opencode-go/kimi-k3"), "opencode-go/kimi-k3")
-        self.assertEqual(q.pool_for("opencode", "opencode-go/longcat-2.0"),
-                         q.pool_for("opencode", "opencode-go/qwen3.8-max"))
+        self.assertEqual(q.pool_for("opencode", "opencode-go/kimi-k3"), "opencode-go")
+        self.assertEqual(q.pool_for("opencode", "opencode-go/longcat-2.0"), "opencode-go")
+        self.assertEqual(q.pool_for("opencode", "opencode/big-pickle"), "opencode/big-pickle")
         self.assertEqual(q.pool_for("opencode", ""), "default model")
 
     def test_limit_lines_exclude_auth(self):
@@ -414,7 +414,7 @@ class LedgerTests(unittest.TestCase):
         table = q.render_table(doc)
         self.assertIn("LIMIT HIT, blocked until reset", table)
         self.assertIn("unavailable: no session files", table)
-        self.assertIn("opencode-go/kimi-k3", table)
+        self.assertIn("opencode-go ", table)
         self.assertIn("stale, not blocking", table)
 
 

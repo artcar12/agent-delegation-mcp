@@ -1,9 +1,11 @@
 ---
 id: ADM-19
 title: 'Dispatch guard: check the target pool before dispatching'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-24T17:24:00Z'
+updated_date: '2026-11-24T17:34:00Z'
 labels: []
 dependencies:
   - ADM-18

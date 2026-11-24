@@ -208,9 +208,9 @@ def agy_bin():
     return os.environ.get("AGY_BIN", "").strip() or shutil.which("agy") or "agy"
 
 
-def collect_agy(now: float):
-    stdout, err = _run([agy_bin(), "-p", "/usage", "--output-format", "json"],
-                       env=_child_env())
+def collect_agy(now: float, bin_path=None, timeout=CMD_TIMEOUT):
+    stdout, err = _run([bin_path or agy_bin(), "-p", "/usage", "--output-format", "json"],
+                       timeout=timeout, env=_child_env())
     if err:
         return _source("agy", reason=err)
     try:
@@ -462,12 +462,11 @@ def ledger_path(root=None):
 AGY_CLAUDE_GPT = "Claude and GPT models"
 AGY_ARGON = "Gemini 4 Argon"
 AGY_GEMINI = "Gemini Models"
-# OpenCode Go meters each model separately, except these, which share a cap
-# (MODEL-ROSTER.md, "OpenCode Go quota mechanics").
-OPENCODE_SHARED = {
-    "qwen3.8-max": "qwen3.8-max+longcat-2.0",
-    "longcat-2.0": "qwen3.8-max+longcat-2.0",
-}
+# OpenCode Go: one pool for the whole plan. The roster lists per-model caps,
+# but the console reports one set of Go percentages, the error reads "Go usage
+# limit exceeded", and a limit on one Go model has taken its siblings out with
+# it. Other opencode providers (the free Zen ids) are taken per model.
+OPENCODE_GO = "opencode-go"
 
 
 def pool_for(cli: str, model: str) -> str:
@@ -485,9 +484,9 @@ def pool_for(cli: str, model: str) -> str:
     if cli == "opencode":
         if not m or m.startswith("("):
             return "default model"
-        provider, _, name = m.rpartition("/")
-        group = OPENCODE_SHARED.get(name.lower())
-        return f"{provider}/{group}" if group and provider else (group or m)
+        if low.startswith(OPENCODE_GO + "/"):
+            return OPENCODE_GO
+        return m
     return m or cli
 
 
@@ -674,6 +673,83 @@ def active_limit(cli, model, now=None, root=None):
         if e["pool"] == pool and e["state"] == "active":
             return e
     return None
+
+
+# ---------------------------------------------------------------------------
+# dispatch guard
+#
+# What a dispatch needs to know about the one pool it is about to draw on,
+# read from that CLI only and bounded by a short timeout: a guard that slows
+# every dispatch, or blocks one on an unreadable source, costs more than it
+# saves.
+
+def warn_percent():
+    """Below this much left, a dispatch proceeds with a warning."""
+    return max(0, _int_env("AGENT_MCP_QUOTA_WARN_PERCENT", 10))
+
+
+def _fmt_age(seconds):
+    s = int(max(0, seconds))
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def pool_check(cli, model, now=None, root=None, timeout=5, agy=None, codex_home=None):
+    """{"pool", "status": "ok"|"low"|"exhausted"|"unknown", "note": str,
+    "hit": ledger entry|None}. "exhausted" means refuse: an active ledger hit
+    on the pool, or a live window at 0% left whose reset has not passed.
+    timeout=0 skips the live reading (the ledger is still read). Never
+    raises."""
+    now = time.time() if now is None else now
+    pool = pool_for(cli, model)
+    out = {"pool": pool, "status": "unknown", "note": "", "hit": None}
+    try:
+        hit = active_limit(cli, model, now, root)
+    except Exception:
+        hit = None
+    if hit:
+        reset = hit.get("resets_at")
+        age = _fmt_age(now - (_parse_iso(hit["hit_at"]) or now))
+        out.update(status="exhausted", hit=hit, note=(
+            f"{cli} pool {pool!r} hit its usage limit {age} ago"
+            + (f"; resets {reset}" if reset else
+               f"; reset time not stated, treated as blocked for {_fmt_age(limit_ttl())}")
+            + f". Error was: {hit.get('line', '')}"))
+        return out
+    windows, as_of, reason = [], None, "no headless reading"
+    if timeout and cli == "agy":
+        src = collect_agy(now, bin_path=agy, timeout=timeout)
+        reason = src["reason"]
+        windows = [w for w in src["windows"] if w["pool"] == pool]
+        as_of = src["as_of"]
+    elif timeout and cli == "codex":
+        src = collect_codex(now, home=codex_home or "")
+        reason = src["reason"]
+        windows = src["windows"]
+        as_of = src["as_of"]
+    elif cli == "opencode":
+        reason = "opencode reports no remaining quota headlessly; only recorded hits count"
+    elif not timeout:
+        reason = "live reading off"
+    if not windows:
+        out["note"] = f"{cli} pool {pool!r}: quota unknown ({reason or 'no window for this pool'})"
+        return out
+    w = min(windows, key=lambda w: w["left_percent"])
+    stale = ""
+    if cli == "codex" and as_of:
+        stale = f", reading {_fmt_age(now - (_parse_iso(as_of) or now))} old"
+    desc = (f"{cli} pool {pool!r}: {w['left_percent']:g}% left of the {w['window']} window"
+            + (f", resets {w['resets_at']}" if w.get("resets_at") else "") + stale)
+    if w["left_percent"] <= 0 and not w["reset_passed"]:
+        out.update(status="exhausted", note=desc)
+    elif w["left_percent"] < warn_percent():
+        out.update(status="low", note=desc)
+    else:
+        out.update(status="ok", note=desc)
+    return out
 
 
 # ---------------------------------------------------------------------------

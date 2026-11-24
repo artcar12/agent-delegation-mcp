@@ -1080,7 +1080,12 @@ def _instructions() -> str:
         "- The return value is not evidence in either direction. Verify with git and by "
         "re-running the gate yourself.\n"
         "- quota_status reports agy, Codex and opencode quota in one table; check it "
-        "before a long dispatch.",
+        "before a long dispatch. Each dispatch also checks the pool its model draws "
+        "on and refuses one that is exhausted or recently hit its limit (force=True "
+        "overrides). Pools: agy has three (Gemini Models; Gemini 4 Argon; Claude and "
+        "GPT models, shared by every claude-* and gpt-* id); every Codex model shares "
+        "one ChatGPT-plan pool; every opencode-go/ model shares the OpenCode Go "
+        "plan pool.",
     ])
 
 
@@ -1126,6 +1131,38 @@ def _deadlines(timeout_seconds, idle_seconds):
     return timeout, idle, None
 
 
+# Seconds the dispatch guard may spend reading the target pool's live quota
+# (agy /usage, the Codex snapshot). 0 skips the live reading; recorded limit
+# hits are still honoured.
+QUOTA_CHECK_TIMEOUT = _int_env("AGENT_MCP_QUOTA_CHECK_TIMEOUT", 5, allow_zero=True)
+
+
+def _quota_gate(model: str, force: bool) -> tuple:
+    """(note, refusal) for the quota pool this dispatch draws on. A pool with
+    an active limit-ledger hit, or a live window at 0% left, is refused unless
+    force=True. An unreadable quota never blocks: it becomes an "unknown"
+    note. Only this server's CLI is read."""
+    quota = globals().get("_quota")
+    if quota is None:
+        return "", ""
+    try:
+        check = quota.pool_check(CLI_LABEL, model, root=RUN_DIR,
+                                 timeout=QUOTA_CHECK_TIMEOUT,
+                                 agy=globals().get("AGY_BIN"), codex_home=CODEX_HOME)
+    except Exception:
+        return "Quota: unknown (the check failed).", ""
+    status, note = check["status"], check["note"]
+    if status == "exhausted" and not force:
+        return "", (f"Refusing to dispatch: {note}\n\nNothing was started. Wait for the "
+                    "reset, pick a model on another pool or another tool (quota_status "
+                    "shows them all), or pass force=True to dispatch anyway.")
+    if status == "exhausted":
+        return f"Quota: EXHAUSTED, dispatched anyway (force=True). {note}", ""
+    if status == "low":
+        return f"Quota: LOW. {note}", ""
+    return f"Quota: {note}", ""
+
+
 # Stands in for the -o path in argv until _dispatch knows the run id. Compared
 # by identity, so a prompt that happens to equal the text cannot be replaced.
 LAST_MESSAGE = object()
@@ -1157,6 +1194,11 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
                     "Concurrent load on one provider is a common reason a run dies, and "
                     "these share a quota pool. check_run one of the above, cancel_run it, "
                     "or pass force=True if you have a reason to overlap them.")
+
+    quota_note, refusal = _quota_gate(model, force)
+    if refusal:
+        return refusal
+    lead = f"{quota_note}\n\n" if quota_note else ""
 
     global _SERVER_IDENTITY
     _SERVER_IDENTITY = _SERVER_IDENTITY or _proc_identity(os.getpid())
@@ -1241,12 +1283,12 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
             time.sleep(min(POLL_SECONDS, max(deadline - time.time(), 0.05)))
             current = _read_record(run_id)
             if current and current.get("state") != "running":
-                return _report(current)
+                return lead + _report(current)
         current = _read_record(run_id) or record
-        return (f"Still running after {wait_seconds}s - the run is unaffected, only the "
+        return lead + (f"Still running after {wait_seconds}s - the run is unaffected, only the "
                 f"waiting stopped.\n\n{_report(current, tail_lines=20)}")
 
-    return (
+    return lead + (
         f"Dispatched {CLI_LABEL} ({model}) in {cwd}.\n"
         f"  run id: {run_id}\n"
         f"  stdout: {out_path}\n\n"
@@ -1322,6 +1364,15 @@ def dispatch_codex(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAULT_C
     DELIVERABLE GOES IN A FILE. Brief the delegate to write its result to
     `.agent-runs/<topic>-codex-<model>.md` and to append one line per phase to
     `.agent-runs/<topic>.log`.
+
+    QUOTA GUARD: every dispatch first checks the pool its model draws on
+    (every Codex model shares one ChatGPT-plan pool, read from the last
+    Codex session's snapshot), and the limit ledger of past usage-limit
+    hits. A pool at 0% left, or one that hit its limit and has not reset,
+    is refused with the reason and reset time; force=True dispatches
+    anyway. Under AGENT_MCP_QUOTA_WARN_PERCENT (default 10) percent left,
+    the result warns. A quota line heads every result; an unreadable quota
+    never blocks.
 
     ONE DISPATCH AT A TIME, enforced: a second concurrent codex run is
     refused, naming the live one, unless you pass force=True.
