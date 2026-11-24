@@ -38,7 +38,9 @@ JSON (format="json") is schema 1:
 extra: agy {} ; codex {"plan_type", "credits": {...}, "limit_reached": str|null,
 "snapshot_used_percent": {pool: float}} ; opencode {"today": {...},
 "last_7_days": {...}, "last_limit_exceeded_at": ISO-UTC|null}, where each
-period is {"sessions", "steps", "tokens", "cost_usd"}.
+period is {"sessions", "steps", "tokens", "cost_usd"}. Every source's extra
+also carries "limit_hits": [{"cli", "pool", "model", "hit_at", "resets_at",
+"line", "run_id", "state": "active"|"stale"}] from the limit ledger below.
 
 Adding a field is compatible; renaming or removing one bumps "schema".
 """
@@ -52,6 +54,11 @@ import shutil
 import subprocess
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:          # not on POSIX: the ledger still works, unlocked
+    fcntl = None
 
 SCHEMA = 1
 CMD_TIMEOUT = 30
@@ -403,13 +410,281 @@ def collect_opencode(now: float):
 
 
 # ---------------------------------------------------------------------------
+# limit ledger
+#
+# A usage-limit hit is final for its pool until the provider resets it, but a
+# run that hits one is otherwise forgotten the moment it ends: the next
+# dispatch, from this session or another, walks into the same wall. The
+# servers record each hit here when a run ends (see _note_limit in each
+# server), and quota_status reports them. For opencode a recorded hit is the
+# only headless signal there is.
+#
+# The file lives in a subdirectory of the run store, so it follows
+# AGENT_MCP_RUN_DIR like the runs do, and the servers' run listing and pruning
+# (which look only at the store's top level) never see it.
+#
+# PRIVACY: an entry keeps the single matched error line, cut to LINE_MAX
+# characters, and nothing else from a run's output.
+
+LEDGER_SCHEMA = 1
+LINE_MAX = 300
+STALE_SECONDS = 86400           # an unknown-reset hit is reported this long at most
+MAX_RESET_AHEAD = 31 * 86400    # a parsed reset further out than this is not trusted
+
+
+def _int_env(name, default):
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def limit_ttl():
+    """How long a hit with no stated reset blocks its pool (seconds)."""
+    return max(0, _int_env("AGENT_MCP_LIMIT_TTL", 3600))
+
+
+def run_dir():
+    return os.path.expanduser(os.environ.get("AGENT_MCP_RUN_DIR", "").strip()
+                              or "~/.agent-delegation-mcp/runs")
+
+
+def ledger_path(root=None):
+    """The ledger file under `root` (a server passes its own RUN_DIR) or the
+    default run store."""
+    return os.path.join(root or run_dir(), "quota", "limits.json")
+
+
+# Pools as the provider meters them. agy names match its /usage groups, so a
+# hit can be set beside the live reading. Which Gemini 4 families other than
+# Argon draw on the shared Gemini pool is an assumption from /usage, which
+# lists no separate group for them.
+AGY_CLAUDE_GPT = "Claude and GPT models"
+AGY_ARGON = "Gemini 4 Argon"
+AGY_GEMINI = "Gemini Models"
+# OpenCode Go meters each model separately, except these, which share a cap
+# (MODEL-ROSTER.md, "OpenCode Go quota mechanics").
+OPENCODE_SHARED = {
+    "qwen3.8-max": "qwen3.8-max+longcat-2.0",
+    "longcat-2.0": "qwen3.8-max+longcat-2.0",
+}
+
+
+def pool_for(cli: str, model: str) -> str:
+    """The quota pool a run of `model` on `cli` draws on."""
+    m = (model or "").strip()
+    low = m.lower()
+    if cli == "codex":
+        return "codex"
+    if cli == "agy":
+        if low.startswith(("claude", "gpt")):
+            return AGY_CLAUDE_GPT
+        if "argon" in low:
+            return AGY_ARGON
+        return AGY_GEMINI
+    if cli == "opencode":
+        if not m or m.startswith("("):
+            return "default model"
+        provider, _, name = m.rpartition("/")
+        group = OPENCODE_SHARED.get(name.lower())
+        return f"{provider}/{group}" if group and provider else (group or m)
+    return m or cli
+
+
+# What counts as a quota wall, as opposed to the other fatal lines (auth, a
+# bad key), which are not limits and must never block a pool.
+_LIMIT_HIT = re.compile(
+    r"usage limit|quota exceeded|exceeded (?:your |the )?quota|insufficient credit"
+    r"|rate limit (?:reached|exceeded)|resource[_ ]exhausted", re.I)
+
+
+def is_limit_line(line) -> bool:
+    return isinstance(line, str) and bool(_LIMIT_HIT.search(line))
+
+
+_ISO_IN_TEXT = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
+_UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+_REL_UNIT = r"(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)"
+_REL = re.compile(r"\bin\s+((?:\d+\s*" + _REL_UNIT + r"\b[\s,]*(?:and\s+)?)+)", re.I)
+_REL_PART = re.compile(r"(\d+)\s*(" + _REL_UNIT + r")\b", re.I)
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
+_CLOCK = re.compile(
+    r"\bat\s+(?:([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(\d{4}),?\s+)?)?"
+    r"(\d{1,2}):(\d{2})\s*([ap])?\.?m?\.?", re.I)
+
+
+def parse_reset(line: str, now: float):
+    """Epoch seconds of the reset a limit message states, or None. Understands
+    an ISO time, "in 2 hours 5 minutes" / "in 2h 5m", and "at 3:05 PM" or
+    "at Nov 25th, 2026 1:07 PM" (local time, as the CLIs print it). Anything
+    in the past or more than MAX_RESET_AHEAD away is treated as unknown."""
+    if not isinstance(line, str):
+        return None
+    ts = None
+    m = _ISO_IN_TEXT.search(line)
+    if m:
+        text = m.group(0).replace(" ", "T")
+        if not re.search(r"(Z|[+-]\d{2}:?\d{2})$", text):
+            text += "Z"
+        ts = _parse_iso(text)
+    if ts is None:
+        m = _REL.search(line)
+        if m:
+            ts = now + sum(int(n) * _UNIT_SECONDS[u[0].lower()]
+                           for n, u in _REL_PART.findall(m.group(1)))
+    if ts is None:
+        m = _CLOCK.search(line)
+        if m:
+            ts = _clock_time(m, now)
+    if ts is None or ts <= now or ts - now > MAX_RESET_AHEAD:
+        return None
+    return ts
+
+
+def _clock_time(m, now):
+    mon, day, year, hour, minute, ampm = m.groups()
+    hour, minute = int(hour), int(minute)
+    if ampm:
+        if hour > 12:
+            return None
+        hour = hour % 12 + (12 if ampm.lower() == "p" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    base = _dt.datetime.fromtimestamp(now).astimezone()
+    try:
+        if mon:
+            month = _MONTHS.get(mon[:3].lower())
+            if not month:
+                return None
+            when = base.replace(year=int(year) if year else base.year, month=month,
+                                day=int(day), hour=hour, minute=minute, second=0,
+                                microsecond=0)
+            if not year and when.timestamp() <= now:
+                when = when.replace(year=when.year + 1)
+            return when.timestamp()
+        when = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError:
+        return None
+    if when.timestamp() <= now:
+        when += _dt.timedelta(days=1)
+    return when.timestamp()
+
+
+def _ledger_load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []               # missing or corrupt: start clean, never raise
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict) and e.get("cli") and e.get("pool")
+            and _parse_iso(e.get("hit_at")) is not None]
+
+
+def _expired(entry, now):
+    hit = _parse_iso(entry.get("hit_at")) or 0
+    reset = _parse_iso(entry.get("resets_at"))
+    if reset is not None:
+        return reset <= now
+    return now - hit > STALE_SECONDS
+
+
+def _ledger_update(fn, now, root=None):
+    """Apply fn(entries) -> entries under an exclusive lock, dropping expired
+    entries, and write the result atomically. False if the ledger could not be
+    written; never raises."""
+    path = ledger_path(root)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".lock", "a") as lock:
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            entries = [e for e in fn(_ledger_load(path)) if not _expired(e, now)]
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"schema": LEDGER_SCHEMA, "entries": entries}, fh, indent=1)
+            os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def record_limit_hit(cli, model, line, run_id="", now=None, root=None):
+    """Record a usage-limit hit for the pool `model` draws on. Returns the
+    entry, or None when `line` is not a limit line or the write failed. A
+    newer hit replaces an older one for the same pool."""
+    if not is_limit_line(line):
+        return None
+    now = time.time() if now is None else now
+    pool = pool_for(cli, model)
+    reset = parse_reset(line, now)
+    entry = {
+        "cli": cli,
+        "pool": pool,
+        "model": model or "",
+        "hit_at": _iso(now),
+        "resets_at": _iso(reset) if reset is not None else None,
+        "line": line.strip()[:LINE_MAX],
+        "run_id": run_id or "",
+    }
+
+    def add(entries):
+        return [e for e in entries if (e["cli"], e["pool"]) != (cli, pool)] + [entry]
+
+    return entry if _ledger_update(add, now, root) else None
+
+
+def clear_limit_hit(cli, model, before, now=None, root=None):
+    """Forget a hit on this pool that happened before `before` (epoch
+    seconds): a later run on the pool finished cleanly, so the wall is gone."""
+    now = time.time() if now is None else now
+    pool = pool_for(cli, model)
+    path = ledger_path(root)
+    if not any((e["cli"], e["pool"]) == (cli, pool) for e in _ledger_load(path)):
+        return False            # nothing to clear: do not create the file
+    return _ledger_update(
+        lambda entries: [e for e in entries
+                         if (e["cli"], e["pool"]) != (cli, pool)
+                         or (_parse_iso(e["hit_at"]) or 0) >= before], now, root)
+
+
+def limit_hits(now=None, cli=None, root=None):
+    """Hits still worth reporting, each with "state": "active" (the pool is
+    blocked: before its stated reset, or within limit_ttl() of an unknown one)
+    or "stale" (reset unknown and the TTL has passed). Read-only."""
+    now = time.time() if now is None else now
+    out = []
+    for e in _ledger_load(ledger_path(root)):
+        if (cli and e["cli"] != cli) or _expired(e, now):
+            continue
+        hit = _parse_iso(e["hit_at"]) or 0
+        active = e.get("resets_at") is not None or now - hit <= limit_ttl()
+        out.append(dict(e, state="active" if active else "stale"))
+    return out
+
+
+def active_limit(cli, model, now=None, root=None):
+    """The active hit blocking `model`'s pool on `cli`, or None."""
+    pool = pool_for(cli, model)
+    for e in limit_hits(now, cli, root):
+        if e["pool"] == pool and e["state"] == "active":
+            return e
+    return None
+
+
+# ---------------------------------------------------------------------------
 # report
 
 COLLECTORS = (("agy", collect_agy), ("codex", collect_codex), ("opencode", collect_opencode))
 
 
-def collect(now=None):
-    """All sources, in parallel, each bounded by CMD_TIMEOUT."""
+def collect(now=None, root=None):
+    """All sources, in parallel, each bounded by CMD_TIMEOUT, plus the limit
+    ledger under `root` (default: the default run store)."""
     now = time.time() if now is None else now
     results = {}
 
@@ -426,6 +701,12 @@ def collect(now=None):
         t.join(CMD_TIMEOUT * 2 + 5)
     sources = [results.get(name) or _source(name, reason="timed out")
                for name, _fn in COLLECTORS]
+    for s in sources:
+        try:
+            hits = limit_hits(now, s["source"], root)
+        except Exception:                 # the ledger never takes a reading down
+            hits = []
+        s["extra"] = dict(s.get("extra") or {}, limit_hits=hits)
     return {"schema": SCHEMA, "generated_at": _iso(now), "sources": sources}
 
 
@@ -460,31 +741,9 @@ def render_table(doc: dict) -> str:
         name = s["source"]
         if s["status"] != "ok":
             rows.append((name, "-", "-", "-", "-", "-", f"unavailable: {s['reason']}"))
-            continue
-        ex = s.get("extra") or {}
-        if name == "codex":
-            note = f"as of {s['as_of']} ({_ago(s['as_of'], now)})"
-            if ex.get("plan_type"):
-                note += f"; plan {ex['plan_type']}"
-            if ex.get("limit_reached"):
-                note += f"; limit reached: {ex['limit_reached']}"
-        elif name == "opencode":
-            note = (f"today: {_period(ex.get('today'))}; 7d: {_period(ex.get('last_7_days'))}; "
-                    f"last usage-limit hit: "
-                    + (f"{ex['last_limit_exceeded_at']} ({_ago(ex['last_limit_exceeded_at'], now)})"
-                       if ex.get("last_limit_exceeded_at") else "none in log"))
         else:
-            note = ""
-        if not s["windows"]:
-            rows.append((name, "-", "-", "-", "-", "-", note))
-        for w in s["windows"]:
-            wnote = note
-            if w["reset_passed"]:
-                was = ex.get("snapshot_used_percent", {}).get(w["window"])
-                wnote = ("reset since snapshot" + (f" (was {was:g}% used)" if was is not None else "")
-                         + ("; " + note if note else ""))
-            rows.append((name, w["pool"], w["window"], f"{w['used_percent']:g}%",
-                         f"{w['left_percent']:g}%", w["resets_at"] or "-", wnote))
+            rows.extend(_window_rows(s, now))
+        rows.extend(_hit_rows(s, now))
     widths = [max(len(str(r[i])) for r in [head] + rows) for i in range(len(head) - 1)]
     lines = []
     for r in [head] + rows:
@@ -493,8 +752,53 @@ def render_table(doc: dict) -> str:
     return f"quota_status (generated {doc['generated_at']})\n" + "\n".join(lines)
 
 
-def report(fmt: str = "table", now=None) -> str:
-    doc = collect(now)
+def _hit_rows(s, now):
+    """One row per ledger hit: the pool is blocked (active) or was, with no
+    known reset (stale)."""
+    rows = []
+    for h in (s.get("extra") or {}).get("limit_hits") or []:
+        if h.get("state") == "active":
+            what = "LIMIT HIT, blocked until " + ("reset" if h.get("resets_at") else
+                                                  "the hit ages out (reset unknown)")
+        else:
+            what = "limit hit, reset unknown (stale, not blocking)"
+        rows.append((s["source"], h.get("pool", "-"), "-", "-", "-", h.get("resets_at") or "-",
+                     f"{what}; at {h.get('hit_at')} ({_ago(h.get('hit_at'), now)})"))
+    return rows
+
+
+def _window_rows(s, now):
+    rows = []
+    name = s["source"]
+    ex = s.get("extra") or {}
+    if name == "codex":
+        note = f"as of {s['as_of']} ({_ago(s['as_of'], now)})"
+        if ex.get("plan_type"):
+            note += f"; plan {ex['plan_type']}"
+        if ex.get("limit_reached"):
+            note += f"; limit reached: {ex['limit_reached']}"
+    elif name == "opencode":
+        note = (f"today: {_period(ex.get('today'))}; 7d: {_period(ex.get('last_7_days'))}; "
+                f"last usage-limit hit: "
+                + (f"{ex['last_limit_exceeded_at']} ({_ago(ex['last_limit_exceeded_at'], now)})"
+                   if ex.get("last_limit_exceeded_at") else "none in log"))
+    else:
+        note = ""
+    if not s["windows"]:
+        rows.append((name, "-", "-", "-", "-", "-", note))
+    for w in s["windows"]:
+        wnote = note
+        if w["reset_passed"]:
+            was = ex.get("snapshot_used_percent", {}).get(w["window"])
+            wnote = ("reset since snapshot" + (f" (was {was:g}% used)" if was is not None else "")
+                     + ("; " + note if note else ""))
+        rows.append((name, w["pool"], w["window"], f"{w['used_percent']:g}%",
+                     f"{w['left_percent']:g}%", w["resets_at"] or "-", wnote))
+    return rows
+
+
+def report(fmt: str = "table", now=None, root=None) -> str:
+    doc = collect(now, root)
     if (fmt or "").lower() == "json":
         return json.dumps(doc, indent=2)
     return render_table(doc)
@@ -504,8 +808,10 @@ QUOTA_DOC = """
     One table of the quota every delegate CLI reports headlessly, read without
     spending a token: agy's pools (weekly and 5-hour), Codex's 5-hour and
     weekly windows from its last session snapshot, and opencode's usage
-    summary plus its last usage-limit hit. Claude's own usage and the web-only
-    pages (opencode console, ChatGPT usage settings) are not covered here.
+    summary plus its last usage-limit hit, and every usage-limit hit a
+    delegate run has recorded in the shared limit ledger, active (the pool is
+    blocked) or stale. Claude's own usage and the web-only pages (opencode
+    console, ChatGPT usage settings) are not covered here.
 
     format="table" (default) for reading; format="json" for a stable,
     documented shape (schema 1, see quota_sources.py) that scripts and the

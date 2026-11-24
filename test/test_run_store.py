@@ -508,6 +508,63 @@ class RunStoreTests(unittest.TestCase):
 
     # -- server idle exit ---------------------------------------------------
 
+    # ------------------------------------------------------ limit ledger
+
+    def ledger(self):
+        sys.path.insert(0, ROOT)
+        import quota_sources
+        return quota_sources
+
+    def test_limit_hit_is_recorded_in_the_ledger(self):
+        q = self.ledger()
+        mod = self.server(f"echo 'Error: {self.FATAL_PHRASE}; try again in 2 hours' >&2; "
+                          "sleep 300\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._read_record(run_id)["state"] not in ("running", "stopping")))
+        record = mod._read_record(run_id)
+        hits = q.limit_hits(root=self.run_dir)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["cli"], mod.CLI_LABEL)
+        self.assertEqual(hits[0]["pool"], q.pool_for(mod.CLI_LABEL, record["model"]))
+        self.assertEqual(hits[0]["run_id"], run_id)
+        self.assertIsNotNone(hits[0]["resets_at"])
+        self.assertTrue(record["limit_noted"])
+        self.assertIn("Recorded as a usage-limit hit", mod.check_run(run_id))
+        # Beside the run store, invisible to its listing and pruning.
+        self.assertEqual(mod._record_ids(), [run_id])
+        record["ended_at"] = time.time() - 30 * 86400
+        mod._write_record(record)
+        mod._prune()
+        self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
+        self.assertIn("LIMIT HIT", mod.quota_status())
+
+    def test_auth_failure_is_not_a_limit_hit(self):
+        q = self.ledger()
+        mod = self.server("echo 'Error: invalid api key' >&2; sleep 300\n")
+        run_id = self.run_id_from(self.dispatch(mod))
+        self.assertTrue(self.wait_until(
+            lambda: mod._read_record(run_id)["state"] not in ("running", "stopping")))
+        self.assertEqual(mod._read_record(run_id)["verdict"], "fatal")
+        self.assertEqual(q.limit_hits(root=self.run_dir), [])
+
+    def test_clean_exit_clears_an_older_hit_on_the_same_pool(self):
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        model = mod.DEFAULT_MODEL or "(codex default)"
+        q.record_limit_hit(mod.CLI_LABEL, model, "usage limit reached",
+                           now=time.time() - 60, root=self.run_dir)
+        other = {"agy": "claude-opus-5-5-high"}.get(mod.CLI_LABEL, "opencode-go/kimi-k3")
+        q.record_limit_hit(mod.CLI_LABEL, other, "usage limit reached",
+                           now=time.time() - 60, root=self.run_dir)
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("exited 0", out)
+        pools = [h["pool"] for h in q.limit_hits(root=self.run_dir)]
+        self.assertNotIn(q.pool_for(mod.CLI_LABEL, model), pools)
+        if mod.CLI_LABEL != "codex":            # codex has one pool for every model
+            self.assertEqual(len(pools), 1)
+
+
     def test_idle_exit_after_limit_without_calls(self):
         mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
         now = mod._last_call
@@ -640,6 +697,18 @@ class CodexRunStoreTests(RunStoreTests):
             "exit 1\n")
         out = self.dispatch(mod, wait_seconds=10)
         self.assertIn("codex reported an error:\n  You have hit your usage limit", out)
+
+    def test_stdout_limit_event_is_recorded_in_the_ledger(self):
+        sys.path.insert(0, ROOT)
+        import quota_sources as q
+        mod = self.server(
+            """echo '{"type":"turn.started"}'\n"""
+            """echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 3 hours."}}'\n"""
+            "exit 1\n")
+        out = self.dispatch(mod, wait_seconds=10)
+        self.assertIn("Recorded as a usage-limit hit on the 'codex' pool", out)
+        hits = q.limit_hits(root=self.run_dir)
+        self.assertEqual([(h["cli"], h["pool"]) for h in hits], [("codex", "codex")])
 
     def test_session_file_counts_as_activity(self):
         tid = "0000aaaa-bbbb-cccc-dddd-eeeeffff0000"

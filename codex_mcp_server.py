@@ -580,6 +580,7 @@ def _reconcile(run_id: str):
         if not _pid_exists(record.get("pid", 0)):
             record["state"] = "killed"
             record["ended_at"] = record.get("ended_at") or time.time()
+            _note_limit(record)
             _seal_git_guard(record)
             _write_record(record)
         return record
@@ -602,6 +603,7 @@ def _reconcile(run_id: str):
             record["state"] = "finished"
             record["verdict"] = "exited"
             record["ended_at"] = time.time()
+            _note_limit(record)
             _seal_git_guard(record)
             _write_record(record)
             return record
@@ -638,10 +640,41 @@ def _reconcile(run_id: str):
 
     # A live run is reconciled once a second; rewriting an unchanged record
     # that often would be pure filesystem churn.
+    _note_limit(record)
     _seal_git_guard(record)
     if json.dumps(record, sort_keys=True) != before:
         _write_record(record)
     return record
+
+
+def _note_limit(record: dict) -> None:
+    """Tell the shared limit ledger (quota_sources.py) about a run that has
+    just ended: a usage-limit failure blocks its pool until the reset, and a
+    clean exit clears an older hit on the same pool. Once per run, latched in
+    the record so a sibling server reconciling it later does not repeat it.
+    Never raises and never changes the verdict."""
+    quota = globals().get("_quota")
+    if (quota is None or record.get("limit_noted")
+            or record.get("state") in ("running", "stopping")):
+        return
+    record["limit_noted"] = True
+    try:
+        cli = record.get("cli", CLI_LABEL)
+        model = record.get("model", "")
+        line = record.get("fatal_line") or ""
+        if not quota.is_limit_line(line) and cli == "codex":
+            # codex reports its quota wall as a JSON event on stdout.
+            line = _codex_error(record.get("stdout_path", ""))
+        if quota.is_limit_line(line):
+            entry = quota.record_limit_hit(cli, model, line, record.get("run_id", ""),
+                                           root=RUN_DIR)
+            if entry:
+                record["limit_pool"] = entry["pool"]
+                record["limit_resets_at"] = entry["resets_at"]
+        elif record.get("verdict") == "exited" and record.get("exit_code") == 0:
+            quota.clear_limit_hit(cli, model, record.get("started_at") or 0, root=RUN_DIR)
+    except Exception:
+        pass
 
 
 def _monitor(run_id: str) -> None:
@@ -873,6 +906,11 @@ def _report(record: dict, tail_lines: int = 80) -> str:
         last = _tail(_last_path(record["run_id"]), tail_lines)
         if last:
             body.append(f"--- final message (codex -o) ---\n{last}")
+    if record.get("limit_pool"):
+        body.append(f"Recorded as a usage-limit hit on the {record['limit_pool']!r} pool"
+                    + (f", reset {record['limit_resets_at']}" if record.get("limit_resets_at")
+                       else ", reset time not stated")
+                    + ". quota_status lists it until then.")
     guard = _git_guard_note(record) if state != "running" else ""
     if guard:
         body.insert(0, guard)
@@ -1480,7 +1518,7 @@ def quota_status(format: str = "table") -> str:
     if _quota is None:
         return (f"unavailable: quota_sources.py could not be imported from {_HERE} "
                 f"({_QUOTA_MISSING}). It ships beside the server files in the plugin.")
-    return _quota.report(format)
+    return _quota.report(format, root=RUN_DIR)
 
 
 quota_status.__doc__ = (_quota.QUOTA_DOC if _quota else

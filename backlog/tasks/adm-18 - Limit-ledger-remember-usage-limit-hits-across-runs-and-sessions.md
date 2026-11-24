@@ -1,9 +1,11 @@
 ---
 id: ADM-18
 title: 'Limit ledger: remember usage-limit hits across runs and sessions'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-24T17:24:00Z'
+updated_date: '2026-11-24T17:25:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -27,3 +29,13 @@ When a delegate hits a provider usage limit, the wrapper fails the run fast (fat
 - [ ] #6 The ledger stores no prompt, transcript or output text beyond the single matched error line
 - [ ] #7 Tests cover recording from each CLI, reset parsing, expiry, a corrupt or missing ledger, and isolation from run listing and pruning
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. quota_sources.py: ledger at <run dir>/quota/limits.json (subdir, so _record_ids and _prune never see it), flock-guarded read-modify-write with os.replace; pool_for(cli, model); is_limit_line (usage limit, quota exceeded, insufficient credit, rate limit, resource exhausted; never auth); parse_reset (ISO time, "in 2 hours 5 minutes", "in 2h 5m", "at 3:05 PM"); entries keyed by cli+pool, latest hit wins.
+2. Expiry: known reset -> active until then; unknown -> active for AGENT_MCP_LIMIT_TTL (default 3600s), then stale until 24h, then dropped. A later run of the same pool that exits 0 with no limit error clears an older entry.
+3. Servers (all three, identical): _note_limit(record) once per run when it leaves running, using fatal_line or, for codex, the stdout error event; latched with record["limit_noted"]. Fails soft when quota_sources is missing.
+4. quota_status: extra.limit_hits per source (schema 1 compatible), table note shows active and stale hits.
+5. Tests in test_quota_sources.py and test_run_store.py; README quota section; version bump 1.13.0 with ADM-19.
+<!-- SECTION:PLAN:END -->
