@@ -117,12 +117,13 @@ class AgyTests(unittest.TestCase):
             {"window": "weekly", "remaining_fraction": 1,
              "reset_time": "1970-01-01T00:00:00Z"}]}]}}}
         w = q.parse_agy_usage(json.dumps(doc), NOW)[0]
-        self.assertEqual((w["resets_at"], w["reset_passed"], w["left_percent"]),
-                         (None, False, 100.0))
+        self.assertEqual((w["resets_at"], w["reset_passed"], w["left_percent"],
+                          w["not_started"]), (None, False, 100.0, True))
         table = q.render_table({"generated_at": q._iso(NOW), "sources": [
             q._source("agy", windows=[w], as_of=q._iso(NOW))]})
         self.assertNotIn("1970", table)
         self.assertNotIn("reset since snapshot", table)
+        self.assertIn("window not started", table)
 
     def test_missing_cli_is_unavailable(self):
         saved = os.environ.get("AGY_BIN")
@@ -281,7 +282,7 @@ class ReportTests(unittest.TestCase):
         src = doc["sources"][0]
         self.assertEqual(set(src), {"source", "status", "reason", "as_of", "windows", "extra"})
         self.assertEqual(set(src["windows"][0]), {"pool", "window", "used_percent", "left_percent",
-                                                  "resets_at", "reset_passed"})
+                                                  "resets_at", "reset_passed", "not_started"})
 
 
 class LedgerTests(unittest.TestCase):
@@ -393,6 +394,13 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(sorted(h["pool"] for h in hits), [q.AGY_CLAUDE_GPT, q.AGY_GEMINI])
         gem = [h for h in hits if h["pool"] == q.AGY_GEMINI][0]
         self.assertEqual(gem["model"], "gemini-3.8-flash-low")
+
+    def test_late_older_hit_does_not_replace_a_newer_one(self):
+        self.hit(line="usage limit reached, resets in 3 days", now=NOW)
+        self.hit(line="usage limit reached", now=NOW - 600)
+        hits = q.limit_hits(NOW, root=self.root)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["resets_at"], q._iso(NOW + 3 * 86400))
 
     def test_non_limit_line_is_not_recorded(self):
         self.assertIsNone(self.hit(line="invalid api key"))

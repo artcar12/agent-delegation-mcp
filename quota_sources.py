@@ -32,7 +32,8 @@ JSON (format="json") is schema 1:
                 "windows": [{"pool": str, "window": "5h"|"weekly"|"<n>m",
                              "used_percent": float, "left_percent": float,
                              "resets_at": ISO-UTC|null,
-                             "reset_passed": bool}],
+                             "reset_passed": bool,
+                             "not_started": bool}],
                 "extra": {...}}]}             # source-specific, see below
 
 extra: agy {} ; codex {"plan_type", "credits": {...}, "limit_reached": str|null,
@@ -94,7 +95,8 @@ def _window(pool, window, used, resets_at, now):
     window whose reset time has passed is shown as reset (0 used), with the
     stale reading kept in the caller's extra if it wants it."""
     used = max(0.0, min(100.0, round(used, 1)))
-    if resets_at is not None and resets_at <= 0:
+    not_started = resets_at is not None and resets_at <= 0
+    if not_started:
         # agy reports the Unix epoch for a pool whose window has not started:
         # there is no reset to show, and nothing has reset.
         resets_at = None
@@ -108,6 +110,7 @@ def _window(pool, window, used, resets_at, now):
         "left_percent": round(100.0 - used, 1),
         "resets_at": _iso(resets_at) if resets_at is not None else None,
         "reset_passed": passed,
+        "not_started": not_started,
     }
 
 
@@ -657,6 +660,11 @@ def record_limit_hit(cli, model, line, run_id="", now=None, root=None):
     }
 
     def add(entries):
+        # A run finalized late can carry an older hit than one already
+        # recorded for the pool; the newer hit is the better evidence.
+        same = [e for e in entries if (e["cli"], e["pool"]) == (cli, pool)]
+        if any((_parse_iso(e["hit_at"]) or 0) > now for e in same):
+            return entries
         return [e for e in entries if (e["cli"], e["pool"]) != (cli, pool)] + [entry]
 
     return entry if _ledger_update(add, now, root) else None
@@ -889,6 +897,8 @@ def _window_rows(s, now):
         rows.append((name, "-", "-", "-", "-", "-", note))
     for w in s["windows"]:
         wnote = note
+        if w.get("not_started"):
+            wnote = "window not started" + ("; " + note if note else "")
         if w["reset_passed"]:
             was = ex.get("snapshot_used_percent", {}).get(w["window"])
             wnote = ("reset since snapshot" + (f" (was {was:g}% used)" if was is not None else "")

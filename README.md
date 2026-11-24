@@ -820,7 +820,7 @@ stable shape (schema 1) for scripts such as a quota-check skill:
               "windows": [{"pool": "Gemini Models", "window": "weekly",
                            "used_percent": 1.1, "left_percent": 98.9,
                            "resets_at": "2026-11-23T23:11:27Z",
-                           "reset_passed": false}],
+                           "reset_passed": false, "not_started": false}],
               "extra": {}}]}
 ```
 
@@ -838,15 +838,15 @@ A run that ends on a usage-limit failure is recorded in a small ledger,
 `<AGENT_MCP_RUN_DIR>/quota/limits.json`, shared by all three servers like the run
 store. The failure is the fail-fast stderr line, or for codex the `error` /
 `turn.failed` event on stdout, or a limit line further up stderr. Auth failures
-and per-minute rate limits (`rate limit reached`, `RESOURCE_EXHAUSTED`, a quota
-error naming a per-minute metric) are not
+and per-minute rate limits (`rate limit reached`, a bare `RESOURCE_EXHAUSTED`, a
+quota error naming a per-minute or per-second metric) are not
 limit hits and are not recorded; agy's live reading still catches a real wall.
 A run that exits 0 records nothing, whatever errors it recovered from, unless
 its fail-fast line was itself a limit line. Each entry names the CLI and the **pool** the model draws on:
 
 | CLI | Pool |
 |---|---|
-| agy | `Claude and GPT models` for `claude-*` and `gpt-*` ids, `Gemini 4 Argon` for Argon, `Gemini Models` for every other Gemini id (the names match agy's `/usage` groups) |
+| agy | `Claude and GPT models` for `claude-*` and `gpt-*` ids, `Gemini 4 Argon` for Argon, `Gemini Models` for every other Gemini id (the names match agy's `/usage` groups; Argon's group is listed only on accounts that have it) |
 | codex | `codex`: every model shares the ChatGPT-plan pool |
 | opencode | `opencode-go` for every `opencode-go/` model (one Go plan pool: the console reports one set of figures and a limit on one Go model has blocked the others); any other id is its own pool |
 
@@ -875,8 +875,11 @@ headless figure. A dispatch that starts leads its result with one `Quota:` line
 | under `AGENT_MCP_QUOTA_WARN_PERCENT` (default 10) left | dispatched, with `Quota: LOW.` |
 | unreadable, timed out, or no figure | dispatched, with `quota unknown (<reason>)` |
 
-The live reading is bounded by `AGENT_MCP_QUOTA_CHECK_TIMEOUT` (default 5 s; `0`
-skips it and leaves only the ledger). A pool the guard blocks on an unknown reset
+agy's `/usage` call is bounded by `AGENT_MCP_QUOTA_CHECK_TIMEOUT` (default 5 s; it
+takes about 2 s); the Codex snapshot is a local file read. `0` skips both live
+readings and leaves only the ledger. A pool `/usage` does not list (Argon, on an
+account without that group) reads as unknown and is never refused on a live
+figure. A pool the guard blocks on an unknown reset
 clears when a forced run on it exits 0.
 
 Rough request budget for the `opencode-go` tier, per 5 hours. Measured against
