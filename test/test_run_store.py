@@ -657,6 +657,36 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
 
 
+    def note(self, mod, stderr_text, mtime=None, **fields):
+        err = os.path.join(self.tmp, "noted.stderr")
+        with open(err, "w") as fh:
+            fh.write(stderr_text)
+        if mtime:
+            os.utime(err, (mtime, mtime))
+        record = {"run_id": "r-noted", "cli": mod.CLI_LABEL,
+                  "model": self.default_model(mod), "state": "finished",
+                  "verdict": "exited", "exit_code": None, "fatal_line": None,
+                  "stderr_path": err, "stdout_path": os.path.join(self.tmp, "none.out")}
+        record.update(fields)
+        mod._note_limit(record)
+        return record
+
+    def test_late_note_counts_the_reset_from_when_the_line_was_written(self):
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        written = time.time() - 1800
+        self.note(mod, "Error: usage limit reached, try again in 1 hour\n", mtime=written)
+        hit = q.limit_hits(root=self.run_dir)[0]
+        self.assertAlmostEqual(q._parse_iso(hit["resets_at"]), written + 3600, delta=2)
+        self.assertAlmostEqual(q._parse_iso(hit["hit_at"]), written, delta=2)
+
+    def test_clean_exit_after_a_limit_fatal_line_still_records(self):
+        q = self.ledger()
+        mod = self.server("exit 0\n")
+        self.note(mod, "", exit_code=0, fatal_line="Error: usage limit reached")
+        self.assertEqual(len(q.limit_hits(root=self.run_dir)), 1)
+
+
     def test_idle_exit_after_limit_without_calls(self):
         mod = self.server(AGENT_MCP_SERVER_IDLE_EXIT="60")
         now = mod._last_call

@@ -310,12 +310,14 @@ class LedgerTests(unittest.TestCase):
 
     def test_limit_lines_exclude_auth(self):
         for line in ("AI.Error: Go usage limit exceeded", "You have hit your usage limit.",
-                     "quota exceeded for model",
+                     "quota exceeded for model", "You exceeded your current quota.",
                      "insufficient credit balance"):
             self.assertTrue(q.is_limit_line(line), line)
         # Per-minute rate limits clear in seconds and must not block a pool.
         for line in ("invalid api key", "authentication failed", "AI_APICallError: bad request",
                      "429 RESOURCE_EXHAUSTED", "Rate limit reached, try again in 1.5s",
+                     "RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'Generate "
+                     "requests' and limit 'requests per minute'",
                      "", None):
             self.assertFalse(q.is_limit_line(line), line)
 
@@ -346,6 +348,10 @@ class LedgerTests(unittest.TestCase):
             microsecond=0)
         self.assertEqual(q.parse_reset("resets at " + local.strftime("%Y-%m-%d %H:%M:%S"), NOW),
                          local.timestamp())
+        # Times before the reset phrase are log stamps or event times.
+        stamp = q._dt.datetime.fromtimestamp(NOW + 3600).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertIsNone(q.parse_reset(f"ERROR {stamp} Go usage limit exceeded", NOW))
+        self.assertIsNone(q.parse_reset("request failed at 23:59: usage limit reached", NOW))
         for text in ("usage limit reached", "try again in 2 months",
                      "resets at 2025-01-01T00:00:00Z",          # past
                      "try again in 400 days"):                  # too far

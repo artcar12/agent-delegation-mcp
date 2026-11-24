@@ -501,11 +501,16 @@ def pool_for(cli: str, model: str) -> str:
 # one would cost far more than the run it lost. agy's live /usage reading
 # still shows a real wall as 0% left.
 _LIMIT_HIT = re.compile(
-    r"usage limit|quota exceeded|exceeded (?:your |the )?quota|insufficient credit", re.I)
+    r"usage limit|quota exceeded|exceeded (?:your |the )?(?:current )?quota"
+    r"|insufficient credit", re.I)
+# Google's per-minute 429 also says "Quota exceeded", for a requests-per-
+# minute metric. That is a rate limit, not a wall.
+_SHORT_WINDOW = re.compile(r"per[ _-]?(?:minute|second)|requests? per|\b[rt]pm\b", re.I)
 
 
 def is_limit_line(line) -> bool:
-    return isinstance(line, str) and bool(_LIMIT_HIT.search(line))
+    return (isinstance(line, str) and bool(_LIMIT_HIT.search(line))
+            and not _SHORT_WINDOW.search(line))
 
 
 _ISO_IN_TEXT = re.compile(
@@ -514,6 +519,8 @@ _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _REL_UNIT = r"(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)"
 _REL = re.compile(r"\bin\s+((?:\d+(?:\.\d+)?\s*" + _REL_UNIT + r"\b[\s,]*(?:and\s+)?)+)", re.I)
 _REL_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(" + _REL_UNIT + r")\b", re.I)
+_RESET_WORD = re.compile(
+    r"reset|try again|retry|available again|until|renews?|refresh", re.I)
 _MONTHS = {m: i + 1 for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
 _CLOCK = re.compile(
@@ -525,11 +532,18 @@ def parse_reset(line: str, now: float):
     """Epoch seconds of the reset a limit message states, or None. Understands
     ISO times ("2026-11-24T18:00:00Z"; one with no offset is local time, as
     the CLIs print it), "in 2 hours 5 minutes" / "in 2h 5m" / "in 1.5s", and
-    "at 3:05 PM" or "at Nov 25th, 2026 1:07 PM" (local). Every candidate is
-    read, since a line can start with its own log timestamp; the earliest one
-    in the future and within MAX_RESET_AHEAD wins, else None."""
+    "at 3:05 PM" or "at Nov 25th, 2026 1:07 PM" (local). Only text after a reset phrase
+    ("resets", "try again", "until", ...) counts. The earliest candidate in
+    the future and within MAX_RESET_AHEAD wins, else None. `now` is when the
+    message was written, so a relative time is counted from then."""
     if not isinstance(line, str):
         return None
+    # Only the text from the first reset phrase on is read: log prefixes and
+    # clock times before it ("failed at 10:32") are not resets.
+    kw = _RESET_WORD.search(line)
+    if not kw:
+        return None
+    line = line[kw.start():]
     found = []
     for m in _ISO_IN_TEXT.finditer(line):
         text = m.group(0).replace(" ", "T")

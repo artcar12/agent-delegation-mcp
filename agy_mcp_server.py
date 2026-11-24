@@ -657,12 +657,13 @@ def _note_limit(record: dict) -> None:
     try:
         cli = record.get("cli", CLI_LABEL)
         model = record.get("model", "")
-        if record.get("verdict") == "exited" and record.get("exit_code") == 0:
+        if (record.get("verdict") == "exited" and record.get("exit_code") == 0
+                and not quota.is_limit_line(record.get("fatal_line") or "")):
             # A clean exit proves the pool works, whatever errors the run
             # recovered from on the way (codex logs retries as error events).
             quota.clear_limit_hit(cli, model, record.get("started_at") or 0, root=RUN_DIR)
             return
-        line = record.get("fatal_line") or ""
+        line, src = record.get("fatal_line") or "", record.get("stderr_path", "")
         if not quota.is_limit_line(line):
             # The fatal scan can miss a line: a sibling server may finalize
             # the run while its live owner is the one meant to scan stderr.
@@ -672,10 +673,18 @@ def _note_limit(record: dict) -> None:
                     break
         if not quota.is_limit_line(line) and cli == "codex":
             # codex reports its quota wall as a JSON event on stdout.
-            line = _codex_error(record.get("stdout_path", ""))
+            src = record.get("stdout_path", "")
+            line = _codex_error(src)
         if quota.is_limit_line(line):
+            # When the message was written, not when this server got round to
+            # it: a run finalized hours later must not push "try again at
+            # 1:07 PM" to tomorrow, or start its TTL late.
+            try:
+                written = os.path.getmtime(src)
+            except (OSError, TypeError):
+                written = record.get("ended_at") or time.time()
             entry = quota.record_limit_hit(cli, model, line, record.get("run_id", ""),
-                                           root=RUN_DIR)
+                                           now=min(written, time.time()), root=RUN_DIR)
             if entry:
                 record["limit_pool"] = entry["pool"]
                 record["limit_resets_at"] = entry["resets_at"]
@@ -1156,6 +1165,14 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
         return (f"Error: cwd {cwd!r} is not an existing directory. Create it first or "
                 "pass an absolute path to an existing project.")
 
+    # Quota first: reading it can take seconds (agy /usage), and doing that
+    # between the busy check and the start would widen the window in which
+    # two sessions can both pass the check.
+    quota_note, refusal = _quota_gate(model, force)
+    if refusal:
+        return refusal
+    lead = f"{quota_note}\n\n" if quota_note else ""
+
     # The "one dispatch at a time" rule has been in the docs since the start
     # and was unenforceable while a run existed only as a local variable. The
     # registry makes it checkable, so it is checked: models sharing a provider
@@ -1172,10 +1189,6 @@ def _dispatch(prompt: str, argv: list, cwd: str, model: str,
                     "these share a quota pool. check_run one of the above, cancel_run it, "
                     "or pass force=True if you have a reason to overlap them.")
 
-    quota_note, refusal = _quota_gate(model, force)
-    if refusal:
-        return refusal
-    lead = f"{quota_note}\n\n" if quota_note else ""
 
     global _SERVER_IDENTITY
     _SERVER_IDENTITY = _SERVER_IDENTITY or _proc_identity(os.getpid())

@@ -838,9 +838,11 @@ A run that ends on a usage-limit failure is recorded in a small ledger,
 `<AGENT_MCP_RUN_DIR>/quota/limits.json`, shared by all three servers like the run
 store. The failure is the fail-fast stderr line, or for codex the `error` /
 `turn.failed` event on stdout, or a limit line further up stderr. Auth failures
-and per-minute rate limits (`rate limit reached`, `RESOURCE_EXHAUSTED`) are not
+and per-minute rate limits (`rate limit reached`, `RESOURCE_EXHAUSTED`, a quota
+error naming a per-minute metric) are not
 limit hits and are not recorded; agy's live reading still catches a real wall.
-A run that exits 0 records nothing, whatever errors it recovered from. Each entry names the CLI and the **pool** the model draws on:
+A run that exits 0 records nothing, whatever errors it recovered from, unless
+its fail-fast line was itself a limit line. Each entry names the CLI and the **pool** the model draws on:
 
 | CLI | Pool |
 |---|---|
@@ -849,8 +851,9 @@ A run that exits 0 records nothing, whatever errors it recovered from. Each entr
 | opencode | `opencode-go` for every `opencode-go/` model (one Go plan pool: the console reports one set of figures and a limit on one Go model has blocked the others); any other id is its own pool |
 
 A hit whose message states a reset (an ISO time, local when it has no offset;
-`in 2 hours 5 minutes`, `in 2h 5m`, `in 1.5s`; `at 3:05 PM`) blocks its pool until
-then. One without a reset blocks it for
+`in 2 hours 5 minutes`, `in 2h 5m`, `in 1.5s`; `at 3:05 PM`, `at Nov 25th, 2026
+1:07 PM`), after a phrase such as "resets" or "try again", blocks its pool until
+then, counted from when the message was written. One without a reset blocks it for
 `AGENT_MCP_LIMIT_TTL` seconds (default 3600), is then reported as stale until a day
 (or the TTL, if longer) has passed, and is dropped. A later run on the same pool that exits 0 clears an older
 hit. `check_run` says when a run was recorded, and `quota_status` lists every
@@ -863,7 +866,8 @@ they are `extra.limit_hits`. An entry keeps only the matched error line, cut to
 Every `dispatch_*` call checks the pool its model draws on before starting
 anything, reading only its own CLI: agy's `/usage` for the matching group, the
 Codex snapshot (with its age), and for opencode only the ledger, since it has no
-headless figure. The result always starts with one `Quota:` line.
+headless figure. A dispatch that starts leads its result with one `Quota:` line
+(none if `quota_sources.py` is missing).
 
 | Finding | What happens |
 |---|---|
