@@ -1379,10 +1379,10 @@ def dispatch_opencode(prompt: str, model: str = DEFAULT_MODEL, cwd: str = DEFAUL
     omen-alpha (ignores the provided tools and rewrites files from scratch).
 
     Free tier (`opencode/` rather than `opencode-go/`), for smoke tests and
-    mechanical work when quota is tight: on 2.x, glm-5.3-flash-free passes a
-    write-a-file probe; big-pickle passed on 1.x and is still listed.
-    mimo-v2.5-free (the old pick) and ling-3.0-flash-fin-free are no longer
-    listed. Block every muse-spark-*-contributor variant,
+    mechanical work when quota is tight: none is tested on 2.3.2 (checked
+    2026-11-24). mimo-v2.5-free and glm-5.3-flash-free are gone; big-pickle
+    passed on 1.x and is still listed; probe a free id before relying on it.
+    Block every muse-spark-*-contributor variant,
     free AND paid, for proprietary code: Meta retains prompts and completions
     for training. Both nemotron tiers FAILED here and the failures are
     confirmed upstream bugs.
