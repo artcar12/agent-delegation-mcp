@@ -1,6 +1,6 @@
 # Model roster (OpenCode in depth, Codex and cross-tool routing up top)
 
-**Research date: 2026-09-10.** Sourced from a deep-research pass over vendor
+**Research date: 2026-09-10; ids last checked 2026-11-24 (an id diff, not new research).** Sourced from a deep-research pass over vendor
 docs, OpenCode's changelog and issue tracker, OpenRouter model pages, and
 independent leaderboards — *not* from local testing, except where the
 [direct test results](#direct-test-results) section says so. Treat every row as
@@ -16,6 +16,15 @@ wrapper now supports only 2.x (checked on 2.2.1, 2026-10-29). Every
 are gone: `opencode/mimo-v2.5-free` and `opencode/ling-3.0-flash-fin-free`.
 `opencode/glm-5.3-flash-free` passed a write-a-file probe on 2.2.1. In 2.x the
 quota error reads `AI.Error: Go usage limit exceeded`, not `AI_APICallError`.
+
+**Id check 2026-11-24 (OpenCode 2.3.2, codex-cli 0.169.1, agy 1.5.12).** Free
+ids diffed against `opencode models`: `nemotron-3-ultra-free`,
+`muse-spark-1.2-contributor-free`, `muse-spark-1.3-contributor-free` and
+`glm-5.3-flash-free` are gone (rows removed; the detail and test sections below
+keep their dated history), and eight new free ids are listed with `unknown`
+cells. The `opencode-go/` ids were not re-checked: the machine that ran the
+check had no Go login, so `opencode models` listed only free ids. The Codex
+and agy lists below are from the same day.
 
 ## Routing across tools
 
@@ -33,14 +42,26 @@ skip any tool that has hit its limit until its reset.
 ### Codex models
 
 Not researched like the OpenCode roster below; this is what is known locally.
-`dispatch_codex` with no `model` uses the default in `~/.codex/config.toml`,
-which on 2026-11-16 was `gpt-6.1-sol` (verified: an end-to-end dispatch wrote a
-file and committed in 34 s). Ids the CLI listed that day: `gpt-6.1-sol`,
-`gpt-6.1-terra`, `gpt-6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-5.6-sol`,
-`gpt-5.6-terra`, `gpt-5.6-luna`. Only the default has been tested here. All
-draw on the same ChatGPT-plan pool: a 5-hour and a weekly window, which
-`quota_status` reads from the last Codex session. Re-check ids in the `codex`
-TUI's `/model` picker.
+`dispatch_codex` with no `model` uses the default in `~/.codex/config.toml`
+(`gpt-6.1-sol` on 2026-11-24; an end-to-end dispatch with it wrote a file and
+committed in 34 s on 2026-11-16). Ids `codex debug models` listed on
+2026-11-24: `gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`,
+`gpt-6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna`. `gpt-6.2-sol` answered a no-tools `codex exec --json` schema
+call that day; the rest are untested here. All draw on the same ChatGPT-plan
+pool: a 5-hour and a weekly window, which `quota_status` reads from the last
+Codex session.
+
+### agy models
+
+Ids `agy models` listed on 2026-11-24, all untested here unless noted. Gemini
+pool: `gemini-3.8-flash-{low,medium,high}` (flash-medium answered a no-tools
+JSON schema call that day), `gemini-4-neon-*`, `gemini-4-argon-*`,
+`gemini-4-hydrogen-*` and `gemini-4-carbon-*` (each `low`, `medium`, `high`,
+neon and hydrogen also `xhigh`), and the `gemini-pro-orchestrator` variants.
+Claude-and-GPT pool: `claude-opus-5-5-*` and `claude-sonnet-5-5-*` (`low`,
+`medium`, `high`) and `gpt-oss-120b-medium`. Carbon is not generally available;
+don't route to it.
 
 ## Contents
 
@@ -83,7 +104,7 @@ breaks the loop.
 
 ## The roster
 
-All thirty-four ids. `unknown` means no source was found — it is not a
+All thirty-seven ids (thirty-four researched 2026-09-10; three net added 2026-11-24 with no research). `unknown` means no source was found — it is not a
 placeholder for a number that exists somewhere.
 
 ### Tier 1 — primary routing targets
@@ -122,18 +143,21 @@ placeholder for a number that exists somewhere.
 
 | id | upstream | context | max out | SWE-bench V | tok/s | tool-calling | juris. | $/Mtok | conf | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `opencode/ling-3.0-flash-fin-free` | Ling 3.0 Flash Fin | unknown | unknown | unknown | unknown | unknown | unknown | free | low | 124B MoE, 5.1B active |
-| `opencode/mimo-v2.5-free` | Xiaomi MiMo V2.5 | 1,000,000 | 131,072 | unknown | unknown | unknown | CN | free | high | `INFERRED`: **same weights as paid**. Strips `Authorization` headers at the transport layer |
-| `opencode/nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra | unknown | unknown | unknown | unknown | **low** | US | free | high | documented `Upstream idle timeout exceeded` mid-stream; writes fail permanently after |
 | `opencode/nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning | unknown | unknown | unknown | unknown | **low** | US | free | high | documented: routinely omits the closing `}` in tool JSON. Ignores STOP constraints |
+| `opencode/deepseek-v4.1-flash-free` | unknown | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
+| `opencode/flint-40b-free` | unknown | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
+| `opencode/hy4-flash-free` | unknown | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
+| `opencode/mimo-v2.6-flash-free` | unknown | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
+| `opencode/nemotron-3.5-super-vl-free` | unknown | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
 
 ### Tier 4 — codenames and unannounced
 
 | id | upstream | context | max out | SWE-bench V | tok/s | tool-calling | juris. | $/Mtok in-out | conf | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `opencode/big-pickle` | `INFERRED`: unannounced, run by OpenCode Zen itself | 200,000 | unknown | unknown | unknown | unknown | US | free | low | no reasoning tags; bypasses reasoning replay. Origin lab unidentified |
-| `opencode/muse-spark-1.2-contributor-free` | `INFERRED`: Meta Muse Spark 1.2 | unknown | unknown | unknown | unknown | unknown | US | free | high | **prompts + completions used for Meta training** |
-| `opencode/muse-spark-1.3-contributor-free` | `INFERRED`: Meta Muse Spark 1.3 | 1,000,000 | unknown | unknown | unknown | unknown | US | free | high | **prompts + completions used for Meta training** |
+| `opencode/beam-free` | unknown (codename) | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
+| `opencode/iceman-free` | unknown (codename) | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
+| `opencode/tidepool-alpha-free` | unknown (codename) | unknown | unknown | unknown | unknown | unknown | unknown | free | unknown | listed 2026-11-24, untested |
 | `opencode-go/muse-spark-1.2-contributor` | `INFERRED`: Meta Muse Spark 1.2 | unknown | unknown | unknown | unknown | unknown | US | 0.10 / 0.20 | high | paying does **not** buy out of the training-data grant |
 | `opencode-go/muse-spark-1.3-contributor` | `INFERRED`: Meta Muse Spark 1.3 | 1,000,000 | unknown | unknown | unknown | unknown | US | 0.10 / 0.20 | high | paying does **not** buy out of the training-data grant |
 | `opencode-go/omen-alpha` | `INFERRED`: Zhipu GLM-5 family, likely an early 5.4 preview | 500,000 | 128,000 | unknown | unknown | **low** | CN | 0.20 / 0.66 | high | fails structured tool calls constantly; reimplements code instead of editing |
@@ -344,11 +368,11 @@ hang). Both would have placed on scores alone.
 
 ### Where free and paid route differently
 
-- **`mimo-v2.5-free`** — viable. Same weights and same context capacity as paid;
+- **`mimo-v2.5-free`** (no longer listed as of 2026-11-24) — was viable. Same weights and same context capacity as paid;
   the free id is a pricing layer, not a smaller model. The one real difference is
   transport-level `Authorization` header stripping, which silently breaks any
   brief that forwards auth tokens.
-- **`muse-spark-*-contributor`** — **block for proprietary work, free *and*
+- **`muse-spark-*-contributor`** (no longer listed as of 2026-11-24; the rule stands if one returns) — **block for proprietary work, free *and*
   paid.** The contributor grant retains prompts, tool inputs, and codebase
   context for Meta training. Fine for public repos, disqualifying otherwise.
 
@@ -388,8 +412,9 @@ Strictly avoid `kimi-k2.6` (infinite repetition exhausts context),
 (drops JSON closing braces), and `omen-alpha` (ignores provided tools, rewrites
 files from scratch).
 
-For free-tier fallback, `mimo-v2.5-free` is the pick — identical weights to paid,
-though it silently strips transport-level `Authorization` headers. Block every
+No free-tier fallback is tested on OpenCode 2.3.2: `mimo-v2.5-free` (the old
+pick) and `glm-5.3-flash-free` are gone and the free ids listed 2026-11-24 are
+untested, so probe one before relying on it. Block every
 `muse-spark-*-contributor` variant, free and paid, for proprietary code: Meta
 retains prompts and completions for training.
 

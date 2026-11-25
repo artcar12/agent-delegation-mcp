@@ -19,7 +19,7 @@ Delete them in a real spec.
 | | |
 |---|---|
 | **Model** | `opencode-go/minimax-m3` |
-| **Fallback** | `opencode-go/qwen3.8-flash` (quota), `opencode/mimo-v2.5-free` (quota exhausted) |
+| **Fallback** | `opencode-go/qwen3.8-flash` (quota), `opencode/big-pickle` (quota exhausted; probe first) |
 | **Chosen** | 2026-09-10, against MODEL-ROSTER.md of the same date |
 | **Basis** | Roster's top-ranked reliable model that is not opt-in gated. ~24h / 1,959 tool calls unattended is the strongest long-horizon evidence in the roster, and 100 tok/s keeps it clear of the wall-clock timeout. `deepseek-v4-pro` ranks first overall but is China-hosted and rejected without a workspace opt-in, so it is not usable here. |
 | **Do not use** | `kimi-k2.6`, `glm-5.3-flash`, `omen-alpha`, either nemotron — see the roster's avoid table |
