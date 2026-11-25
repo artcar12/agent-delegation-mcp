@@ -56,7 +56,13 @@ Write ONE complete, specific prompt. Length is not a problem:
   That can make Gemini say it cannot browse and then answer from memory.
 - If the job truly needs Deep Research (dozens of sources read end to end, a
   written report as the deliverable), say so, so the user can switch modes.
-  Otherwise a normal chat prompt on Flash is enough.
+  Otherwise a normal chat prompt is enough.
+- Name the model and thinking level. The Gemini app picker (Gemini 4, since
+  2026-11-18): "Everyday help" is Hydrogen (fast, the Flash replacement),
+  "Deeper analysis" is Neon (replaced Argon in the app), "Code & complex work"
+  is Carbon. Hydrogen for light lookups, Neon for comparisons and surveys.
+  Start at the default thinking level and raise it only if the answer comes
+  back thin.
 
 ## The session line
 

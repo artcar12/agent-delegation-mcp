@@ -60,8 +60,17 @@ JSON schema call that day), `gemini-4-neon-*`, `gemini-4-argon-*`,
 `gemini-4-hydrogen-*` and `gemini-4-carbon-*` (each `low`, `medium`, `high`,
 neon and hydrogen also `xhigh`), and the `gemini-pro-orchestrator` variants.
 Claude-and-GPT pool: `claude-opus-5-5-*` and `claude-sonnet-5-5-*` (`low`,
-`medium`, `high`) and `gpt-oss-120b-medium`. Carbon is not generally available;
-don't route to it.
+`medium`, `high`) and `gpt-oss-120b-medium`.
+
+Gemini 4 family (checked 2026-11-24 against itdaily.com and 9to5google.com
+coverage of the Neon launch): Hydrogen (2026-11-12) is the fast, cheap
+"Everyday help" tier and Google's Flash replacement; Neon (2026-11-18) sits
+between Hydrogen and Carbon and replaced Argon in the Gemini app's picker;
+Argon (GA 2026-10-13) stays in the API and in agy; Carbon (GA 2026-11-10) is
+the top tier, now generally available but locked on this account's Gemini app
+plan. `gemini-4-hydrogen-medium` and `gemini-4-neon-medium` both answered a
+no-tools `--print` probe on 2026-11-24, and both drew on the Gemini Models pool
+(`/usage` no longer lists a separate Argon group on this account).
 
 ## Contents
 

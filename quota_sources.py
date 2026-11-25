@@ -463,9 +463,9 @@ def ledger_path(root=None):
 
 
 # Pools as the provider meters them. agy names match its /usage groups, so a
-# hit can be set beside the live reading. Which Gemini 4 families other than
-# Argon draw on the shared Gemini pool is an assumption from /usage, which
-# lists no separate group for them.
+# hit can be set beside the live reading. Hydrogen and Neon were seen drawing
+# on the shared Gemini pool (2026-11-24); Carbon is assumed to as well. Argon
+# keeps its own name for accounts whose /usage still lists that group.
 AGY_CLAUDE_GPT = "Claude and GPT models"
 AGY_ARGON = "Gemini 4 Argon"
 AGY_GEMINI = "Gemini Models"
